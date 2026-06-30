@@ -119,10 +119,15 @@ def _get_done_stocks(date_str: str) -> set:
     return set(df[df["date"] == date_str]["stock_id"].tolist())
 
 
-def update_day(start_date: str = None, stocks: list = None):
-    """日線（Fugle），flag避免同日重複下載"""
+def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
+    """
+    日線（Fugle），flag 避免同日重複下載。
+    workers: 並發執行緒數（預設 5，約 5 分鐘下載 1500 支）
+    """
     if not token:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     now = datetime.now(_TW)
     date_str = now.strftime("%Y-%m-%d")
@@ -135,27 +140,40 @@ def update_day(start_date: str = None, stocks: list = None):
     candidates = _all_stocks() if stocks is None else stocks
     done = _get_done_stocks(date_str)
     wait_stocks = [s for s in candidates if s not in done]
-    print(f"start_date={start_date}，還有 {len(wait_stocks)} 個股票未更新（已排除今日已下載 flag）")
-    for stock_id in wait_stocks:
+    print(f"start_date={start_date}，{len(wait_stocks)} 支待下載（{workers} 並發）")
+
+    _save_lock = threading.Lock()
+    completed = 0
+
+    def _fetch_one(stock_id: str):
+        nonlocal completed
+        time.sleep(0.2)  # 每執行緒小延遲，5 執行緒合計 ~1 req/s
         try:
             df = _download_day(stock_id, start_date)
             if not df.empty:
-                _save_day(df)
-                print(stock_id, "下載完成", len(df), "筆")
-            else:
-                print(stock_id, "無資料")
+                with _save_lock:
+                    _save_day(df)
             _update_flag(stock_id, date_str)
+            return stock_id, len(df), None
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                print(stock_id, "Fugle 無此股票資料，標記跳過")
                 _update_flag(stock_id, date_str)
-            else:
-                print(f"{stock_id} 失敗: {e}")
+                return stock_id, 0, None
+            return stock_id, 0, str(e)
         except Exception as e:
-            print(f"{stock_id} 失敗: {e}")
-        time.sleep(1.05)  # Fugle API 60 req/min
+            return stock_id, 0, str(e)
 
-    print("全部完成")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_one, sid): sid for sid in wait_stocks}
+        for fut in as_completed(futures):
+            sid, rows, err = fut.result()
+            completed += 1
+            if err:
+                print(f"  [{completed}/{len(wait_stocks)}] {sid} 失敗: {err}")
+            elif completed % 100 == 0 or completed == len(wait_stocks):
+                print(f"  [{completed}/{len(wait_stocks)}] 進度更新")
+
+    print("日K 下載完成")
 
 
 if __name__ == "__main__":

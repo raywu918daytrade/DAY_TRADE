@@ -150,10 +150,16 @@ class M1Collector:
         ws.on("error", lambda e: print(f"WS 錯誤: {e}"))
 
         def _subscribe_all():
-            authenticated.wait(timeout=10)
+            if not authenticated.wait(timeout=10):
+                print("認證逾時，跳過訂閱")
+                return
             print("認證完成，開始訂閱...")
             for i, symbol in enumerate(stocks):
-                ws.subscribe({"channel": "candles", "symbol": symbol})
+                try:
+                    ws.subscribe({"channel": "candles", "symbol": symbol})
+                except Exception as e:
+                    print(f"訂閱中斷（已送出 {i}/{len(stocks)}）: {e}")
+                    return
                 if (i + 1) % 500 == 0:
                     print(f"  已送出 {i+1}/{len(stocks)} 筆訂閱...")
             print(f"訂閱送出完畢（{len(stocks)} 支）")

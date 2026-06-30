@@ -1,0 +1,32 @@
+name: Update Daily K-line Data
+
+on:
+  schedule:
+    # 每天凌晨 00:00 台北時間（= 16:00 UTC 前一天），週一到週五
+    - cron: '0 9 * * 1-5'   # 17:00 台北時間 週一~五（UTC+8）
+  workflow_dispatch:   # 允許手動觸發
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # 最多 60 分鐘（含 rate limit 等待）
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt huggingface_hub
+
+      - name: Download d1 and push to HF Hub
+        env:
+          FUGLE: ${{ secrets.FUGLE }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ vars.HF_REPO_ID }}
+        run: python scripts/push_to_hf.py

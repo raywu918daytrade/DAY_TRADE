@@ -1,0 +1,405 @@
+"""
+即時交易監控 API（FastAPI + Swagger）
+
+Swagger UI : http://localhost:8000/docs
+ReDoc      : http://localhost:8000/redoc
+
+端點：
+    GET  /health                     健康檢查
+    GET  /dashboard/summary          上方資訊列統計
+    GET  /signals/today              左邊訊號列表
+    GET  /signals/{stock_id}/detail  右邊訊號詳情
+    GET  /chart/{stock_id}/candles   中間 K 圖
+    GET  /positions                  下方持倉區
+    GET  /trades                     下方成交記錄
+    WS   /ws                         即時推送
+"""
+
+import asyncio
+import json
+import threading
+from datetime import date
+from typing import Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="just1stock 即時交易監控",
+    version="1.0.0",
+    description="當沖模型訊號監控平台 API",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Pydantic response models（Swagger 自動生成文件）───────────────────────────
+
+class DashboardSummary(BaseModel):
+    today_signals: int
+    sent_orders: int
+    filled: int
+    holding: int
+    closed: int
+    today_pnl_pct: float
+    risk_rejected: int
+    errors: int
+    last_updated: str
+
+class SignalRecord(BaseModel):
+    time: str
+    stock_id: str
+    name: str
+    direction: str          # "buy" | "sell"
+    score: int              # proba * 100，0~100
+    status: str             # signal_only / risk_pass / sent / filled / holding / closed / failed
+    pnl_pct: Optional[float] = None
+
+class Candle(BaseModel):
+    time: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    vwap: Optional[float] = None
+
+class CandleResponse(BaseModel):
+    stock_id: str
+    candles: list[Candle]
+
+class LifecycleEvent(BaseModel):
+    time: str
+    event: str
+    detail: Optional[str] = None
+
+class SignalDetail(BaseModel):
+    stock_id: str
+    name: str
+    direction: str
+    signal_time: str
+    signal_price: float
+    filled_avg: Optional[float] = None
+    current_price: Optional[float] = None
+    unrealized_pnl_pct: Optional[float] = None
+    stop_loss: float
+    take_profit: float
+    exit_rule: Optional[str] = None
+    signal_reasons: list[str] = []
+    lifecycle: list[LifecycleEvent] = []
+
+class Position(BaseModel):
+    stock_id: str
+    name: str
+    pnl_pct: float
+    entry_price: float
+    current_price: float
+    stop_loss: float
+    take_profit: float
+
+class TradeRecord(BaseModel):
+    time: str
+    stock_id: str
+    direction: str
+    price: float
+    quantity: int
+    status: str             # FILLED / PARTIAL / SENT / FAILED
+    broker_response: Optional[str] = None
+
+# ── In-memory state ──────────────────────────────────────────────────────────
+
+_lock = threading.Lock()
+_today_date: date = None
+
+_summary: dict = {
+    "today_signals": 0,
+    "sent_orders": 0,
+    "filled": 0,
+    "holding": 0,
+    "closed": 0,
+    "today_pnl_pct": 0.0,
+    "risk_rejected": 0,
+    "errors": 0,
+    "last_updated": "",
+}
+
+_collector_status: str = "stopped"   # "running" | "stopped" | "error"
+
+_signals: list = []        # 今日訊號列表
+_positions: dict = {}      # {stock_id: Position dict}
+_trades: list = []         # 今日成交記錄
+_candles: dict = {}        # {stock_id: [Candle dict, ...]}
+_signal_detail: dict = {}  # {stock_id: SignalDetail dict}
+
+# ── SSE 廣播 ─────────────────────────────────────────────────────────────────
+
+_sse_clients: set[asyncio.Queue] = set()
+_event_loop: asyncio.AbstractEventLoop = None
+
+
+@app.on_event("startup")
+async def _capture_loop():
+    global _event_loop
+    _event_loop = asyncio.get_running_loop()
+
+
+def _broadcast(data: dict):
+    """從同步執行緒安全地推送給所有 SSE 客戶端"""
+    if not _event_loop or not _sse_clients:
+        return
+
+    async def _enqueue_all():
+        for q in list(_sse_clients):
+            await q.put(data)
+
+    asyncio.run_coroutine_threadsafe(_enqueue_all(), _event_loop)
+
+
+# ── Public push functions（由 live_trader.py 呼叫）───────────────────────────
+
+def _reset_if_new_day():
+    global _today_date, _summary, _signals, _trades, _candles, _signal_detail, _positions
+    today = date.today()
+    if _today_date != today:
+        _today_date = today
+        _signals.clear()
+        _trades.clear()
+        _candles.clear()
+        _signal_detail.clear()
+        _positions.clear()
+        _summary = {k: 0 if isinstance(v, (int, float)) else "" for k, v in _summary.items()}
+
+
+def push_signals(minute_str: str, signals: list):
+    """每分K推入新訊號（由 on_minute 呼叫）"""
+    with _lock:
+        _reset_if_new_day()
+        for s in signals:
+            record = {
+                "time": minute_str[11:16],
+                "stock_id": s["stock_id"],
+                "name": s.get("name", s["stock_id"]),
+                "direction": "buy",
+                "score": int(s["proba"] * 100),
+                "status": "signal_only",
+                "pnl_pct": None,
+            }
+            _signals.append(record)
+            _summary["today_signals"] += 1
+            _summary["last_updated"] = minute_str[11:]
+
+            # 初始化詳情
+            _signal_detail[s["stock_id"]] = {
+                "stock_id": s["stock_id"],
+                "name": s.get("name", s["stock_id"]),
+                "direction": "buy",
+                "signal_time": minute_str[11:],
+                "signal_price": s["price"],
+                "filled_avg": None,
+                "current_price": s["price"],
+                "unrealized_pnl_pct": None,
+                "stop_loss": round(s["price"] * 0.97, 2),
+                "take_profit": round(s["price"] * 1.03, 2),
+                "exit_rule": None,
+                "signal_reasons": [],
+                "lifecycle": [
+                    {"time": minute_str[11:], "event": "產生訊號", "detail": f"模型分數 {int(s['proba']*100)}"}
+                ],
+            }
+
+        _broadcast({"type": "signals", "minute": minute_str, "data": signals})
+
+
+def push_candles(stock_id: str, candles: list):
+    """推入 K 線資料（index=datetime, open/high/low/close/volume/vwap）"""
+    with _lock:
+        _candles[stock_id] = candles
+        _broadcast({"type": "candles", "stock_id": stock_id})
+
+
+def push_position(position: dict):
+    """新增或更新持倉"""
+    with _lock:
+        sid = position["stock_id"]
+        _positions[sid] = position
+        _summary["holding"] = len(_positions)
+        # 更新訊號列表狀態
+        for r in _signals:
+            if r["stock_id"] == sid:
+                r["status"] = "holding"
+                r["pnl_pct"] = position.get("pnl_pct")
+        _broadcast({"type": "position", "data": position})
+
+
+def push_trade(trade: dict):
+    """推入成交記錄"""
+    with _lock:
+        _trades.append(trade)
+        _summary["filled"] = len(_trades)
+        sid = trade["stock_id"]
+        # 更新生命週期
+        if sid in _signal_detail:
+            _signal_detail[sid]["lifecycle"].append({
+                "time": trade["time"],
+                "event": "成交",
+                "detail": f"{trade['quantity']} 股 @ {trade['price']}",
+            })
+            _signal_detail[sid]["filled_avg"] = trade["price"]
+        _broadcast({"type": "trade", "data": trade})
+
+
+def close_position(stock_id: str, pnl_pct: float, exit_reason: str = ""):
+    """平倉：移除持倉、更新統計與訊號狀態"""
+    with _lock:
+        _positions.pop(stock_id, None)
+        _summary["holding"] = len(_positions)
+        _summary["closed"] += 1
+        closed = _summary["closed"]
+        prev = _summary["today_pnl_pct"] * (closed - 1)
+        _summary["today_pnl_pct"] = round((prev + pnl_pct) / closed, 4)
+        for r in _signals:
+            if r["stock_id"] == stock_id:
+                r["status"] = "closed"
+                r["pnl_pct"] = pnl_pct
+        if stock_id in _signal_detail:
+            _signal_detail[stock_id]["exit_rule"] = exit_reason
+        _broadcast({"type": "closed", "stock_id": stock_id, "pnl_pct": pnl_pct})
+
+
+# ── REST Endpoints ────────────────────────────────────────────────────────────
+
+def set_collector_status(status: str):
+    """由 live_trader.py 呼叫，更新 collector 狀態（'running' | 'stopped' | 'error'）"""
+    global _collector_status
+    _collector_status = status
+
+
+_COLLECTOR_MSG = {
+    "running": "資料流正常",
+    "stopped": "盤後或尚未啟動",
+    "error":   "資料流中斷",
+}
+
+@app.get("/health", tags=["系統"], summary="健康檢查")
+def health():
+    with _lock:
+        last_signal = _signals[-1]["time"] if _signals else None
+    return {
+        "status": "ok",
+        "collector": _collector_status,
+        "message": _COLLECTOR_MSG.get(_collector_status, _collector_status),
+        "sse_clients": len(_sse_clients),
+        "last_signal_at": last_signal,
+    }
+
+
+@app.get(
+    "/dashboard/summary",
+    response_model=DashboardSummary,
+    tags=["儀表板"],
+    summary="上方資訊列統計",
+)
+def dashboard_summary():
+    with _lock:
+        return dict(_summary)
+
+
+@app.get(
+    "/signals/today",
+    response_model=list[SignalRecord],
+    tags=["訊號"],
+    summary="今日訊號列表（左邊訊號區）",
+)
+def signals_today():
+    with _lock:
+        return list(reversed(_signals))  # 最新在上
+
+
+@app.get(
+    "/signals/{stock_id}/detail",
+    response_model=SignalDetail,
+    tags=["訊號"],
+    summary="訊號詳情（右邊詳情區，依選定股票）",
+)
+def signal_detail(stock_id: str):
+    with _lock:
+        detail = _signal_detail.get(stock_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"無 {stock_id} 的訊號資料")
+    return detail
+
+
+@app.get(
+    "/chart/{stock_id}/candles",
+    response_model=CandleResponse,
+    tags=["圖表"],
+    summary="K 線資料（中間 K 圖，依選定股票）",
+)
+def chart_candles(stock_id: str):
+    with _lock:
+        candles = list(_candles.get(stock_id, []))
+    return {"stock_id": stock_id, "candles": candles}
+
+
+@app.get(
+    "/positions",
+    response_model=list[Position],
+    tags=["持倉"],
+    summary="當前持倉（下方持倉區）",
+)
+def positions():
+    with _lock:
+        return list(_positions.values())
+
+
+@app.get(
+    "/trades",
+    response_model=list[TradeRecord],
+    tags=["成交"],
+    summary="今日成交記錄（下方成交區）",
+)
+def trades():
+    with _lock:
+        return list(reversed(_trades))  # 最新在上
+
+
+# ── SSE ──────────────────────────────────────────────────────────────────────
+
+@app.get("/stream", tags=["即時推送"], summary="SSE 即時推送（訊號 / 持倉 / 成交）")
+async def event_stream(request: Request):
+    queue: asyncio.Queue = asyncio.Queue()
+    _sse_clients.add(queue)
+
+    async def generate():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"   # 保持連線
+        finally:
+            _sse_clients.discard(queue)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Start（由 live_trader.py 呼叫）───────────────────────────────────────────
+
+def get_uvicorn_config(host: str = "0.0.0.0", port: int = 8000) -> uvicorn.Config:
+    return uvicorn.Config(app=app, host=host, port=port, log_level="warning")

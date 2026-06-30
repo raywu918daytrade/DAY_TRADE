@@ -17,7 +17,7 @@ _TICKERS_PATH = _ROOT / "db/fugle_tickers/tickers.parquet"
 
 def update_tickers() -> pd.DataFrame:
     """
-    從 Fugle /intraday/tickers 取得當日正常可交易股票清單（TWSE + TPEx），
+    從 Fugle /intraday/tickers 取得當日可當沖股票清單（TWSE + TPEx），
     存到 db/fugle_tickers/tickers.parquet。
     建議每日開盤前呼叫一次。
     """
@@ -29,7 +29,7 @@ def update_tickers() -> pd.DataFrame:
     for exchange in ("TWSE", "TPEx"):
         r = requests.get(
             f"{_BASE_URL}/intraday/tickers",
-            params={"type": "EQUITY", "exchange": exchange, "isNormal": "true"},
+            params={"type": "EQUITY", "exchange": exchange, "isDayTrading": "true"},
             headers={"X-API-KEY": token},
             timeout=10,
         )
@@ -44,6 +44,9 @@ def update_tickers() -> pd.DataFrame:
             })
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["stock_id"])
+    if df.empty:
+        print(f"update_tickers: API 回傳空資料（非盤中？），保留舊檔案")
+        return load_tickers() if os.path.exists(_TICKERS_PATH) else df
     os.makedirs(os.path.dirname(_TICKERS_PATH), exist_ok=True)
     df.to_parquet(_TICKERS_PATH, index=False)
     print(f"儲存完成：{len(df)} 支股票（{date_str}）→ {_TICKERS_PATH}")
