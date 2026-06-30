@@ -41,7 +41,7 @@ if tickers_df.empty:
     try:
         cached = hf_hub_download(
             repo_id=HF_REPO_ID, filename="fugle_tickers.parquet",
-            repo_type="dataset", token=HF_TOKEN,
+            repo_type="dataset",
         )
         tickers_df = pd.read_parquet(cached)
         print(f"  快取標的：{len(tickers_df)} 支")

@@ -38,6 +38,7 @@ def _load_day_from_hf() -> "pd.DataFrame":
         repo_id=_HF_REPO_ID,
         filename="fugle_day.parquet",
         repo_type="dataset",
+        token=None,   # public repo
     )
     df = pd.read_parquet(local_path)
     print(f"  {len(df):,} 筆，{df['stock_id'].nunique():,} 支")
