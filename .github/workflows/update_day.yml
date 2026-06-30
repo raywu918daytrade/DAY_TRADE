@@ -9,6 +9,7 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
+    environment: DAY_TRADE
     timeout-minutes: 60   # 最多 60 分鐘（含 rate limit 等待）
 
     steps:
