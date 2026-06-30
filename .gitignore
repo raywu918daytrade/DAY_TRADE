@@ -13,10 +13,8 @@ dist/
 *.pfx
 *.egg-info
 db
-models/
 log/
 cache/
-models/
 model/
 *.json
 tmp.txt
@@ -24,6 +22,7 @@ tmp.txt
 src/db_models/__pycache__/peewee_models.cpython-313.pyc
 *.png
 *.pkl
+!models/m1_lgbm.pkl
 .env
 chart*.html
 signal*.txt
@@ -35,5 +34,6 @@ signal*.txt
 *.md
 *.html
 *.txt
+!requirements.txt
 *.log
 *.mp3

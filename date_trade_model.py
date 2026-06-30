@@ -60,7 +60,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from tay_trade.query import load_day, load_m1
+from tay_trade.query import load_day, load_m1, load_m1_live
 
 _MODEL_PATH = Path(__file__).parent / "models/m1_lgbm.pkl"
 
@@ -114,7 +114,7 @@ def _make_barrier_labels(m1: pd.DataFrame) -> pd.Series:
 # ── 特徵工程 ──────────────────────────────────────────────────────────────────
 
 
-def make_features(m1: pd.DataFrame, day: pd.DataFrame) -> pd.DataFrame:
+def make_features(m1: pd.DataFrame, day: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame:
     # 先建 day_date，供後面日內分組使用
     m1["day_date"] = m1["date"].dt.date
 
@@ -137,12 +137,11 @@ def make_features(m1: pd.DataFrame, day: pd.DataFrame) -> pd.DataFrame:
     m1["hour"] = m1["date"].dt.hour
     m1["minute"] = m1["date"].dt.minute
 
-    # 目標：Triple Barrier Label（每日內計算，不跨日）
-    m1["target"] = _make_barrier_labels(m1)
-
-    # 過濾 label 為 NaN 的 bar（每日最後 HOLD_BARS 根無法確認結果）
-    m1 = m1[m1["target"].notna()].copy()
-    m1["target"] = m1["target"].astype(int)
+    # 目標：Triple Barrier Label（訓練用；即時推論時跳過）
+    if compute_labels:
+        m1["target"] = _make_barrier_labels(m1)
+        m1 = m1[m1["target"].notna()].copy()
+        m1["target"] = m1["target"].astype(int)
 
     # ── 當日盤中特徵（用 cumsum/cummax 確保不洩漏未來資料）────────────────────
     g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
@@ -295,6 +294,44 @@ def load_model():
     if not _MODEL_PATH.exists():
         raise FileNotFoundError(f"找不到模型，請先執行 train()")
     return joblib.load(_MODEL_PATH)
+
+
+def predict_live(
+    minute_str: str,
+    day: pd.DataFrame,
+    model=None,
+    threshold: float = 0.55,
+) -> list:
+    """
+    即時推論：載入今日 m1_live，計算特徵，回傳當分K達門檻的訊號清單。
+    回傳格式：[{"stock_id": ..., "proba": ..., "price": ...}, ...]
+    """
+    if model is None:
+        model = load_model()
+
+    date_str = minute_str[:10]
+    m1_live = load_m1_live(date_str)
+    if m1_live.empty:
+        return []
+
+    df = make_features(m1_live, day, compute_labels=False)
+
+    current = df[df["date"] == pd.Timestamp(minute_str)]
+    if current.empty:
+        return []
+
+    # 只保留特徵齊全的 bar（早盤前幾根 lag 特徵可能為 NaN）
+    valid = current.dropna(subset=FEATURES)
+    if valid.empty:
+        return []
+
+    proba = model.predict_proba(valid[FEATURES])[:, 1]
+    signals = [
+        {"stock_id": row["stock_id"], "proba": float(p), "price": float(row["close"])}
+        for (_, row), p in zip(valid.iterrows(), proba)
+        if p >= threshold
+    ]
+    return sorted(signals, key=lambda x: -x["proba"])
 
 
 def confidence_report(model=None, test_days: int = 10):
