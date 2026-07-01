@@ -41,21 +41,26 @@ def _last_stored_date() -> str | None:
 
 def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
     """先寫暫存檔再 rename，避免寫入過程被中斷導致 parquet 檔損毀"""
-    tmp_path = f"{file_path}.tmp"
-    df.to_parquet(tmp_path, **kwargs)
-    os.replace(tmp_path, file_path)
+    import tempfile
+    dir_path = os.path.dirname(file_path)
+    os.makedirs(dir_path, exist_ok=True)
+    # 用系統 tmp 目錄避免 Dropbox 干擾 rename
+    with tempfile.NamedTemporaryFile(dir=dir_path, suffix=".tmp", delete=False) as f:
+        tmp_path = f.name
+    try:
+        df.to_parquet(tmp_path, **kwargs)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
-def _download_day(stock_id: str, start_date: str) -> pd.DataFrame:
-    now = datetime.now(_TW)
-    params = {
-        "from": start_date,
-        "to": now.strftime("%Y-%m-%d"),
-        "fields": "open,high,low,close,volume",
-        "sort": "asc",
-        "adjusted": "true",
-    }
+def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
+    """單次請求（區間 < 1 年）"""
     headers = {"X-API-KEY": token}
+    params = {"from": from_date, "to": to_date,
+              "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"}
     r = requests.get(f"{_BASE_URL}/historical/candles/{stock_id}", params=params, headers=headers, timeout=10)
     if r.status_code == 429:
         time.sleep(float(r.headers.get("Retry-After", 60)) + 1)
@@ -64,11 +69,25 @@ def _download_day(stock_id: str, start_date: str) -> pd.DataFrame:
     data = r.json()
     if "data" not in data or not data["data"]:
         return pd.DataFrame()
-
     df = pd.DataFrame(data["data"])
     df["stock_id"] = stock_id
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     return df
+
+
+def _download_day(stock_id: str, start_date: str) -> pd.DataFrame:
+    """自動切割成年度區間（Fugle 限制每次 < 1 年）"""
+    now = datetime.now(_TW)
+    end = now.date()
+    cur = datetime.strptime(start_date, "%Y-%m-%d").date()
+    chunks = []
+    while cur <= end:
+        chunk_end = min(cur.replace(year=cur.year + 1) - timedelta(days=1), end)
+        df = _fetch_year(stock_id, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"))
+        if not df.empty:
+            chunks.append(df)
+        cur = chunk_end + timedelta(days=1)
+    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
 def _save_day(new_df: pd.DataFrame):
