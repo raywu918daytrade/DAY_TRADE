@@ -45,7 +45,7 @@ if tickers_df.empty:
     print("  非盤中，從 HF Hub 取快取標的清單...")
     try:
         cached = hf_hub_download(
-            repo_id=HF_REPO_ID, filename="fugle_tickers.parquet",
+            repo_id=HF_REPO_ID, filename="day_trade/data/fugle_tickers.parquet",
             repo_type="dataset", token=None,
         )
         tickers_df = pd.read_parquet(cached)
@@ -61,7 +61,7 @@ else:
     tickers_df.to_parquet(tickers_out, index=False)
     api.upload_file(
         path_or_fileobj=str(tickers_out),
-        path_in_repo="fugle_tickers.parquet",
+        path_in_repo="day_trade/data/fugle_tickers.parquet",
         repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN,
         commit_message=f"update tickers {datetime.now(_TW).strftime('%Y-%m-%d')}",
     )
@@ -77,7 +77,7 @@ print(f"  使用 {len(stocks)} 支標的")
 print("從 HF Hub 下載現有日K...")
 try:
     existing_path = hf_hub_download(
-        repo_id=HF_REPO_ID, filename="fugle_day.parquet",
+        repo_id=HF_REPO_ID, filename="day_trade/data/fugle_day.parquet",
         repo_type="dataset", token=HF_TOKEN,
     )
     df_existing = pd.read_parquet(existing_path)
@@ -124,7 +124,7 @@ print(f"  檔案大小：{out_path.stat().st_size / 1024:.0f} KB")
 print(f"推送至 HF Hub: {HF_REPO_ID}...")
 api.upload_file(
     path_or_fileobj=str(out_path),
-    path_in_repo="fugle_day.parquet",
+    path_in_repo="day_trade/data/fugle_day.parquet",
     repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN,
     commit_message=f"incremental update {datetime.now(_TW).strftime('%Y-%m-%d')}",
 )
