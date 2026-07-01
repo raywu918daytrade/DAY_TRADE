@@ -36,7 +36,7 @@ def _load_day_from_hf() -> "pd.DataFrame":
     print(f"從 HF Hub 下載日K：{_HF_REPO_ID}...")
     local_path = hf_hub_download(
         repo_id=_HF_REPO_ID,
-        filename="day_trade/data/fugle_day.parquet",
+        filename="day_trade/day/fugle_day.parquet",
         repo_type="dataset",
         token=os.environ.get("HF_TOKEN") or None,
     )
