@@ -314,16 +314,12 @@ class LiveTrader:
         avg_pnl = round(sum(c["pnl_pct"] for c in completed_trades) / closed, 4) if closed else 0.0
         total_pnl_amt = round(sum(c.get("pnl_amt") or 0 for c in completed_trades), 0)
 
-        # 今日已用額度 = 所有成交的買入金額 + 賣出金額（當沖買賣都佔額度）
-        filled_set = {"FILLED", "PARTIAL"}
+        # 已用額度 = 目前持倉買入成本（當沖資金循環：平倉後歸還，不累計賣出）
         used_quota = round(
-            sum(
-                t["price"] * t.get("filled", t.get("quantity", 0)) * 1000
-                for t in trades
-                if t.get("status") in filled_set
-            ),
+            sum(p["entry_price"] * p["quantity"] * 1000 for p in positions),
             0,
         )
+        filled_set = {"FILLED", "PARTIAL"}
         # 開倉成交 = FILLED 買進筆數；平倉回合 = FIFO 配對數（closed）
         filled = {"FILLED", "PARTIAL"}
         open_count = sum(1 for t in trades if t.get("direction") == "buy" and t.get("status") in filled)
@@ -574,12 +570,8 @@ class LiveTrader:
             except Exception as e:
                 self._reset_on_disconnect(e, "取得快照")
 
-        # 迴圈前算一次可用額度，之後每開一倉就扣，避免第 2 張高估
-        open_reserved = sum(
-            _api_positions.get(s, {}).get("entry_price", 0) * _api_positions.get(s, {}).get("quantity", 0) * 1000
-            for s in _api_positions
-        )
-        available = self.total_capital - self._used_quota - open_reserved
+        # 可用額度：總資金 - 持倉買入成本（平倉後自動釋放，無需另計 open_reserved）
+        available = self.total_capital - self._used_quota
 
         cfg_min_price = _get_setting("min_price")
         cfg_max_price = _get_setting("max_price")
@@ -623,7 +615,7 @@ class LiveTrader:
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
                 buy_cost = price * lots * 1000
                 self._used_quota += buy_cost  # 買入已用
-                available -= buy_cost * 2  # 扣掉 買 + 預留賣，給下一支用
+                available -= buy_cost  # 扣掉買入成本（賣出時歸還，不需預留）
                 print(
                     f"[LIVE OPEN] {sid} {lots}張 @ {price} → {status} [{order_id}]"
                     f"（剩餘可用 {available/10000:.1f}萬）"
@@ -667,8 +659,7 @@ class LiveTrader:
                 exit_price = float(trade.order.price) if hasattr(trade, "order") else avg_price
                 entry_price = _get_pos_entry(sid)
                 pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
-                sell_cost = exit_price * lots * 1000
-                self._used_quota += sell_cost  # 賣出佔用額度
+                self._used_quota = max(0, self._used_quota - entry_price * lots * 1000)  # 平倉歸還開倉額度
                 print(
                     f"[LIVE CLOSE] {sid} {lots}張 @ {exit_price} → {status} [{order_id}]"
                     f"（額度已用 {self._used_quota/10000:.1f}萬）"
