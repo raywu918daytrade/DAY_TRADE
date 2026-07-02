@@ -572,7 +572,10 @@ class LiveTrader:
             except Exception as e:
                 self._reset_on_disconnect(e, "取得快照")
 
-        # 可用額度：總資金 - 持倉買入成本（平倉後自動釋放，無需另計 open_reserved）
+        # 可用額度直接從 broker 持倉算（不用自追 _used_quota，永豐才是真實來源）
+        self._used_quota = round(
+            sum(p["avg_price"] * p["quantity"] * 1000 for p in current.values()), 0
+        )
         available = self.total_capital - self._used_quota
 
         cfg_min_price = _get_setting("min_price")
@@ -616,8 +619,7 @@ class LiveTrader:
                 status = trade_api.normalize_status(trade.status.status)
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
                 buy_cost = price * lots * 1000
-                self._used_quota += buy_cost  # 買入已用
-                available -= buy_cost  # 扣掉買入成本（賣出時歸還，不需預留）
+                available -= buy_cost  # 本分鐘內給後續股票用；下次 reconcile 從 broker 重算
                 print(
                     f"[LIVE OPEN] {sid} {lots}張 @ {price} → {status} [{order_id}]"
                     f"（剩餘可用 {available/10000:.1f}萬）"
@@ -661,7 +663,6 @@ class LiveTrader:
                 exit_price = float(trade.order.price) if hasattr(trade, "order") else avg_price
                 entry_price = _get_pos_entry(sid)
                 pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
-                self._used_quota = max(0, self._used_quota - entry_price * lots * 1000)  # 平倉歸還開倉額度
                 print(
                     f"[LIVE CLOSE] {sid} {lots}張 @ {exit_price} → {status} [{order_id}]"
                     f"（額度已用 {self._used_quota/10000:.1f}萬）"
