@@ -127,6 +127,8 @@ _summary: dict = {
     "filled": 0,
     "holding": 0,
     "closed": 0,
+    "wins": 0,
+    "win_rate": None,
     "today_pnl_pct": 0.0,
     "risk_rejected": 0,
     "errors": 0,
@@ -135,12 +137,13 @@ _summary: dict = {
 
 _collector_status: str = "stopped"   # "running" | "stopped" | "error"
 
-_signals: list = []        # 今日訊號列表
-_positions: dict = {}      # {stock_id: Position dict}
-_trades: list = []         # 今日成交記錄
-_candles: dict = {}        # {stock_id: [Candle dict, ...]}
-_signal_detail: dict = {}  # {stock_id: SignalDetail dict}
-_monitoring: dict = {}     # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
+_signals: list = []            # 今日訊號列表
+_positions: dict = {}          # {stock_id: Position dict}
+_trades: list = []             # 今日原始成交事件（買/賣各一筆）
+_completed_trades: list = []   # 今日完整回合（進出配對，含損益）
+_candles: dict = {}            # {stock_id: [Candle dict, ...]}
+_signal_detail: dict = {}      # {stock_id: SignalDetail dict}
+_monitoring: dict = {}         # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 
 # ── SSE 廣播 ─────────────────────────────────────────────────────────────────
 
@@ -169,12 +172,13 @@ def _broadcast(data: dict):
 # ── Public push functions（由 live_trader.py 呼叫）───────────────────────────
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _candles, _signal_detail, _positions, _monitoring
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _signal_detail, _positions, _monitoring
     today = date.today()
     if _today_date != today:
         _today_date = today
         _signals.clear()
         _trades.clear()
+        _completed_trades.clear()
         _candles.clear()
         _signal_detail.clear()
         _positions.clear()
@@ -277,15 +281,36 @@ def push_trade(trade: dict):
         _broadcast({"type": "trade", "data": trade})
 
 
-def close_position(stock_id: str, pnl_pct: float, exit_reason: str = ""):
-    """平倉：移除持倉、更新統計與訊號狀態"""
+def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_price: float = 0.0):
+    """平倉：移除持倉、更新統計、記錄完整回合"""
+    from datetime import datetime
     with _lock:
-        _positions.pop(stock_id, None)
+        pos = _positions.pop(stock_id, {})
         _summary["holding"] = len(_positions)
         _summary["closed"] += 1
+        if pnl_pct > 0:
+            _summary["wins"] += 1
         closed = _summary["closed"]
+        _summary["win_rate"] = round(_summary["wins"] / closed * 100, 1) if closed else None
         prev = _summary["today_pnl_pct"] * (closed - 1)
         _summary["today_pnl_pct"] = round((prev + pnl_pct) / closed, 4)
+
+        # 完整回合記錄
+        entry = pos.get("entry_price", 0)
+        qty = pos.get("quantity", 0)
+        pnl_amt = round((exit_price - entry) * qty * 1000, 0) if entry and exit_price else None
+        _completed_trades.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "stock_id": stock_id,
+            "name": pos.get("name", stock_id),
+            "quantity": qty,
+            "entry_price": entry,
+            "exit_price": exit_price or None,
+            "pnl_pct": round(pnl_pct, 4),
+            "pnl_amt": pnl_amt,
+            "exit_reason": exit_reason,
+        })
+        _broadcast({"type": "completed_trade", "data": _completed_trades[-1]})
         for r in _signals:
             if r["stock_id"] == stock_id:
                 r["status"] = "closed"
@@ -399,6 +424,35 @@ def chart_candles(stock_id: str):
 def get_monitoring():
     with _lock:
         return sorted(_monitoring.values(), key=lambda x: -x["proba"])
+
+
+@app.get("/completed_trades", tags=["成交"], summary="今日已完成回合（進出配對，含損益）")
+def completed_trades():
+    with _lock:
+        return list(reversed(_completed_trades))  # 最新在上
+
+
+def push_completed_trades_from_broker(closed_list: list):
+    """重啟後從永豐重建今日已平倉記錄（get_closed_today 回傳）"""
+    with _lock:
+        _completed_trades.clear()
+        for c in closed_list:
+            entry = c.get("buy_avg", 0)
+            ex = c.get("sell_avg", 0)
+            qty = c.get("quantity", 0)
+            pnl_pct = c.get("pnl_pct", 0.0)
+            pnl_amt = round((ex - entry) * qty * 1000, 0) if entry and ex else None
+            _completed_trades.append({
+                "time": "-",
+                "stock_id": c["stock_id"],
+                "name": c["stock_id"],
+                "quantity": qty,
+                "entry_price": entry,
+                "exit_price": ex,
+                "pnl_pct": pnl_pct,
+                "pnl_amt": pnl_amt,
+                "exit_reason": "broker_sync",
+            })
 
 
 @app.get(

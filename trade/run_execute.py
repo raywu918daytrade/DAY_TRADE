@@ -8,16 +8,24 @@ except ImportError:
     import trade_api  # run directly from trade/ directory
 
 try:
+    from api import _positions as _api_positions
+    def _get_pos_entry(sid: str) -> float:
+        return _api_positions.get(sid, {}).get("entry_price", 0.0)
+except ImportError:
+    def _get_pos_entry(_): return 0.0
+
+try:
     from api import push_trade as _push_trade
     from api import push_position as _push_pos
     from api import close_position as _close_pos
     from api import push_summary_update as _push_summary
+    from api import push_completed_trades_from_broker as _push_closed_sync
 except ImportError:
-    # standalone / unit-test fallback
     def _push_trade(*_): pass
     def _push_pos(*_): pass
     def _close_pos(*_): pass
     def _push_summary(*_): pass
+    def _push_closed_sync(*_): pass
 
 
 def _now() -> str:
@@ -235,11 +243,16 @@ class LiveTrader:
                 closed_today = trade_api.get_closed_today(self._api)
                 if closed_today:
                     avg_pnl = sum(c["pnl_pct"] for c in closed_today) / len(closed_today)
+                    wins = sum(1 for c in closed_today if c["pnl_pct"] > 0)
+                    n = len(closed_today)
                     _push_summary({
-                        "closed": len(closed_today),
+                        "closed": n,
+                        "wins": wins,
+                        "win_rate": round(wins / n * 100, 1),
                         "today_pnl_pct": round(avg_pnl, 4),
                     })
-                    print(f"[LIVE SYNC] 今日已平倉 {len(closed_today)} 筆，均損益 {avg_pnl:.2f}%")
+                    _push_closed_sync(closed_today)
+                    print(f"[LIVE SYNC] 今日已平倉 {n} 筆，勝率 {wins}/{n}，均損益 {avg_pnl:.2f}%")
             except Exception as e:
                 print(f"[LIVE SYNC] 已平倉同步失敗: {e}")
 
@@ -298,19 +311,24 @@ class LiveTrader:
         for sid in sorted(to_close):
             try:
                 lots = current[sid]["quantity"]
+                avg_price = current[sid]["avg_price"]
                 trade = trade_api.close(self._api, sid, lots)
                 status = trade_api.normalize_status(trade.status.status)
-                print(f"[LIVE CLOSE] {sid} {lots}張 → {status}")
+                # 用委託限價估算出場價（SDEAL 回報後 _on_order_event 會更新）
+                exit_price = float(trade.order.price) if hasattr(trade, "order") else avg_price
+                entry_price = _get_pos_entry(sid)
+                pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
+                print(f"[LIVE CLOSE] {sid} {lots}張 @ {exit_price} → {status}")
                 _push_trade({
                     "time": _now(),
                     "stock_id": sid,
                     "direction": "sell",
-                    "price": 0,          # fill price unknown until confirmed
+                    "price": exit_price,
                     "quantity": lots,
                     "status": status,
                     "broker_response": status,
                 })
-                _close_pos(sid, 0.0)
+                _close_pos(sid, pnl_pct, exit_price=exit_price)
             except Exception as e:
                 print(f"[LIVE ERROR] 平倉 {sid}: {e}")
 
