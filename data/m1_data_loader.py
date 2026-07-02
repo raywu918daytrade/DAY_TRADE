@@ -1,3 +1,19 @@
+"""
+歷史分K 下載器（訓練資料用）
+
+功能：
+    從 Fugle REST API 下載 1 分鐘 K 線，存入 db/m1/（訓練資料庫）。
+    flag 機制避免同一支股票在同一天重複下載。
+
+與 m1_rest.py 的差異：
+    m1_data_loader.py → 下載歷史分K（近30日），存 db/m1/，給訓練用，GHA 每日觸發
+    m1_rest.py        → 盤中每分鐘 poll，存 db/m1_live/，給當天交易推論用
+
+主要函式：
+    update_m1(stocks)
+        循序下載（2.1s/支），避免超過 API rate limit（60 req/min）。
+        stocks 預設為 fugle_stocks() 所有 ~2787 支。
+"""
 from datetime import datetime, timezone, timedelta
 import os
 from pathlib import Path

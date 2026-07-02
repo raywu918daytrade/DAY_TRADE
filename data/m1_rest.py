@@ -225,7 +225,9 @@ class M1RestPoller:
             return
 
         print(f"[{date_str}] 收盤後 historical backfill 開始，共 {len(stocks)} 支")
+        _BATCH = 100  # 每 100 支存一次，避免全量 concat 超過記憶體上限
         frames = []
+        saved = 0
         t0 = time.time()
         for idx, symbol in enumerate(stocks, 1):
             if self._stop:
@@ -234,21 +236,19 @@ class M1RestPoller:
             if not df.empty:
                 frames.append(df)
             if idx % 20 == 0 or idx == len(stocks):
-                print(f"  historical backfill 進度 {idx}/{len(stocks)}，有資料 {len(frames)} 支")
+                print(f"  historical backfill 進度 {idx}/{len(stocks)}，待存 {len(frames)} 支")
+            if len(frames) >= _BATCH or (idx == len(stocks) and frames):
+                _atomic_save(pd.concat(frames, ignore_index=True), _live_path(date_str))
+                saved += len(frames)
+                frames.clear()
             if idx < len(stocks):
                 time.sleep(_BACKFILL_INTERVAL)
 
-        if not frames:
+        elapsed = time.time() - t0
+        if saved == 0 and not frames:
             print(f"[{date_str}] historical backfill 沒有取得今日資料")
             return
-
-        df = pd.concat(frames, ignore_index=True)
-        _atomic_save(df, _live_path(date_str))
-        elapsed = time.time() - t0
-        print(
-            f"[{date_str}] historical backfill 完成，"
-            f"{df['stock_id'].nunique()} 支、{len(df)} 筆（{elapsed:.1f}s）"
-        )
+        print(f"[{date_str}] historical backfill 完成，{saved} 支（{elapsed:.1f}s）")
 
     def _fetch_all(self, stocks: list, date_str: str) -> pd.DataFrame:
         if not stocks:
@@ -305,8 +305,12 @@ class M1RestPoller:
             current_closed_minute = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
             if _after_poll_end(current_closed_minute):
                 date_str = current_closed_minute.strftime("%Y-%m-%d")
-                stocks = self._get_stocks()
-                self._historical_backfill_once(stocks, date_str, api_key)
+                # 只在收盤後 3 小時內補資料，之後直接 sleep 到明天
+                if now.hour < _POLL_END_HOUR + 3:
+                    stocks = self._get_stocks()
+                    self._historical_backfill_once(stocks, date_str, api_key)
+                else:
+                    print(f"[{now.strftime('%H:%M')}] 收盤超過 3 小時，略過 backfill")
                 wake_at = _next_poll_window_start(now)
                 _sleep_until(
                     wake_at,

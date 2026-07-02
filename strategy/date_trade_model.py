@@ -314,17 +314,20 @@ def predict_live(
     model=None,
     threshold: float = 0.55,
     day_trade_stocks: set | None = None,
+    m1_live: pd.DataFrame | None = None,
 ) -> list:
     """
-    即時推論：載入今日 m1_live，計算特徵，回傳當分K達門檻的訊號清單。
+    即時推論：計算特徵，回傳當分K達門檻的訊號清單。
+    m1_live: 已載入的今日分K，傳入可避免重複 I/O（on_minute 已載過）。
     day_trade_stocks: 當沖標的 set，若提供則只推論這些股票。
-    回傳格式：[{"stock_id": ..., "name": ..., "proba": ..., "price": ...}, ...]
+    回傳格式：[{"stock_id": ..., "proba": ..., "price": ...}, ...]
     """
     if model is None:
         model = load_model()
 
-    date_str = minute_str[:10]
-    m1_live = load_m1_live(date_str)
+    if m1_live is None:
+        date_str = minute_str[:10]
+        m1_live = load_m1_live(date_str)
     if m1_live.empty:
         return []
 

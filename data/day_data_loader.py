@@ -1,3 +1,18 @@
+"""
+日K 資料下載器（Fugle historical/candles）
+
+功能：
+    從 Fugle REST API 下載股票日K，按月份分檔存入 db/fugle_day/。
+    flag 機制避免同一支股票在同一天重複下載。
+
+主要函式：
+    update_day(start_date, stocks, workers)
+        增量下載指定標的的日K，多執行緒並發，5 workers 約 5 分鐘下載 1500 支。
+
+資料格式（db/fugle_day/YYYY_M.parquet）：
+    stock_id, date(str), open, high, low, close(float32), volume(int64)
+"""
+
 from datetime import datetime, timezone, timedelta
 import os
 from pathlib import Path

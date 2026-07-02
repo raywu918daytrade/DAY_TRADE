@@ -1,3 +1,21 @@
+"""
+當沖標的清單管理（Fugle /intraday/tickers）
+
+功能：
+    從 Fugle API 取得每日可當沖股票清單（過濾條件 ②③），
+    存到 db/fugle_tickers/tickers.parquet 供其他模組使用。
+
+過濾條件（Fugle API 端）：
+    ② isDayTrading=true  可當沖
+    ③ isNormal=true      正常交易（排除全額交割等）
+    → 約 2,787 支（TWSE + TPEx）
+
+注意：不含 ① 20日均量過濾（那是 live_trader.py 的 _volume_filter 做的）
+
+主要函式：
+    update_tickers()  每日開盤前呼叫一次，更新並回傳清單
+    fugle_stocks()    回傳 stock_id 列表（無清單時自動呼叫 update_tickers）
+"""
 import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path

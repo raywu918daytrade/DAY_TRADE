@@ -202,15 +202,16 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     if not (SESSION_START <= (h, m) <= SESSION_END):
         return
 
-    # 推入 K 線資料（每股今日所有分K，供圖表使用）
+    # 載入今日分K（只載一次，下面 push_candles 和 predict_live 共用）
     date_str = minute_str[:10]
     m1_live = load_m1_live(date_str)
+
     if not m1_live.empty:
         for sid, g in m1_live.groupby("stock_id"):
             candles = []
             for _, row in g.iterrows():
                 dt = datetime.strptime(str(row["date"]), "%Y-%m-%d %H:%M:%S")
-                ts = calendar.timegm(dt.timetuple())  # 以 TW 本地時間當 UTC，圖表顯示正確
+                ts = calendar.timegm(dt.timetuple())
                 candles.append(
                     {
                         "time": ts,
@@ -223,13 +224,14 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                 )
             push_candles(str(sid), candles)
 
-    # 模型推論：threshold=0 取得所有股票機率，供監控面板顯示
+    # 模型推論：threshold=0 取得所有股票機率，共用已載入的 m1_live
     all_results = predict_live(
         minute_str,
         _day,
         model=model,
         threshold=0,
         day_trade_stocks=_day_trade_stocks,
+        m1_live=m1_live if not m1_live.empty else None,
     )
     for r in all_results:
         r["name"] = _tickers.get(r["stock_id"], r["stock_id"])
