@@ -22,6 +22,7 @@ def load_m1() -> pd.DataFrame:
     """載入 db/m1/ 全部歷史分K（訓練資料，~2787 支，按月分檔）"""
     df = ds.dataset(str(_ROOT / "db/m1"), format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"])
+    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
@@ -29,6 +30,7 @@ def load_day() -> pd.DataFrame:
     """載入 db/fugle_day/ 全部日K（模型特徵用，按月分檔）"""
     df = ds.dataset(str(_ROOT / "db/fugle_day"), format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"])
+    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 

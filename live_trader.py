@@ -68,21 +68,36 @@ TOTAL_CAPITAL = _resolve_capital()
 
 
 def _load_day_from_hf() -> "pd.DataFrame":
-    """從 HF Hub 下載 fugle_day.parquet，存到本地後用 load_day() 載入"""
+    """從 HF Hub 下載最近 2 個月份的日K（月份分檔），只取近 60 天"""
     import pandas as pd
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import HfApi, hf_hub_download
 
+    token = os.environ.get("HF_TOKEN") or None
+    api = HfApi()
     print(f"從 HF Hub 下載日K：{_HF_REPO_ID}...")
-    local_path = hf_hub_download(
-        repo_id=_HF_REPO_ID,
-        filename="day_trade/day/fugle_day.parquet",
-        repo_type="dataset",
-        token=os.environ.get("HF_TOKEN") or None,
-    )
-    df = pd.read_parquet(local_path)
-    # live trading 只需要最近 60 天日K特徵，節省記憶體
+
+    day_files = sorted([
+        f for f in api.list_repo_files(repo_id=_HF_REPO_ID, repo_type="dataset", token=token)
+        if f.startswith("day_trade/day/") and f.endswith(".parquet")
+    ])
+    # 只下載最近 2 個月份（60 天內一定落在最多 2 個月）
+    recent_files = day_files[-2:] if len(day_files) >= 2 else day_files
+
+    frames = []
+    for hf_path in recent_files:
+        local_path = hf_hub_download(
+            repo_id=_HF_REPO_ID, filename=hf_path,
+            repo_type="dataset", token=token,
+        )
+        frames.append(pd.read_parquet(local_path))
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
     cutoff = (pd.Timestamp.now() - timedelta(days=60)).strftime("%Y-%m-%d")
     df = df[df["date"] >= cutoff].copy()
+    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     print(f"  {len(df):,} 筆，{df['stock_id'].nunique():,} 支（最近 60 天）")
     return df
 

@@ -1,11 +1,13 @@
 """
-GH Actions 執行：增量下載當沖日K → 合併 HF Hub 舊資料 → 推回 HF Hub
+GH Actions 執行：增量下載當沖日K → 按月份合併 HF Hub 舊資料 → 推回 HF Hub
 
 流程：
     1. 取當沖標的清單（盤中直接拿；盤後從 HF Hub 快取）
-    2. 從 HF Hub 下載現有 fugle_day.parquet，取最後日期
+    2. 從 HF Hub 現有月份檔取最後日期，決定增量起始日
     3. 只下載 last_date+1 以後的新資料
-    4. 新舊合併後推回 HF Hub
+    4. 按月份與 HF Hub 舊資料合併後推回（只更新有變動的月份）
+
+HF Hub 路徑：day_trade/day/YYYY_M.parquet（月份分檔，與 m1 一致）
 
 需要的環境變數：
     FUGLE      : Fugle API Key
@@ -19,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.dataset as ds
 from huggingface_hub import HfApi, hf_hub_download
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -26,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from data.day_data_loader import update_day
 from data.fugle_tickers import update_tickers
 
-_TW  = timezone(timedelta(hours=8))
+_TW   = timezone(timedelta(hours=8))
 _ROOT = Path(__file__).parent.parent
 
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
@@ -53,7 +56,7 @@ if tickers_df.empty:
     except Exception as e:
         raise RuntimeError(
             f"無法取得當沖標的清單（非盤中且 HF Hub 無快取）: {e}\n"
-            "請在盤中手動執行一次 push_to_hf.py 以建立快取"
+            "請在盤中手動執行一次 push_day_to_hf.py 以建立快取"
         )
 else:
     print(f"  {len(tickers_df)} 支，更新 HF Hub 快取...")
@@ -73,60 +76,82 @@ tickers_df.to_parquet(tickers_local / "tickers.parquet", index=False)
 stocks = tickers_df["stock_id"].tolist()
 print(f"  使用 {len(stocks)} 支標的")
 
-# ── 2. 從 HF Hub 取現有資料，決定增量起始日 ──────────────────────────────────
-print("從 HF Hub 下載現有日K...")
-try:
-    existing_path = hf_hub_download(
-        repo_id=HF_REPO_ID, filename="day_trade/day/fugle_day.parquet",
-        repo_type="dataset", token=HF_TOKEN,
-    )
-    df_existing = pd.read_parquet(existing_path)
-    last_date = pd.to_datetime(df_existing["date"]).max()
+# ── 2. 從 HF Hub 取現有月份清單，決定增量起始日 ───────────────────────────────
+print("掃描 HF Hub 現有日K月份...")
+day_files = [
+    f for f in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
+    if f.startswith("day_trade/day/") and f.endswith(".parquet")
+]
+
+last_date = None
+if day_files:
+    latest_file = max(day_files)   # e.g. day_trade/day/2026_7.parquet
+    try:
+        existing_path = hf_hub_download(
+            repo_id=HF_REPO_ID, filename=latest_file,
+            repo_type="dataset", token=HF_TOKEN,
+        )
+        df_latest = pd.read_parquet(existing_path)
+        last_date = pd.to_datetime(df_latest["date"]).max()
+        print(f"  最新月份 {Path(latest_file).stem}，資料至 {last_date.date()}")
+    except Exception:
+        pass
+
+today = datetime.now(_TW).strftime("%Y-%m-%d")
+if last_date is not None:
     start_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    print(f"  現有資料至 {last_date.date()}，增量起始：{start_date}")
-except Exception:
-    df_existing = pd.DataFrame()
+else:
     start_date = (datetime.now(_TW) - timedelta(days=60)).strftime("%Y-%m-%d")
     print(f"  HF Hub 無現有資料，下載最近 60 天（{start_date}）")
 
-today = datetime.now(_TW).strftime("%Y-%m-%d")
 if start_date > today:
     print("資料已是最新，無需更新")
     sys.exit(0)
 
-# ── 3. 下載增量資料 ──────────────────────────────────────────────────────────
+print(f"  增量起始：{start_date}")
+
+# ── 3. 下載增量資料 ───────────────────────────────────────────────────────────
 print(f"下載日K：{start_date} 至 {today}...")
 update_day(start_date=start_date, stocks=stocks)
 
-# ── 4. 合併本地新資料 + HF Hub 舊資料 ────────────────────────────────────────
-import pyarrow.dataset as ds
-
+# ── 4. 讀本機新資料，按月份與 HF Hub 合併後推回 ───────────────────────────────
 day_dir = _ROOT / "db/fugle_day"
-print("合併資料...")
 df_new = ds.dataset(str(day_dir), format="parquet").to_table().to_pandas()
-df_new = df_new[df_new["date"] >= start_date]   # 只取新資料
+df_new = df_new[df_new["date"] >= start_date]
+df_new["_month"] = pd.to_datetime(df_new["date"]).dt.to_period("M").astype(str)
 
-if not df_existing.empty:
-    df_all = pd.concat([df_existing, df_new], ignore_index=True)
-    df_all.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
-    df_all.sort_values(["date", "stock_id"], inplace=True)
-else:
-    df_all = df_new
+for month_str, group in df_new.groupby("_month"):
+    group = group.drop(columns=["_month"])
+    hf_filename = f"day_trade/day/{month_str.replace('-', '_')}.parquet"
 
-print(f"  合併後共 {len(df_all):,} 筆，{df_all['stock_id'].nunique():,} 支，"
-      f"日期 {df_all['date'].min()} ~ {df_all['date'].max()}")
+    # 下載該月 HF Hub 舊資料（若有）
+    try:
+        existing_path = hf_hub_download(
+            repo_id=HF_REPO_ID, filename=hf_filename,
+            repo_type="dataset", token=HF_TOKEN,
+        )
+        df_existing = pd.read_parquet(existing_path)
+        print(f"  [{month_str}] HF Hub 現有 {len(df_existing):,} 筆，本次新增 {len(group):,} 筆")
+        df_merged = pd.concat([df_existing, group], ignore_index=True)
+    except Exception:
+        print(f"  [{month_str}] 首次建立（{len(group):,} 筆）")
+        df_merged = group
 
-# ── 5. 推回 HF Hub ────────────────────────────────────────────────────────────
-out_path = _ROOT / "fugle_day.parquet"
-df_all.to_parquet(out_path, index=False, compression="zstd")
-print(f"  檔案大小：{out_path.stat().st_size / 1024:.0f} KB")
+    df_merged.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
+    df_merged.sort_values(["date", "stock_id"], inplace=True)
 
-print(f"推送至 HF Hub: {HF_REPO_ID}...")
-api.upload_file(
-    path_or_fileobj=str(out_path),
-    path_in_repo="day_trade/day/fugle_day.parquet",
-    repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN,
-    commit_message=f"incremental update {datetime.now(_TW).strftime('%Y-%m-%d')}",
-)
-out_path.unlink(missing_ok=True)
+    out_path = _ROOT / f"day_{month_str.replace('-', '_')}.parquet"
+    df_merged.to_parquet(out_path, index=False, compression="zstd")
+    size_kb = out_path.stat().st_size / 1024
+
+    print(f"  [{month_str}] 推送 {hf_filename}（{len(df_merged):,} 筆，{size_kb:.0f} KB）...")
+    api.upload_file(
+        path_or_fileobj=str(out_path),
+        path_in_repo=hf_filename,
+        repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN,
+        commit_message=f"day update {today}",
+    )
+    out_path.unlink(missing_ok=True)
+    print(f"  [{month_str}] 完成")
+
 print("完成")
