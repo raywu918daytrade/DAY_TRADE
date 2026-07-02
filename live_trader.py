@@ -70,7 +70,7 @@ def _load_day_from_hf() -> "pd.DataFrame":
     )
     df = pd.read_parquet(local_path)
     # live trading 只需要最近 60 天日K特徵，節省記憶體
-    cutoff = (pd.Timestamp.now() - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+    cutoff = (pd.Timestamp.now() - timedelta(days=60)).strftime("%Y-%m-%d")
     df = df[df["date"] >= cutoff].copy()
     print(f"  {len(df):,} 筆，{df['stock_id'].nunique():,} 支（最近 60 天）")
     return df
