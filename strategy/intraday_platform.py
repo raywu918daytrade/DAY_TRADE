@@ -8,10 +8,15 @@
     4. 輸出績效摘要
 """
 
+import sys
 from pathlib import Path
 from time import time
 
 import pandas as pd
+
+# 確保能從根目錄導入
+if str(Path(__file__).parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategy.intraday_backtest import intraday_backtest
 from data.query import load_m1
