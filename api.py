@@ -19,6 +19,7 @@ import asyncio
 import json
 import threading
 from datetime import date
+from pathlib import Path
 from typing import Optional
 
 import uvicorn
@@ -45,13 +46,14 @@ app.add_middleware(
 # ── Pydantic response models（Swagger 自動生成文件）───────────────────────────
 
 class DashboardSummary(BaseModel):
-    today_signals: int
-    sent_orders: int
-    filled: int
+    open_trades: int = 0
     holding: int
-    closed: int
+    closed: int               # 已平倉回合數（永豐 FIFO）
     win_rate: Optional[float] = None
     today_pnl_pct: float
+    today_pnl_amt: float = 0.0
+    total_capital: float = 0.0
+    used_quota: float = 0.0
     risk_rejected: int
     errors: int
     last_updated: str
@@ -109,13 +111,100 @@ class Position(BaseModel):
     take_profit: float
 
 class TradeRecord(BaseModel):
+    order_id: str = ""
     time: str
     stock_id: str
     direction: str
     price: float
     quantity: int
+    filled: int = 0
     status: str             # FILLED / PARTIAL / SENT / FAILED
     broker_response: Optional[str] = None
+
+# ── 使用者設定（settings.json + HF Hub 備份，覆蓋 .env 預設值）─────────────
+
+import os as _os
+
+_SETTINGS_PATH = Path(__file__).parent / "settings.json"
+_HF_SETTINGS_FILENAME = "day_trade/settings.json"
+_settings_cache: dict | None = None   # in-memory cache，避免每次 reconcile 讀磁碟
+
+
+def _hf_download_settings() -> dict:
+    """從 HF Hub 拉 settings.json（Render 重啟後磁碟遺失時用）"""
+    repo_id = _os.environ.get("HF_REPO_ID", "")
+    token   = _os.environ.get("HF_TOKEN", "") or None
+    if not repo_id:
+        return {}
+    try:
+        from huggingface_hub import hf_hub_download
+        local = hf_hub_download(
+            repo_id=repo_id,
+            filename=_HF_SETTINGS_FILENAME,
+            repo_type="dataset",
+            token=token,
+        )
+        data = json.loads(Path(local).read_text(encoding="utf-8"))
+        print(f"[設定] 從 HF Hub 載入 settings: {data}")
+        return data
+    except Exception as e:
+        print(f"[設定] HF Hub 無設定檔（首次或未上傳）: {e}")
+        return {}
+
+
+def _hf_upload_settings(data: dict) -> None:
+    """把 settings.json 非同步上傳到 HF Hub（寫完本地後背景執行）"""
+    repo_id = _os.environ.get("HF_REPO_ID", "")
+    token   = _os.environ.get("HF_TOKEN", "") or None
+    if not repo_id:
+        return
+    def _upload():
+        try:
+            from huggingface_hub import HfApi
+            HfApi().upload_file(
+                path_or_fileobj=json.dumps(data, ensure_ascii=False, indent=2).encode(),
+                path_in_repo=_HF_SETTINGS_FILENAME,
+                repo_id=repo_id,
+                repo_type="dataset",
+                token=token,
+                commit_message="update settings",
+            )
+            print("[設定] settings.json 已同步至 HF Hub")
+        except Exception as e:
+            print(f"[設定] HF Hub 上傳失敗: {e}")
+    threading.Thread(target=_upload, daemon=True).start()
+
+
+def _load_settings() -> dict:
+    """讀設定：優先 in-memory cache → 本地 settings.json → HF Hub"""
+    global _settings_cache
+    if _settings_cache is not None:
+        return _settings_cache
+    # 本地有就用本地
+    try:
+        _settings_cache = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        return _settings_cache
+    except Exception:
+        pass
+    # 本地沒有（Render 重啟）→ 從 HF Hub 拉
+    _settings_cache = _hf_download_settings()
+    if _settings_cache:
+        # 存回本地，避免同一次運行重複下載
+        _SETTINGS_PATH.write_text(json.dumps(_settings_cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    return _settings_cache
+
+
+def _save_settings(data: dict) -> None:
+    global _settings_cache
+    _settings_cache = data
+    _SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _hf_upload_settings(data)   # 背景同步至 HF Hub
+
+
+def get_setting(key: str, default=None):
+    """取使用者設定值；cache/settings.json 優先，找不到回傳 default（通常來自 .env）"""
+    return _load_settings().get(key, default)
+
 
 # ── In-memory state ──────────────────────────────────────────────────────────
 
@@ -123,14 +212,15 @@ _lock = threading.Lock()
 _today_date: date = None
 
 _SUMMARY_DEFAULT: dict = {
-    "today_signals": 0,
-    "sent_orders": 0,
-    "filled": 0,
-    "holding": 0,
-    "closed": 0,
+    "open_trades": 0,      # 買進成交次數（開倉），即時計
+    "holding": 0,          # 目前持倉部位數
+    "closed": 0,           # 已平倉回合數（永豐 FIFO 配對，sync_from_broker 更新）
     "wins": 0,
     "win_rate": None,
     "today_pnl_pct": 0.0,
+    "today_pnl_amt": 0.0,  # 今日已實現損益（元，估算）
+    "total_capital": 0.0,  # 當沖總額度（元），來自 TOTAL_CAPITAL 環境變數
+    "used_quota": 0.0,     # 今日已用額度 = 買入金額 + 賣出金額
     "risk_rejected": 0,
     "errors": 0,
     "last_updated": "",
@@ -267,10 +357,12 @@ def push_position(position: dict):
 
 
 def push_trade(trade: dict):
-    """推入成交記錄"""
+    """推入成交記錄；open_trades 即時計成交買進，平倉數由永豐 FIFO（closed）為準"""
     with _lock:
         _trades.append(trade)
-        _summary["filled"] = len(_trades)
+        status = trade.get("status", "")
+        if trade.get("direction") == "buy" and status in {"FILLED", "PARTIAL"}:
+            _summary["open_trades"] += 1
         sid = trade["stock_id"]
         # 更新生命週期
         if sid in _signal_detail:
@@ -296,6 +388,8 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_pr
         _summary["win_rate"] = round(_summary["wins"] / closed * 100, 1) if closed else None
         prev = _summary["today_pnl_pct"] * (closed - 1)
         _summary["today_pnl_pct"] = round((prev + pnl_pct) / closed, 4)
+        if pnl_amt is not None:
+            _summary["today_pnl_amt"] = round(_summary.get("today_pnl_amt", 0) + pnl_amt, 0)
 
         # 完整回合記錄
         entry = pos.get("entry_price", 0)
@@ -349,11 +443,12 @@ def sync_broker_snapshot(
         _completed_trades.clear()
         _completed_trades.extend(completed_trades)
 
+        filled = {"FILLED", "PARTIAL"}
+        open_trades = sum(1 for t in _trades if t.get("direction") == "buy" and t.get("status") in filled)
         _summary.update({
             "holding": len(_positions),
-            "sent_orders": len(_trades),
-            "filled": sum(1 for t in _trades if t.get("status") in {"FILLED", "PARTIAL"}),
-            "closed": len(_completed_trades),
+            "open_trades": open_trades,
+            # close_trades / closed 由 summary_updates 傳入（FIFO 回合數），不在此重算
         })
         _summary.update(summary_updates)
 
@@ -399,6 +494,32 @@ _COLLECTOR_MSG = {
     "stopped": "盤後或尚未啟動",
     "error":   "資料流中斷",
 }
+
+@app.get("/settings", tags=["系統"], summary="取得使用者設定")
+def settings_get():
+    """回傳 settings.json 的內容（若檔案不存在回傳空物件）"""
+    return _load_settings()
+
+
+@app.post("/settings", tags=["系統"], summary="儲存使用者設定")
+async def settings_post(request: Request):
+    """
+    更新 settings.json 並立即套用至儀表板。
+    目前支援欄位：
+      total_capital (float)：當沖總額度（元）
+    """
+    body: dict = await request.json()
+    current = _load_settings()
+    for k, v in body.items():
+        if v is None:
+            current.pop(k, None)   # null → 刪除 key，回落 .env 預設
+        else:
+            current[k] = v
+    _save_settings(current)
+    if "total_capital" in body and body["total_capital"] is not None:
+        push_summary_update({"total_capital": float(body["total_capital"])})
+    return {"ok": True, "settings": current}
+
 
 @app.get("/health", tags=["系統"], summary="健康檢查")
 def health():
@@ -474,8 +595,17 @@ def completed_trades():
         return list(reversed(_completed_trades))  # 最新在上
 
 
-def push_completed_trades_from_broker(closed_list: list):
-    """重啟後從永豐重建今日已平倉記錄（get_closed_today 回傳）"""
+@app.get("/failed_orders", tags=["成交"], summary="今日失敗委託（含錯誤訊息）")
+def failed_orders():
+    with _lock:
+        return list(reversed([t for t in _trades if t.get("status") == "FAILED"]))
+
+
+def push_completed_trades_from_broker(closed_list: list, name_lookup=None):
+    """重啟後從永豐重建今日已平倉記錄（get_closed_today 回傳）。
+    name_lookup: callable(stock_id) → str，可傳入 _tickers.get 查公司名。
+    """
+    _lookup = name_lookup or (lambda sid: sid)
     with _lock:
         _completed_trades.clear()
         for c in closed_list:
@@ -484,10 +614,11 @@ def push_completed_trades_from_broker(closed_list: list):
             qty = c.get("quantity", 0)
             pnl_pct = c.get("pnl_pct", 0.0)
             pnl_amt = round((ex - entry) * qty * 1000, 0) if entry and ex else None
+            sid = c["stock_id"]
             _completed_trades.append({
                 "time": "-",
-                "stock_id": c["stock_id"],
-                "name": c["stock_id"],
+                "stock_id": sid,
+                "name": _lookup(sid),
                 "quantity": qty,
                 "entry_price": entry,
                 "exit_price": ex,

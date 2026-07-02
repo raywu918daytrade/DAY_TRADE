@@ -4,11 +4,19 @@
 架構：
     主執行緒  → uvicorn（FastAPI + SSE）
     背景執行緒 → M1RestPoller（Fugle REST API，每分鐘 poll）
+    背景執行緒 → _daily_refresh（每天 06:00 更新當沖標的 + 日K）
+    背景執行緒 → _force_close_eod（每天 13:25 強制平倉，當沖不過夜）
+
+資料取用時段：
+    盤前（<09:01）  : 日K 從 HF Hub / 本地載入；分K 從既有 parquet 讀取（昨日 backfill）
+    盤中（09:01~13:00）: Fugle REST /intraday/candles 每分鐘 poll，寫入 db/m1_live/
+    盤後（>13:00）  : Fugle REST /historical/candles 補齊完整今日分K，再 sleep 到隔日
 
 流程：
     on_minute → predict_live → push_monitoring → SSE monitoring event
                              → push_signals    → API /signals/today
                              → push_candles    → API /chart/{id}/candles
+                             → reconcile       → 永豐 / paper 下單
 """
 
 import calendar
@@ -20,17 +28,32 @@ import pandas as pd
 import uvicorn
 
 from api import get_uvicorn_config, push_candles, push_monitoring, push_signals, set_collector_status, update_positions_price
-from date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
+from strategy.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
 import os
 
-from tay_trade.fugle_tickers import update_tickers
-from tay_trade.m1_rest import M1RestPoller
-from tay_trade.query import load_day, load_m1_live
+from data.fugle_tickers import update_tickers
+from data.m1_rest import M1RestPoller
+from data.query import load_day, load_m1_live
 
 _HF_REPO_ID = os.environ.get("HF_REPO_ID", "")   # 設在 Render 環境變數
 
 TRADE_MODE = os.environ.get("TRADE_MODE", "off")      # off | paper | sim | live
-TOTAL_CAPITAL = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
+_TOTAL_CAPITAL_ENV = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
+
+# settings.json 存在且有 total_capital → 優先使用，否則回落 .env
+def _resolve_capital() -> float:
+    # api.py 已初始化 _settings_cache（含 HF Hub fallback），直接用 get_setting
+    try:
+        from api import get_setting
+        v = get_setting("total_capital")
+        if v is not None:
+            print(f"[設定] 總額度從 settings 載入：{float(v):,.0f}")
+            return float(v)
+    except Exception:
+        pass
+    return _TOTAL_CAPITAL_ENV
+
+TOTAL_CAPITAL = _resolve_capital()
 
 
 def _load_day_from_hf() -> "pd.DataFrame":
@@ -140,6 +163,7 @@ def _daily_refresh():
 
 
 def on_minute(minute_str: str, df: pd.DataFrame):
+    """M1RestPoller 每分鐘回呼：推論、推送監控/K線/訊號，並觸發下單。"""
     dt = pd.Timestamp(minute_str)
     h, m = dt.hour, dt.minute
 
@@ -174,14 +198,18 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     )
     for r in all_results:
         r["name"] = _tickers.get(r["stock_id"], r["stock_id"])
-    push_monitoring(minute_str, all_results, THRESHOLD)
+    # 每分鐘從 settings 讀信心度，允許前端即時調整
+    from api import get_setting
+    threshold = float(get_setting("threshold") or THRESHOLD)
+
+    push_monitoring(minute_str, all_results, threshold)
 
     # 用最新分K收盤價更新持倉卡片浮動損益（今日損益只計已實現，不含此處）
     price_map = {r["stock_id"]: r["price"] for r in all_results}
     update_positions_price(price_map)
 
     # 只有達門檻才產生交易訊號
-    signals = [r for r in all_results if r["proba"] >= THRESHOLD]
+    signals = [r for r in all_results if r["proba"] >= threshold]
     push_signals(minute_str, signals)
 
     print(f"[{minute_str}] 推論 {len(all_results)} 支，信心度: " +
@@ -201,8 +229,10 @@ _force_close_done_date = None  # 防止同一天重複觸發
 
 
 def _force_close_eod():
-    """每天 FORCE_CLOSE_HOUR:FORCE_CLOSE_MIN 強制平倉所有當沖部位（不過夜）"""
-    global _force_closed_date
+    """每天 FORCE_CLOSE_HOUR:FORCE_CLOSE_MIN 強制平倉所有當沖部位（不過夜）。
+    reconcile([]) 傳空訊號 → 所有現倉視為「不在目標」而被賣出。
+    """
+    global _force_close_done_date
     while True:
         now = datetime.now(_TW)
         trigger = now.replace(
@@ -214,14 +244,21 @@ def _force_close_eod():
             time.sleep(wait)
             now = datetime.now(_TW)
         today = now.date()
-        global _force_close_done_date
         if _force_close_done_date != today and _executor is not None:
             _force_close_done_date = today
-            print(f"[{now.strftime('%H:%M:%S')}] 強制平倉：當沖部位全部平倉（{_FORCE_CLOSE_HOUR}:{_FORCE_CLOSE_MIN:02d}）")
+            print(f"[{now.strftime('%H:%M:%S')}] 強制平倉：本系統當沖倉位（{_FORCE_CLOSE_HOUR}:{_FORCE_CLOSE_MIN:02d}）")
             try:
-                _executor.reconcile([])  # 空訊號 → 平掉所有持倉
+                _executor.force_close_own_positions()  # 只平本系統追蹤的倉，長期持倉不動
             except Exception as e:
                 print(f"[FORCE CLOSE] 錯誤: {e}")
+            # 等委託成交後，從永豐同步一次最終狀態（確保 dashboard 與 broker 一致）
+            time.sleep(10)
+            if hasattr(_executor, "sync_from_broker"):
+                try:
+                    _executor.sync_from_broker()
+                    print(f"[FORCE CLOSE] 盤後同步完成")
+                except Exception as e:
+                    print(f"[FORCE CLOSE] 盤後同步失敗: {e}")
         # 等到明天同一時間
         next_trigger = trigger + timedelta(days=1)
         time.sleep(max((next_trigger - datetime.now(_TW)).total_seconds(), 60))
@@ -229,11 +266,12 @@ def _force_close_eod():
 
 def _get_stocks():
     """每次重連都取最新當沖標的；非盤中無清單時回退到所有可交易股票"""
-    from tay_trade.fugle_tickers import fugle_stocks
+    from data.fugle_tickers import fugle_stocks
     return list(_day_trade_stocks) if _day_trade_stocks else fugle_stocks()
 
 
 def _start_collector():
+    """M1RestPoller 收集器執行緒，異常時更新 collector 狀態供 /health 回傳。"""
     collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks)
     try:
         set_collector_status("running")

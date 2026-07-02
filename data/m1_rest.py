@@ -25,7 +25,7 @@ import requests
 from dotenv import load_dotenv
 from fugle_marketdata import RestClient
 
-from tay_trade.fugle_tickers import fugle_stocks
+from data.fugle_tickers import fugle_stocks
 
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env")

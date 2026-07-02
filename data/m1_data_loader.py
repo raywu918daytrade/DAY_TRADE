@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from tay_trade.fugle_tickers import fugle_stocks
+from data.fugle_tickers import fugle_stocks
 
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env")

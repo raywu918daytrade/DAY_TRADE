@@ -70,6 +70,7 @@ def _tick(price: float) -> float:
 
 
 def close(api: sj.Shioaji, stock_id: str, quantity: int):
+    """當沖賣出（現股當沖，order_cond=DayTradingSell → 證交稅 0.15%，非 0.3%）"""
     contract = api.Contracts.Stocks[stock_id]
     price = api.snapshots([contract])[0].close
     raw = price * 0.995
@@ -84,12 +85,14 @@ def close(api: sj.Shioaji, stock_id: str, quantity: int):
             action=sj.Action.Sell,
             price_type=sj.StockPriceType.LMT,
             order_type=sj.OrderType.ROD,
+            order_cond=sj.OrderCondition.DayTradingSell,  # 現股當沖賣出，稅率 0.15%
         ),
     )
     return trade
 
 
 def open(api: sj.Shioaji, stock_id: str, quantity: int, action: sj.Action = sj.Action.Buy):
+    """當沖買進（現股）"""
     contract = api.Contracts.Stocks[stock_id]
     close = api.snapshots([contract])[0].close
     raw = close * 1.01
@@ -109,31 +112,44 @@ def open(api: sj.Shioaji, stock_id: str, quantity: int, action: sj.Action = sj.A
     return trade
 
 
-def get_positions(api: sj.Shioaji) -> dict[str, dict]:
-    """回傳 {stock_id: {"quantity": lots, "avg_price": fill_price}} 目前持倉（永豐實際成交均價）"""
-    return {
-        p.code: {"quantity": p.quantity, "avg_price": float(p.price)}
-        for p in api.list_positions(api.stock_account)
-    }
+def get_positions(api: sj.Shioaji, day_trade_only: bool = False) -> dict[str, dict]:
+    """回傳 {stock_id: {"quantity": lots, "avg_price": fill_price, "yd_quantity": 昨日庫存}} 目前持倉。
+    day_trade_only=True：只回傳今天新買的（yd_quantity == 0），排除昨日帶過來的長期持股。
+    """
+    result = {}
+    for p in api.list_positions(api.stock_account):
+        yd_qty = getattr(p, "yd_quantity", 0) or 0
+        if day_trade_only and yd_qty > 0:
+            continue  # 昨日帶過來的長期持股，略過
+        result[p.code] = {
+            "quantity": p.quantity,
+            "avg_price": float(p.price),
+            "yd_quantity": yd_qty,
+        }
+    return result
 
 
 def get_closed_today(api: sj.Shioaji) -> list[dict]:
     """
     從今日委託記錄重建已平倉清單。
-    當沖：同一支股票有買進成交 + 賣出成交 → 視為已平倉。
-    回傳 [{"stock_id", "buy_avg", "sell_avg", "quantity", "pnl_pct"}, ...]
+    每筆賣出成交各算一回合（FIFO 配對對應買進），而非按股票合併。
+    回傳 [{"stock_id", "buy_avg", "sell_avg", "quantity", "pnl_pct", "sell_time"}, ...]
     """
     from datetime import date
+    from collections import deque
     today = date.today()
     api.update_status()
-    trades = api.list_trades()
+    trades = sorted(api.list_trades(), key=lambda t: t.status.order_datetime)
 
-    buys: dict[str, list] = {}
-    sells: dict[str, list] = {}
+    # 按股票建立買進 FIFO queue：[(price, qty), ...]
+    buy_queues: dict[str, deque] = {}
+    # 賣出事件清單：[(price, qty, time), ...]
+    sell_events: dict[str, list] = {}
+
     for t in trades:
-        # 過濾今日
-        order_date = getattr(t.status.order_datetime, "date", lambda: t.status.order_datetime)()
-        if order_date != today:
+        order_dt = t.status.order_datetime
+        order_date = getattr(order_dt, "date", lambda: order_dt)()
+        if str(order_date) != str(today):
             continue
         filled = t.status.deal_quantity
         if filled <= 0:
@@ -141,29 +157,73 @@ def get_closed_today(api: sj.Shioaji) -> list[dict]:
         code = t.contract.code
         price = float(t.order.price)
         action = str(t.order.action).lower()
+        time_str = order_dt.strftime("%H:%M:%S") if hasattr(order_dt, "strftime") else str(order_dt)[11:19]
         if "buy" in action:
-            buys.setdefault(code, []).append((price, filled))
+            buy_queues.setdefault(code, deque()).append((price, filled))
         else:
-            sells.setdefault(code, []).append((price, filled))
+            sell_events.setdefault(code, []).append((price, filled, time_str))
 
     result = []
-    for code in sells:
-        if code not in buys:
-            continue
-        buy_lots = sum(q for _, q in buys[code])
-        sell_lots = sum(q for _, q in sells[code])
-        qty = min(buy_lots, sell_lots)
-        buy_avg = sum(p * q for p, q in buys[code]) / sum(q for _, q in buys[code])
-        sell_avg = sum(p * q for p, q in sells[code]) / sum(q for _, q in sells[code])
-        pnl_pct = round((sell_avg - buy_avg) / buy_avg * 100, 4)
-        result.append({
-            "stock_id": code,
-            "quantity": qty,
-            "buy_avg": round(buy_avg, 3),
-            "sell_avg": round(sell_avg, 3),
-            "pnl_pct": pnl_pct,
-        })
+    for code, sells in sell_events.items():
+        q = buy_queues.get(code, deque())
+        buy_rem = 0
+        buy_price = 0.0
+        for sell_price, sell_qty, sell_time in sells:
+            matched = 0
+            cost = 0.0
+            rem = sell_qty
+            while rem > 0:
+                if buy_rem == 0:
+                    if not q:
+                        break
+                    buy_price, buy_rem = q.popleft()
+                take = min(rem, buy_rem)
+                cost += buy_price * take
+                buy_rem -= take
+                matched += take
+                rem -= take
+            if matched <= 0:
+                continue
+            buy_avg = cost / matched
+            pnl_pct = round((sell_price - buy_avg) / buy_avg * 100, 4) if buy_avg else 0.0
+            result.append({
+                "stock_id": code,
+                "quantity": matched,
+                "buy_avg": round(buy_avg, 3),
+                "sell_avg": round(sell_price, 3),
+                "pnl_pct": pnl_pct,
+                "sell_time": sell_time,
+            })
+        # 未配對的買進剩餘量放回（仍持倉）
+        if buy_rem > 0:
+            q.appendleft((buy_price, buy_rem))
     return result
+
+
+def cancel_sent_orders(api: sj.Shioaji) -> dict[str, list[str]]:
+    """
+    取消今日所有 SENT（掛單未成交）的買/賣委託。
+    回傳 {"buy": [sid, ...], "sell": [sid, ...]}
+    """
+    from datetime import date
+    today = date.today()
+    api.update_status()
+    cancelled = {"buy": [], "sell": []}
+    for t in api.list_trades():
+        order_dt = t.status.order_datetime
+        order_date = getattr(order_dt, "date", lambda: order_dt)()
+        if str(order_date) != str(today):
+            continue
+        if normalize_status(t.status.status) != "SENT":
+            continue
+        sid = t.contract.code
+        direction = "buy" if "buy" in str(t.order.action).lower() else "sell"
+        try:
+            api.cancel_order(t)
+            cancelled[direction].append(sid)
+        except Exception as e:
+            print(f"[CANCEL] {sid} {direction} 取消失敗: {e}")
+    return cancelled
 
 
 def list_orders(api: sj.Shioaji) -> list:

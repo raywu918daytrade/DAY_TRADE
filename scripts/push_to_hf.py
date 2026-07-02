@@ -23,8 +23,8 @@ from huggingface_hub import HfApi, hf_hub_download
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from tay_trade.day_data_loader import update_day
-from tay_trade.fugle_tickers import update_tickers
+from data.day_data_loader import update_day
+from data.fugle_tickers import update_tickers
 
 _TW  = timezone(timedelta(hours=8))
 _ROOT = Path(__file__).parent.parent

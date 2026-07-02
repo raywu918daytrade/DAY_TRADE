@@ -61,7 +61,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from tay_trade.query import load_day, load_m1, load_m1_live
+from data.query import load_day, load_m1, load_m1_live
 
 _MODEL_PATH = Path(__file__).parent / "models/m1_lgbm.pkl"
 

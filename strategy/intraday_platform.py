@@ -13,8 +13,8 @@ from time import time
 
 import pandas as pd
 
-from intraday_backtest import intraday_backtest
-from tay_trade.query import load_m1
+from strategy.intraday_backtest import intraday_backtest
+from data.query import load_m1
 
 _ROOT = Path(__file__).parent
 
@@ -180,7 +180,7 @@ def optimize_optuna(df_proba: pd.DataFrame, n_trials: int = 50):
 # ── 執行入口 ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from date_trade_model import predict
+    from strategy.date_trade_model import predict
 
     df_proba = predict()  # 載入已訓練模型並產生預測機率
     portfolio_df, trades_df = run_backtest(df_proba)
