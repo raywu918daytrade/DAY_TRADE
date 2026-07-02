@@ -150,21 +150,19 @@ except Exception as e:
     _tickers = {}
     _day_trade_stocks = None
 
-# HF_REPO_ID 有設定 → 從 HF 下載（Render）；否則用本地（本機開發）
-print("載入日K資料...", flush=True)
-try:
-    if _HF_REPO_ID:
-        _day = _load_day_from_hf()
-    else:
-        _day = load_day()
-    print(f"✓ 日K 載入完成：{len(_day)} 筆", flush=True)
-except Exception as e:
-    print(f"✗ 日K 載入失敗: {e}", flush=True)
-    _day = pd.DataFrame()
-
-# 條件③：20日均量過濾
+# 盤中才有標的清單，非盤中跳過日K載入（省記憶體）；_daily_refresh 在 06:00 補載
 if _day_trade_stocks:
+    print("載入日K資料...", flush=True)
+    try:
+        _day = _load_day_from_hf() if _HF_REPO_ID else load_day()
+        print(f"✓ 日K 載入完成：{len(_day)} 筆", flush=True)
+    except Exception as e:
+        print(f"✗ 日K 載入失敗: {e}", flush=True)
+        _day = pd.DataFrame()
     _day_trade_stocks = _volume_filter(_day_trade_stocks, _day)
+else:
+    _day = pd.DataFrame()
+    print("非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
 
 print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...", flush=True)
 
@@ -186,13 +184,16 @@ if TRADE_MODE != "off":
 
 
 def _daily_refresh():
-    """每天 08:45 更新當沖清單與日K（Render 24小時常駐用）"""
+    """每天 06:00 更新當沖清單與日K（Render 24小時常駐用）"""
     global _tickers, _day_trade_stocks, _day
     last_refresh = None
     while True:
         now = datetime.now(_TW)
         today = now.date()
-        if last_refresh != today and now.hour == 6 and now.minute >= 0:
+        need_refresh = (last_refresh != today and now.hour == 6 and now.minute >= 0)
+        # 啟動時若日K是空的（非盤中跳過）且已過 06:00，立即補載
+        need_refresh = need_refresh or (last_refresh is None and _day.empty and now.hour >= 6)
+        if need_refresh:
             print(f"[{now.strftime('%H:%M')}] 每日更新：當沖標的 + 日K...")
             try:
                 df = update_tickers()
