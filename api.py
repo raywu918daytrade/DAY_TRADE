@@ -45,10 +45,11 @@ app.add_middleware(
 
 # ── Pydantic response models（Swagger 自動生成文件）───────────────────────────
 
+
 class DashboardSummary(BaseModel):
     open_trades: int = 0
     holding: int
-    closed: int               # 已平倉回合數（永豐 FIFO）
+    closed: int  # 已平倉回合數（永豐 FIFO）
     win_rate: Optional[float] = None
     today_pnl_pct: float
     today_pnl_amt: float = 0.0
@@ -58,17 +59,19 @@ class DashboardSummary(BaseModel):
     errors: int
     last_updated: str
 
+
 class SignalRecord(BaseModel):
     time: str
     stock_id: str
     name: str
-    direction: str          # "buy" | "sell"
-    score: int              # proba * 100，0~100
-    status: str             # signal_only / risk_pass / sent / filled / holding / closed / failed
+    direction: str  # "buy" | "sell"
+    score: int  # proba * 100，0~100
+    status: str  # signal_only / risk_pass / sent / filled / holding / closed / failed
     pnl_pct: Optional[float] = None
 
+
 class Candle(BaseModel):
-    time: int | str   # Unix timestamp (int) 或舊格式字串
+    time: int | str  # Unix timestamp (int) 或舊格式字串
     open: float
     high: float
     low: float
@@ -76,14 +79,17 @@ class Candle(BaseModel):
     volume: int
     vwap: Optional[float] = None
 
+
 class CandleResponse(BaseModel):
     stock_id: str
     candles: list[Candle]
+
 
 class LifecycleEvent(BaseModel):
     time: str
     event: str
     detail: Optional[str] = None
+
 
 class SignalDetail(BaseModel):
     stock_id: str
@@ -100,6 +106,7 @@ class SignalDetail(BaseModel):
     signal_reasons: list[str] = []
     lifecycle: list[LifecycleEvent] = []
 
+
 class Position(BaseModel):
     stock_id: str
     name: str
@@ -110,6 +117,7 @@ class Position(BaseModel):
     stop_loss: float
     take_profit: float
 
+
 class TradeRecord(BaseModel):
     order_id: str = ""
     time: str
@@ -118,8 +126,9 @@ class TradeRecord(BaseModel):
     price: float
     quantity: int
     filled: int = 0
-    status: str             # FILLED / PARTIAL / SENT / FAILED
+    status: str  # FILLED / PARTIAL / SENT / FAILED
     broker_response: Optional[str] = None
+
 
 # ── 使用者設定（settings.json + HF Hub 備份，覆蓋 .env 預設值）─────────────
 
@@ -127,17 +136,18 @@ import os as _os
 
 _SETTINGS_PATH = Path(__file__).parent / "settings.json"
 _HF_SETTINGS_FILENAME = "day_trade/settings.json"
-_settings_cache: dict | None = None   # in-memory cache，避免每次 reconcile 讀磁碟
+_settings_cache: dict | None = None  # in-memory cache，避免每次 reconcile 讀磁碟
 
 
 def _hf_download_settings() -> dict:
     """從 HF Hub 拉 settings.json（Render 重啟後磁碟遺失時用）"""
     repo_id = _os.environ.get("HF_REPO_ID", "")
-    token   = _os.environ.get("HF_TOKEN", "") or None
+    token = _os.environ.get("HF_TOKEN", "") or None
     if not repo_id:
         return {}
     try:
         from huggingface_hub import hf_hub_download
+
         local = hf_hub_download(
             repo_id=repo_id,
             filename=_HF_SETTINGS_FILENAME,
@@ -155,12 +165,14 @@ def _hf_download_settings() -> dict:
 def _hf_upload_settings(data: dict) -> None:
     """把 settings.json 非同步上傳到 HF Hub（寫完本地後背景執行）"""
     repo_id = _os.environ.get("HF_REPO_ID", "")
-    token   = _os.environ.get("HF_TOKEN", "") or None
+    token = _os.environ.get("HF_TOKEN", "") or None
     if not repo_id:
         return
+
     def _upload():
         try:
             from huggingface_hub import HfApi
+
             HfApi().upload_file(
                 path_or_fileobj=json.dumps(data, ensure_ascii=False, indent=2).encode(),
                 path_in_repo=_HF_SETTINGS_FILENAME,
@@ -172,6 +184,7 @@ def _hf_upload_settings(data: dict) -> None:
             print("[設定] settings.json 已同步至 HF Hub")
         except Exception as e:
             print(f"[設定] HF Hub 上傳失敗: {e}")
+
     threading.Thread(target=_upload, daemon=True).start()
 
 
@@ -198,7 +211,7 @@ def _save_settings(data: dict) -> None:
     global _settings_cache
     _settings_cache = data
     _SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    _hf_upload_settings(data)   # 背景同步至 HF Hub
+    _hf_upload_settings(data)  # 背景同步至 HF Hub
 
 
 def get_setting(key: str, default=None):
@@ -212,30 +225,30 @@ _lock = threading.Lock()
 _today_date: date = None
 
 _SUMMARY_DEFAULT: dict = {
-    "open_trades": 0,      # 買進成交次數（開倉），即時計
-    "holding": 0,          # 目前持倉部位數
-    "closed": 0,           # 已平倉回合數（永豐 FIFO 配對，sync_from_broker 更新）
+    "open_trades": 0,  # 買進成交次數（開倉），即時計
+    "holding": 0,  # 目前持倉部位數
+    "closed": 0,  # 已平倉回合數（永豐 FIFO 配對，sync_from_broker 更新）
     "wins": 0,
     "win_rate": None,
     "today_pnl_pct": 0.0,
     "today_pnl_amt": 0.0,  # 今日已實現損益（元，估算）
     "total_capital": 0.0,  # 當沖總額度（元），來自 TOTAL_CAPITAL 環境變數
-    "used_quota": 0.0,     # 今日已用額度 = 買入金額 + 賣出金額
+    "used_quota": 0.0,  # 今日已用額度 = 買入金額 + 賣出金額
     "risk_rejected": 0,
     "errors": 0,
     "last_updated": "",
 }
 _summary: dict = dict(_SUMMARY_DEFAULT)
 
-_collector_status: str = "stopped"   # "running" | "stopped" | "error"
+_collector_status: str = "stopped"  # "running" | "stopped" | "error"
 
-_signals: list = []            # 今日訊號列表
-_positions: dict = {}          # {stock_id: Position dict}
-_trades: list = []             # 今日原始成交事件（買/賣各一筆）
-_completed_trades: list = []   # 今日完整回合（進出配對，含損益）
-_candles: dict = {}            # {stock_id: [Candle dict, ...]}
-_signal_detail: dict = {}      # {stock_id: SignalDetail dict}
-_monitoring: dict = {}         # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
+_signals: list = []  # 今日訊號列表
+_positions: dict = {}  # {stock_id: Position dict}
+_trades: list = []  # 今日原始成交事件（買/賣各一筆）
+_completed_trades: list = []  # 今日完整回合（進出配對，含損益）
+_candles: dict = {}  # {stock_id: [Candle dict, ...]}
+_signal_detail: dict = {}  # {stock_id: SignalDetail dict}
+_monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 
 # ── SSE 廣播 ─────────────────────────────────────────────────────────────────
 
@@ -262,6 +275,7 @@ def _broadcast(data: dict):
 
 
 # ── Public push functions（由 live_trader.py 呼叫）───────────────────────────
+
 
 def _reset_if_new_day():
     global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _signal_detail, _positions, _monitoring
@@ -369,11 +383,13 @@ def push_trade(trade: dict):
         sid = trade["stock_id"]
         # 更新生命週期
         if sid in _signal_detail:
-            _signal_detail[sid]["lifecycle"].append({
-                "time": trade["time"],
-                "event": "成交",
-                "detail": f"{trade['quantity']} 股 @ {trade['price']}",
-            })
+            _signal_detail[sid]["lifecycle"].append(
+                {
+                    "time": trade["time"],
+                    "event": "成交",
+                    "detail": f"{trade['quantity']} 股 @ {trade['price']}",
+                }
+            )
             _signal_detail[sid]["filled_avg"] = trade["price"]
         _broadcast({"type": "trade", "data": trade})
 
@@ -381,6 +397,7 @@ def push_trade(trade: dict):
 def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_price: float = 0.0):
     """平倉：移除持倉、更新統計、記錄完整回合"""
     from datetime import datetime
+
     with _lock:
         pos = _positions.pop(stock_id, {})
         _summary["holding"] = len(_positions)
@@ -398,17 +415,19 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_pr
         entry = pos.get("entry_price", 0)
         qty = pos.get("quantity", 0)
         pnl_amt = round((exit_price - entry) * qty * 1000, 0) if entry and exit_price else None
-        _completed_trades.append({
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "stock_id": stock_id,
-            "name": pos.get("name", stock_id),
-            "quantity": qty,
-            "entry_price": entry,
-            "exit_price": exit_price or None,
-            "pnl_pct": round(pnl_pct, 4),
-            "pnl_amt": pnl_amt,
-            "exit_reason": exit_reason,
-        })
+        _completed_trades.append(
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "stock_id": stock_id,
+                "name": pos.get("name", stock_id),
+                "quantity": qty,
+                "entry_price": entry,
+                "exit_price": exit_price or None,
+                "pnl_pct": round(pnl_pct, 4),
+                "pnl_amt": pnl_amt,
+                "exit_reason": exit_reason,
+            }
+        )
         _broadcast({"type": "completed_trade", "data": _completed_trades[-1]})
         for r in _signals:
             if r["stock_id"] == stock_id:
@@ -448,11 +467,13 @@ def sync_broker_snapshot(
 
         filled = {"FILLED", "PARTIAL"}
         open_trades = sum(1 for t in _trades if t.get("direction") == "buy" and t.get("status") in filled)
-        _summary.update({
-            "holding": len(_positions),
-            "open_trades": open_trades,
-            # close_trades / closed 由 summary_updates 傳入（FIFO 回合數），不在此重算
-        })
+        _summary.update(
+            {
+                "holding": len(_positions),
+                "open_trades": open_trades,
+                # close_trades / closed 由 summary_updates 傳入（FIFO 回合數），不在此重算
+            }
+        )
         _summary.update(summary_updates)
 
         snapshot = {
@@ -486,6 +507,7 @@ def update_positions_price(price_map: dict):
 
 # ── REST Endpoints ────────────────────────────────────────────────────────────
 
+
 def set_collector_status(status: str):
     """由 live_trader.py 呼叫，更新 collector 狀態（'running' | 'stopped' | 'error'）"""
     global _collector_status
@@ -495,8 +517,9 @@ def set_collector_status(status: str):
 _COLLECTOR_MSG = {
     "running": "資料流正常",
     "stopped": "盤後或尚未啟動",
-    "error":   "資料流中斷",
+    "error": "資料流中斷",
 }
+
 
 @app.get("/settings", tags=["系統"], summary="取得使用者設定")
 def settings_get():
@@ -515,7 +538,7 @@ async def settings_post(request: Request):
     current = _load_settings()
     for k, v in body.items():
         if v is None:
-            current.pop(k, None)   # null → 刪除 key，回落 .env 預設
+            current.pop(k, None)  # null → 刪除 key，回落 .env 預設
         else:
             current[k] = v
     _save_settings(current)
@@ -526,7 +549,9 @@ async def settings_post(request: Request):
 
 @app.get("/health", tags=["系統"], summary="健康檢查")
 def health():
-    print(f"[GET /health] sse_clients={len(_sse_clients)} signals={len(_signals)} positions={len(_positions)}", flush=True)
+    print(
+        f"[GET /health] sse_clients={len(_sse_clients)} signals={len(_signals)} positions={len(_positions)}", flush=True
+    )
     with _lock:
         last_signal = _signals[-1]["time"] if _signals else None
     return {
@@ -546,7 +571,10 @@ def health():
     summary="上方資訊列統計",
 )
 def dashboard_summary():
-    print(f"[GET /dashboard/summary] 回傳摘要：holding={_summary.get('holding')} pnl={_summary.get('today_pnl_pct')}%", flush=True)
+    print(
+        f"[GET /dashboard/summary] 回傳摘要：holding={_summary.get('holding')} pnl={_summary.get('today_pnl_pct')}%",
+        flush=True,
+    )
     with _lock:
         return dict(_summary)
 
@@ -623,17 +651,19 @@ def push_completed_trades_from_broker(closed_list: list, name_lookup=None):
             pnl_pct = c.get("pnl_pct", 0.0)
             pnl_amt = round((ex - entry) * qty * 1000, 0) if entry and ex else None
             sid = c["stock_id"]
-            _completed_trades.append({
-                "time": "-",
-                "stock_id": sid,
-                "name": _lookup(sid),
-                "quantity": qty,
-                "entry_price": entry,
-                "exit_price": ex,
-                "pnl_pct": pnl_pct,
-                "pnl_amt": pnl_amt,
-                "exit_reason": "broker_sync",
-            })
+            _completed_trades.append(
+                {
+                    "time": "-",
+                    "stock_id": sid,
+                    "name": _lookup(sid),
+                    "quantity": qty,
+                    "entry_price": entry,
+                    "exit_price": ex,
+                    "pnl_pct": pnl_pct,
+                    "pnl_amt": pnl_amt,
+                    "exit_reason": "broker_sync",
+                }
+            )
 
 
 @app.get(
@@ -662,6 +692,7 @@ def trades():
 
 # ── SSE ──────────────────────────────────────────────────────────────────────
 
+
 @app.get("/stream", tags=["即時推送"], summary="SSE 即時推送（訊號 / 持倉 / 成交）")
 async def event_stream(request: Request):
     queue: asyncio.Queue = asyncio.Queue()
@@ -676,7 +707,7 @@ async def event_stream(request: Request):
                     data = await asyncio.wait_for(queue.get(), timeout=30)
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": heartbeat\n\n"   # 保持連線
+                    yield ": heartbeat\n\n"  # 保持連線
         finally:
             _sse_clients.discard(queue)
 
@@ -688,6 +719,7 @@ async def event_stream(request: Request):
 
 
 # ── Start（由 live_trader.py 呼叫）───────────────────────────────────────────
+
 
 def get_uvicorn_config(host: str = "0.0.0.0", port: int = 8000) -> uvicorn.Config:
     return uvicorn.Config(app=app, host=host, port=port, log_level="warning")
