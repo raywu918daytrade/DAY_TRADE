@@ -1,18 +1,32 @@
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
+# ── sys.path 注入（支援 Render 或其他環境）─────────────────────────────
+if str(Path(__file__).parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
 try:
-    from trade import trade_api  # imported from project root
-except ImportError:
-    import trade_api  # run directly from trade/ directory
+    from trade import trade_api  # 相對於項目根目錄
+except (ImportError, ModuleNotFoundError):
+    try:
+        import trade_api  # 相對於 trade/ 目錄
+    except (ImportError, ModuleNotFoundError) as e:
+        print(f"[ERROR] 永豐模組無法載入: {e}", flush=True)
+        trade_api = None
 
 try:
     from api import _positions as _api_positions
+
     def _get_pos_entry(sid: str) -> float:
         return _api_positions.get(sid, {}).get("entry_price", 0.0)
-except ImportError:
-    def _get_pos_entry(_): return 0.0
+
+except (ImportError, ModuleNotFoundError):
+
+    def _get_pos_entry(_):
+        return 0.0
+
 
 try:
     from api import push_trade as _push_trade
@@ -22,14 +36,28 @@ try:
     from api import push_completed_trades_from_broker as _push_closed_sync
     from api import sync_broker_snapshot as _sync_broker_snapshot
     from api import get_setting as _get_setting
-except ImportError:
-    def _push_trade(*_): pass
-    def _push_pos(*_): pass
-    def _close_pos(*_): pass
-    def _push_summary(*_): pass
-    def _push_closed_sync(*_): pass
-    def _sync_broker_snapshot(*_): pass
-    def _get_setting(key, default=None): return default
+except (ImportError, ModuleNotFoundError):
+
+    def _push_trade(*_):
+        pass
+
+    def _push_pos(*_):
+        pass
+
+    def _close_pos(*_):
+        pass
+
+    def _push_summary(*_):
+        pass
+
+    def _push_closed_sync(*_):
+        pass
+
+    def _sync_broker_snapshot(*_):
+        pass
+
+    def _get_setting(key, default=None):
+        return default
 
 
 def _now() -> str:
@@ -86,15 +114,17 @@ class PaperTrader:
             pos = self._positions.pop(sid)
             entry = pos["avg_price"]
             print(f"[PAPER CLOSE] {sid} {pos['quantity']}張 (entry={entry:.2f})")
-            _push_trade({
-                "time": _now(),
-                "stock_id": sid,
-                "direction": "sell",
-                "price": entry,       # exit price unknown without feed; use entry as placeholder
-                "quantity": pos["quantity"],
-                "status": "FILLED",
-                "broker_response": "paper",
-            })
+            _push_trade(
+                {
+                    "time": _now(),
+                    "stock_id": sid,
+                    "direction": "sell",
+                    "price": entry,  # exit price unknown without feed; use entry as placeholder
+                    "quantity": pos["quantity"],
+                    "status": "FILLED",
+                    "broker_response": "paper",
+                }
+            )
             _close_pos(sid, 0.0)
 
         for sid in sorted(to_open):
@@ -109,24 +139,28 @@ class PaperTrader:
                 continue
             self._positions[sid] = {"quantity": lots, "avg_price": price}
             print(f"[PAPER OPEN] {sid} {lots}張 @ {price:.2f}")
-            _push_trade({
-                "time": _now(),
-                "stock_id": sid,
-                "direction": "buy",
-                "price": price,
-                "quantity": lots,
-                "status": "FILLED",
-                "broker_response": "paper",
-            })
-            _push_pos({
-                "stock_id": sid,
-                "name": sig.get("name", sid),
-                "pnl_pct": 0.0,
-                "entry_price": price,
-                "current_price": price,
-                "stop_loss": round(price * 0.97, 2),
-                "take_profit": round(price * 1.03, 2),
-            })
+            _push_trade(
+                {
+                    "time": _now(),
+                    "stock_id": sid,
+                    "direction": "buy",
+                    "price": price,
+                    "quantity": lots,
+                    "status": "FILLED",
+                    "broker_response": "paper",
+                }
+            )
+            _push_pos(
+                {
+                    "stock_id": sid,
+                    "name": sig.get("name", sid),
+                    "pnl_pct": 0.0,
+                    "entry_price": price,
+                    "current_price": price,
+                    "stop_loss": round(price * 0.97, 2),
+                    "take_profit": round(price * 1.03, 2),
+                }
+            )
 
         self._path.write_text(json.dumps(self._positions, ensure_ascii=False, indent=2))
 
@@ -157,13 +191,19 @@ class LiveTrader:
     def _connect(self) -> bool:
         if self._api is not None:
             return True
+        # 檢查 trade_api 是否正確載入
+        if trade_api is None:
+            print(f"[LIVE CONNECT] ✗ 永豐模組未載入，無法連線", flush=True)
+            return False
+        mode = "模擬" if self.simulation else "正式"
+        print(f"[LIVE CONNECT] 正在連接永豐 {mode}環境...", flush=True)
         try:
             self._api = trade_api.test() if self.simulation else trade_api.login()
             self._api.set_order_callback(self._on_order_event)
-            print("[LIVE] 永豐 API 連線成功")
+            print(f"[LIVE CONNECT] 永豐 {mode}環境連線成功 ✓", flush=True)
             return True
         except Exception as e:
-            print(f"[LIVE] 登入失敗: {e}")
+            print(f"[LIVE CONNECT] ✗ 登入失敗 ({mode}環境): {e}", flush=True)
             return False
 
     def _reset_on_disconnect(self, e: Exception, context: str):
@@ -181,7 +221,9 @@ class LiveTrader:
 
     def sync_from_broker(self) -> bool:
         """重啟後從永豐只讀同步持倉、今日委託與已平倉到 dashboard 快取。"""
+        print(f"[LIVE SYNC] 啟動：正在從永豐同步持倉、委託與已平倉...", flush=True)
         if not self._connect():
+            print(f"[LIVE SYNC] ✗ 連線失敗，同步中止", flush=True)
             return False
 
         try:
@@ -206,16 +248,18 @@ class LiveTrader:
             qty = pos["quantity"]
             curr_price = snapshots.get(sid, avg)
             pnl = round((curr_price - avg) / avg * 100, 4) if avg else 0.0
-            positions.append({
-                "stock_id": sid,
-                "name": self._name_lookup(sid),
-                "quantity": qty,
-                "pnl_pct": pnl,
-                "entry_price": avg,
-                "current_price": curr_price,
-                "stop_loss": round(avg * 0.97, 2),
-                "take_profit": round(avg * 1.03, 2),
-            })
+            positions.append(
+                {
+                    "stock_id": sid,
+                    "name": self._name_lookup(sid),
+                    "quantity": qty,
+                    "pnl_pct": pnl,
+                    "entry_price": avg,
+                    "current_price": curr_price,
+                    "stop_loss": round(avg * 0.97, 2),
+                    "take_profit": round(avg * 1.03, 2),
+                }
+            )
 
         try:
             orders = trade_api.list_orders_today(self._api)
@@ -251,33 +295,35 @@ class LiveTrader:
             qty = c.get("quantity", 0)
             pnl_pct = c.get("pnl_pct", 0.0)
             pnl_amt = round((exit_price - entry) * qty * 1000, 0) if entry and exit_price else None
-            completed_trades.append({
-                "time": c.get("sell_time", "-"),
-                "stock_id": c["stock_id"],
-                "name": self._name_lookup(c["stock_id"]),
-                "quantity": qty,
-                "entry_price": entry,
-                "exit_price": exit_price,
-                "pnl_pct": pnl_pct,
-                "pnl_amt": pnl_amt,
-                "exit_reason": "broker_sync",
-            })
+            completed_trades.append(
+                {
+                    "time": c.get("sell_time", "-"),
+                    "stock_id": c["stock_id"],
+                    "name": self._name_lookup(c["stock_id"]),
+                    "quantity": qty,
+                    "entry_price": entry,
+                    "exit_price": exit_price,
+                    "pnl_pct": pnl_pct,
+                    "pnl_amt": pnl_amt,
+                    "exit_reason": "broker_sync",
+                }
+            )
 
         wins = sum(1 for c in completed_trades if c["pnl_pct"] > 0)
-        closed = len(completed_trades)   # FIFO 配對回合數，最準確
-        avg_pnl = (
-            round(sum(c["pnl_pct"] for c in completed_trades) / closed, 4)
-            if closed else 0.0
-        )
+        closed = len(completed_trades)  # FIFO 配對回合數，最準確
+        avg_pnl = round(sum(c["pnl_pct"] for c in completed_trades) / closed, 4) if closed else 0.0
         total_pnl_amt = round(sum(c.get("pnl_amt") or 0 for c in completed_trades), 0)
 
         # 今日已用額度 = 所有成交的買入金額 + 賣出金額（當沖買賣都佔額度）
         filled_set = {"FILLED", "PARTIAL"}
-        used_quota = round(sum(
-            t["price"] * t.get("filled", t.get("quantity", 0)) * 1000
-            for t in trades
-            if t.get("status") in filled_set
-        ), 0)
+        used_quota = round(
+            sum(
+                t["price"] * t.get("filled", t.get("quantity", 0)) * 1000
+                for t in trades
+                if t.get("status") in filled_set
+            ),
+            0,
+        )
         # 開倉成交 = FILLED 買進筆數；平倉回合 = FIFO 配對數（closed）
         filled = {"FILLED", "PARTIAL"}
         open_count = sum(1 for t in trades if t.get("direction") == "buy" and t.get("status") in filled)
@@ -301,7 +347,7 @@ class LiveTrader:
                 "last_updated": last_updated,
             },
         )
-        self._used_quota = used_quota   # 重啟恢復已用額度
+        self._used_quota = used_quota  # 重啟恢復已用額度
         self._positions_synced = True
         print(
             f"[LIVE SYNC] 啟動同步完成：持倉 {len(positions)}、"
@@ -312,6 +358,7 @@ class LiveTrader:
     def _on_order_event(self, state, msg):
         """永豐成交回報（SDEAL）→ 更新 dashboard 進場均價"""
         import shioaji as sj
+
         if state != sj.OrderState.StockDeal:
             return
         try:
@@ -319,17 +366,19 @@ class LiveTrader:
             fill_price = float(msg["price"])
             fill_qty = int(msg["quantity"])
             action = str(msg.get("action", "")).lower()
-            print(f"[LIVE FILL] {sid} {action} {fill_qty}張 @ {fill_price}")
-            _push_trade({
-                "order_id": msg.get("id", ""),
-                "time": _now(),
-                "stock_id": sid,
-                "direction": "buy" if "buy" in action else "sell",
-                "price": fill_price,
-                "quantity": fill_qty,
-                "status": "FILLED",
-                "broker_response": f"fill@{fill_price}",
-            })
+            print(f"[LIVE FILL] {sid} {action} {fill_qty}張 @ {fill_price} ✓", flush=True)
+            _push_trade(
+                {
+                    "order_id": msg.get("id", ""),
+                    "time": _now(),
+                    "stock_id": sid,
+                    "direction": "buy" if "buy" in action else "sell",
+                    "price": fill_price,
+                    "quantity": fill_qty,
+                    "status": "FILLED",
+                    "broker_response": f"fill@{fill_price}",
+                }
+            )
             # 更新 dashboard 持倉的實際進場均價
             try:
                 current = trade_api.get_positions(self._api, day_trade_only=True)
@@ -339,20 +388,23 @@ class LiveTrader:
                     qty = pos["quantity"]
                     snap = self._api.snapshots([self._api.Contracts.Stocks[sid]])[0].close
                     pnl = round((snap - avg) / avg * 100, 4) if avg else 0.0
-                    _push_pos({
-                        "stock_id": sid,
-                        "name": self._name_lookup(sid),
-                        "quantity": qty,
-                        "pnl_pct": pnl,
-                        "entry_price": avg,
-                        "current_price": snap,
-                        "stop_loss": round(avg * 0.97, 2),
-                        "take_profit": round(avg * 1.03, 2),
-                    })
+                    print(f"[LIVE FILL] 更新持倉：{sid} avg={avg} qty={qty} pnl={pnl}%", flush=True)
+                    _push_pos(
+                        {
+                            "stock_id": sid,
+                            "name": self._name_lookup(sid),
+                            "quantity": qty,
+                            "pnl_pct": pnl,
+                            "entry_price": avg,
+                            "current_price": snap,
+                            "stop_loss": round(avg * 0.97, 2),
+                            "take_profit": round(avg * 1.03, 2),
+                        }
+                    )
             except Exception as e:
-                print(f"[LIVE FILL] 更新持倉失敗: {e}")
+                print(f"[LIVE FILL] ✗ 更新持倉失敗: {e}", flush=True)
         except Exception as e:
-            print(f"[LIVE FILL] 解析回報失敗: {e} | {msg}")
+            print(f"[LIVE FILL] ✗ 解析回報失敗: {e} | {msg}", flush=True)
 
     def _sync_positions_with_broker(self, current: dict):
         """每次 reconcile 呼叫：以永豐目前持倉為準，修正 dashboard 偏移。
@@ -360,27 +412,32 @@ class LiveTrader:
         - dashboard 有、broker 沒有 → 移除（broker 已平倉但通知未收到）
         - 兩者皆有但均價不同 → 更新 entry_price（fill 後均價修正）
         """
+        print(f"[SYNC POS] 與永豐同步持倉：broker={len(current)} dashboard={len(_api_positions)}", flush=True)
         # 補進 broker 有但 dashboard 沒有的持倉
         for sid, pos in current.items():
             dash = _api_positions.get(sid, {})
             avg = pos["avg_price"]
             qty = pos["quantity"]
             if sid not in _api_positions or abs(dash.get("entry_price", 0) - avg) > 0.01:
-                _push_pos({
-                    "stock_id": sid,
-                    "name": self._name_lookup(sid),
-                    "quantity": qty,
-                    "pnl_pct": dash.get("pnl_pct", 0.0),
-                    "entry_price": avg,
-                    "current_price": dash.get("current_price", avg),
-                    "stop_loss": round(avg * 0.97, 2),
-                    "take_profit": round(avg * 1.03, 2),
-                })
+                print(f"[SYNC POS] 補進 {sid} {qty}張 @ {avg}", flush=True)
+                _push_pos(
+                    {
+                        "stock_id": sid,
+                        "name": self._name_lookup(sid),
+                        "quantity": qty,
+                        "pnl_pct": dash.get("pnl_pct", 0.0),
+                        "entry_price": avg,
+                        "current_price": dash.get("current_price", avg),
+                        "stop_loss": round(avg * 0.97, 2),
+                        "take_profit": round(avg * 1.03, 2),
+                    }
+                )
         # 移除 broker 已不存在的 ghost 持倉
         # 只有 broker 有回傳至少一筆時才移除，避免 API 短暫異常誤刪全部持倉
         if current:
             for sid in list(_api_positions.keys()):
                 if sid not in current:
+                    print(f"[SYNC POS] 移除已平倉 {sid}", flush=True)
                     _close_pos(sid, 0.0, exit_reason="broker_closed")
 
     def reconcile(self, signals: list[dict]):
@@ -393,7 +450,9 @@ class LiveTrader:
         - 在券商持倉中但不在 signals → 下限價賣單
         下單後同步更新 api.py 的 in-memory 狀態，供 dashboard 顯示。
         """
+        print(f"[RECONCILE] 開始調和：收到 {len(signals)} 筆訊號", flush=True)
         if not self._connect():
+            print(f"[RECONCILE] ✗ 連線失敗，中止", flush=True)
             return
 
         # 每次 reconcile 重新讀取設定，允許前端即時變更 total_capital 立即生效
@@ -433,12 +492,10 @@ class LiveTrader:
         try:
             pending_orders = trade_api.list_orders_today(self._api)
             pending_buy = {
-                o["stock_id"] for o in pending_orders
-                if o["status"] in {"SENT", "PARTIAL"} and o["direction"] == "buy"
+                o["stock_id"] for o in pending_orders if o["status"] in {"SENT", "PARTIAL"} and o["direction"] == "buy"
             }
             pending_sell = {
-                o["stock_id"] for o in pending_orders
-                if o["status"] in {"SENT", "PARTIAL"} and o["direction"] == "sell"
+                o["stock_id"] for o in pending_orders if o["status"] in {"SENT", "PARTIAL"} and o["direction"] == "sell"
             }
         except Exception:
             pending_buy = set()
@@ -458,16 +515,18 @@ class LiveTrader:
                     qty = pos["quantity"]
                     curr_price = snaps.get(sid, avg)
                     pnl = round((curr_price - avg) / avg * 100, 4) if avg else 0.0
-                    _push_pos({
-                        "stock_id": sid,
-                        "name": self._name_lookup(sid),
-                        "quantity": qty,
-                        "pnl_pct": pnl,
-                        "entry_price": avg,
-                        "current_price": curr_price,
-                        "stop_loss": round(avg * 0.97, 2),
-                        "take_profit": round(avg * 1.03, 2),
-                    })
+                    _push_pos(
+                        {
+                            "stock_id": sid,
+                            "name": self._name_lookup(sid),
+                            "quantity": qty,
+                            "pnl_pct": pnl,
+                            "entry_price": avg,
+                            "current_price": curr_price,
+                            "stop_loss": round(avg * 0.97, 2),
+                            "take_profit": round(avg * 1.03, 2),
+                        }
+                    )
                 print(f"[LIVE SYNC] 同步 {len(current)} 筆現有持倉到 dashboard（含永豐均價）")
 
             # 同步今日已平倉（從永豐 list_trades 重建，僅今日）
@@ -477,24 +536,31 @@ class LiveTrader:
                     avg_pnl = sum(c["pnl_pct"] for c in closed_today) / len(closed_today)
                     wins = sum(1 for c in closed_today if c["pnl_pct"] > 0)
                     n = len(closed_today)
-                    _push_summary({
-                        "closed": n,
-                        "wins": wins,
-                        "win_rate": round(wins / n * 100, 1),
-                        "today_pnl_pct": round(avg_pnl, 4),
-                    })
+                    _push_summary(
+                        {
+                            "closed": n,
+                            "wins": wins,
+                            "win_rate": round(wins / n * 100, 1),
+                            "today_pnl_pct": round(avg_pnl, 4),
+                        }
+                    )
                     _push_closed_sync(closed_today)
                     print(f"[LIVE SYNC] 今日已平倉 {n} 筆，勝率 {wins}/{n}，均損益 {avg_pnl:.2f}%")
             except Exception as e:
                 print(f"[LIVE SYNC] 已平倉同步失敗: {e}")
 
         # 排除已有委託中的買/賣單，防止重複下單與「集保餘股不足」
-        open_enabled  = _get_setting("open_enabled")  if _get_setting("open_enabled")  is not None else True
+        open_enabled = _get_setting("open_enabled") if _get_setting("open_enabled") is not None else True
         close_enabled = _get_setting("close_enabled") if _get_setting("close_enabled") is not None else True
-        to_open  = (target - set(current) - pending_buy)  if open_enabled  else set()
+        to_open = (target - set(current) - pending_buy) if open_enabled else set()
         to_close = (set(current) - target - pending_sell) if close_enabled else set()
 
+        print(
+            f"[RECONCILE] 交易計畫：開倉 {len(to_open)}、平倉 {len(to_close)}、待核實 買={len(pending_buy)} 賣={len(pending_sell)}",
+            flush=True,
+        )
         if not to_open and not to_close:
+            print(f"[RECONCILE] 無新增交易，完成", flush=True)
             return
 
         # 當沖額度：買入 + 賣出 各佔一半，所以買入預算 = total_capital / 2 / 持倉支數
@@ -510,18 +576,17 @@ class LiveTrader:
 
         # 迴圈前算一次可用額度，之後每開一倉就扣，避免第 2 張高估
         open_reserved = sum(
-            _api_positions.get(s, {}).get("entry_price", 0)
-            * _api_positions.get(s, {}).get("quantity", 0) * 1000
+            _api_positions.get(s, {}).get("entry_price", 0) * _api_positions.get(s, {}).get("quantity", 0) * 1000
             for s in _api_positions
         )
         available = self.total_capital - self._used_quota - open_reserved
 
-        cfg_min_price        = _get_setting("min_price")
-        cfg_max_price        = _get_setting("max_price")
+        cfg_min_price = _get_setting("min_price")
+        cfg_max_price = _get_setting("max_price")
         cfg_max_budget_stock = _get_setting("max_budget_per_stock")  # 萬
         # 手續費 + 證交稅緩衝（買+賣 ≈ 0.3%），讓實際資金留有餘裕
         fee_rate = float(_get_setting("fee_rate") or 0.003)
-        lot_cost_factor = 1 + fee_rate   # 每張有效成本倍數
+        lot_cost_factor = 1 + fee_rate  # 每張有效成本倍數
 
         for sid in sorted(to_open, key=lambda s: sig_map.get(s, {}).get("proba", 0), reverse=True):
             try:
@@ -547,7 +612,7 @@ class LiveTrader:
                 # 每張有效成本含手續費緩衝（確保不因小數截斷而超額）
                 effective_lot_cost = price * 1000 * lot_cost_factor
                 lots_by_budget = int(stock_budget / effective_lot_cost)
-                lots_by_quota  = int((available / 2) / effective_lot_cost)
+                lots_by_quota = int((available / 2) / effective_lot_cost)
                 lots = min(lots_by_budget, lots_by_quota)
                 if lots < 1:
                     print(f"[LIVE SKIP] {sid} 額度不足（可用 {available/10000:.1f}萬，需 {price*2/10:.1f}萬/張）")
@@ -557,31 +622,37 @@ class LiveTrader:
                 status = trade_api.normalize_status(trade.status.status)
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
                 buy_cost = price * lots * 1000
-                self._used_quota += buy_cost   # 買入已用
-                available -= buy_cost * 2      # 扣掉 買 + 預留賣，給下一支用
-                print(f"[LIVE OPEN] {sid} {lots}張 @ {price} → {status} [{order_id}]"
-                      f"（剩餘可用 {available/10000:.1f}萬）")
-                _push_trade({
-                    "order_id": order_id,
-                    "time": _now(),
-                    "stock_id": sid,
-                    "direction": "buy",
-                    "price": price,
-                    "quantity": lots,
-                    "status": status,
-                    "broker_response": status,
-                })
+                self._used_quota += buy_cost  # 買入已用
+                available -= buy_cost * 2  # 扣掉 買 + 預留賣，給下一支用
+                print(
+                    f"[LIVE OPEN] {sid} {lots}張 @ {price} → {status} [{order_id}]"
+                    f"（剩餘可用 {available/10000:.1f}萬）"
+                )
+                _push_trade(
+                    {
+                        "order_id": order_id,
+                        "time": _now(),
+                        "stock_id": sid,
+                        "direction": "buy",
+                        "price": price,
+                        "quantity": lots,
+                        "status": status,
+                        "broker_response": status,
+                    }
+                )
                 sig = sig_map.get(sid, {})
-                _push_pos({
-                    "stock_id": sid,
-                    "name": sig.get("name", sid),
-                    "quantity": lots,
-                    "pnl_pct": 0.0,
-                    "entry_price": price,
-                    "current_price": price,
-                    "stop_loss": round(price * 0.97, 2),
-                    "take_profit": round(price * 1.03, 2),
-                })
+                _push_pos(
+                    {
+                        "stock_id": sid,
+                        "name": sig.get("name", sid),
+                        "quantity": lots,
+                        "pnl_pct": 0.0,
+                        "entry_price": price,
+                        "current_price": price,
+                        "stop_loss": round(price * 0.97, 2),
+                        "take_profit": round(price * 1.03, 2),
+                    }
+                )
             except Exception as e:
                 print(f"[LIVE ERROR] 開倉 {sid}: {e}")
 
@@ -598,42 +669,55 @@ class LiveTrader:
                 pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
                 sell_cost = exit_price * lots * 1000
                 self._used_quota += sell_cost  # 賣出佔用額度
-                print(f"[LIVE CLOSE] {sid} {lots}張 @ {exit_price} → {status} [{order_id}]"
-                      f"（額度已用 {self._used_quota/10000:.1f}萬）")
-                _push_trade({
-                    "order_id": order_id,
-                    "time": _now(),
-                    "stock_id": sid,
-                    "direction": "sell",
-                    "price": exit_price,
-                    "quantity": lots,
-                    "status": status,
-                    "broker_response": status,
-                })
+                print(
+                    f"[LIVE CLOSE] {sid} {lots}張 @ {exit_price} → {status} [{order_id}]"
+                    f"（額度已用 {self._used_quota/10000:.1f}萬）"
+                )
+                _push_trade(
+                    {
+                        "order_id": order_id,
+                        "time": _now(),
+                        "stock_id": sid,
+                        "direction": "sell",
+                        "price": exit_price,
+                        "quantity": lots,
+                        "status": status,
+                        "broker_response": status,
+                    }
+                )
                 _close_pos(sid, pnl_pct, exit_price=exit_price)
             except Exception as e:
                 print(f"[LIVE ERROR] 平倉 {sid}: {e}")
 
         # 同步最新額度到 dashboard
-        _push_summary({
-            "used_quota": self._used_quota,
-            "total_capital": self.total_capital,
-        })
+        _push_summary(
+            {
+                "used_quota": self._used_quota,
+                "total_capital": self.total_capital,
+            }
+        )
+        print(
+            f"[RECONCILE] 本分鐘調和完成：已用額度 {self._used_quota/10000:.1f}萬，目前持倉 {len(_api_positions)}",
+            flush=True,
+        )
 
     def force_close_own_positions(self):
         """13:25 強制平倉：只平本系統今日開的當沖倉，不動其他長期持倉。
         判斷依據：_api_positions（本系統追蹤的持倉），非永豐帳戶全部持倉。
         """
+        print(f"[FORCE CLOSE] 盤後強制平倉程序啟動", flush=True)
         if not self._connect():
+            print(f"[FORCE CLOSE] ✗ 連線失敗，中止", flush=True)
             return
         own_stocks = list(_api_positions.keys())
         if not own_stocks:
-            print("[FORCE CLOSE] 無本系統持倉，略過")
+            print(f"[FORCE CLOSE] 無本系統持倉，略過", flush=True)
             return
+        print(f"[FORCE CLOSE] 準備平倉 {len(own_stocks)} 支：{own_stocks}", flush=True)
         try:
             current = trade_api.get_positions(self._api, day_trade_only=True)
         except Exception as e:
-            print(f"[FORCE CLOSE] 取得持倉失敗: {e}")
+            print(f"[FORCE CLOSE] ✗ 取得持倉失敗: {e}", flush=True)
             return
         for sid in own_stocks:
             if sid not in current:
@@ -648,16 +732,18 @@ class LiveTrader:
                 entry_price = _get_pos_entry(sid)
                 pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
                 print(f"[FORCE CLOSE] {sid} {lots}張 @ {exit_price} → {status} [{order_id}]")
-                _push_trade({
-                    "order_id": order_id,
-                    "time": _now(),
-                    "stock_id": sid,
-                    "direction": "sell",
-                    "price": exit_price,
-                    "quantity": lots,
-                    "status": status,
-                    "broker_response": "force_close_eod",
-                })
+                _push_trade(
+                    {
+                        "order_id": order_id,
+                        "time": _now(),
+                        "stock_id": sid,
+                        "direction": "sell",
+                        "price": exit_price,
+                        "quantity": lots,
+                        "status": status,
+                        "broker_response": "force_close_eod",
+                    }
+                )
                 _close_pos(sid, pnl_pct, exit_reason="force_close_eod", exit_price=exit_price)
             except Exception as e:
                 print(f"[FORCE CLOSE] 平倉 {sid} 失敗: {e}")
