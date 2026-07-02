@@ -63,14 +63,14 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 
 from data.query import load_day, load_m1, load_m1_live
 
-_MODEL_PATH = Path(__file__).parent / "models/m1_lgbm.pkl"
+_MODEL_PATH = Path(__file__).parent.parent / "models/m1_lgbm.pkl"
 
 # Triple Barrier 參數（需與回測保持一致）
 TP_PCT = 0.03  # 停利 3%
 SL_PCT = 0.03  # 停損 3%
 HOLD_BARS = 30  # 最多持有分K數
 
-_ROOT = Path(__file__).parent
+_ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env")
 
 # 訓練/推論的交易時段；可用 .env 覆寫（本機測試用）
@@ -338,15 +338,17 @@ def predict_live(
         rows = []
         for sid, g in m1_live.groupby("stock_id"):
             g_s = g.sort_values("date")
-            rows.append({
-                "stock_id": sid,
-                "date": today_ts,
-                "open": float(g_s.iloc[0]["open"]),
-                "high": float(g["high"].max()),
-                "low": float(g["low"].min()),
-                "close": float(g_s.iloc[-1]["close"]),
-                "volume": int(g["volume"].sum()),
-            })
+            rows.append(
+                {
+                    "stock_id": sid,
+                    "date": today_ts,
+                    "open": float(g_s.iloc[0]["open"]),
+                    "high": float(g["high"].max()),
+                    "low": float(g["low"].min()),
+                    "close": float(g_s.iloc[-1]["close"]),
+                    "volume": int(g["volume"].sum()),
+                }
+            )
         if rows:
             day = pd.concat([day, pd.DataFrame(rows)], ignore_index=True)
             day["date"] = pd.to_datetime(day["date"])
