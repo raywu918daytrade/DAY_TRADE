@@ -20,6 +20,7 @@
 """
 
 import calendar
+import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -111,29 +112,46 @@ def _volume_filter(stocks: set, day: "pd.DataFrame") -> list:
 
 
 print("載入模型...")
-model = load_model()
+sys.stdout.flush()
+try:
+    model = load_model()
+    print("✓ 模型載入成功", flush=True)
+except Exception as e:
+    print(f"✗ 模型載入失敗: {e}", flush=True)
+    raise
 
-print("更新當沖標的清單...")
-_tickers_df = update_tickers()
-if _tickers_df.empty:
-    print("  警告：無法取得當沖標的（非盤中），不過濾股票")
+print("更新當沖標的清單...", flush=True)
+try:
+    _tickers_df = update_tickers()
+    if _tickers_df.empty:
+        print("  警告：無法取得當沖標的（非盤中），不過濾股票", flush=True)
+        _tickers = {}
+    else:
+        _tickers = _tickers_df.set_index("stock_id")["name"].to_dict()
+    _day_trade_stocks = set(_tickers.keys()) or None  # None = 不過濾
+    print(f"  當沖標的（API）：{len(_tickers)} 支", flush=True)
+except Exception as e:
+    print(f"✗ 取得當沖標的失敗: {e}", flush=True)
     _tickers = {}
-else:
-    _tickers = _tickers_df.set_index("stock_id")["name"].to_dict()
-_day_trade_stocks = set(_tickers.keys()) or None  # None = 不過濾
-print(f"  當沖標的（API）：{len(_tickers)} 支")
+    _day_trade_stocks = None
 
 # HF_REPO_ID 有設定 → 從 HF 下載（Render）；否則用本地（本機開發）
-if _HF_REPO_ID:
-    _day = _load_day_from_hf()
-else:
-    _day = load_day()
+print("載入日K資料...", flush=True)
+try:
+    if _HF_REPO_ID:
+        _day = _load_day_from_hf()
+    else:
+        _day = load_day()
+    print(f"✓ 日K 載入完成：{len(_day)} 筆", flush=True)
+except Exception as e:
+    print(f"✗ 日K 載入失敗: {e}", flush=True)
+    _day = pd.DataFrame()
 
 # 條件③：20日均量過濾
 if _day_trade_stocks:
     _day_trade_stocks = _volume_filter(_day_trade_stocks, _day)
 
-print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...")
+print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...", flush=True)
 
 _executor = None
 if TRADE_MODE != "off":
@@ -145,11 +163,11 @@ if TRADE_MODE != "off":
             TOTAL_CAPITAL,
             name_lookup=lambda sid: _tickers.get(sid, sid),
         )
-        print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}")
+        print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}", flush=True)
         if hasattr(_executor, "sync_from_broker"):
             _executor.sync_from_broker()
     except Exception as e:
-        print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}")
+        print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
 
 
 def _daily_refresh():

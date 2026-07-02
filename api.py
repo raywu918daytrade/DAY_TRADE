@@ -280,6 +280,7 @@ def _reset_if_new_day():
 
 def push_monitoring(minute_str: str, all_results: list, threshold: float):
     """推入所有監控股票的最新推論結果（threshold=0 全部），由 on_minute 呼叫"""
+    print(f"[push_monitoring] {minute_str} 接收 {len(all_results)} 支股票的推論結果", flush=True)
     with _lock:
         for r in all_results:
             _monitoring[r["stock_id"]] = {
@@ -297,6 +298,7 @@ def push_monitoring(minute_str: str, all_results: list, threshold: float):
 
 def push_signals(minute_str: str, signals: list):
     """每分K推入新訊號（由 on_minute 呼叫）"""
+    print(f"[push_signals] {minute_str} 產生 {len(signals)} 筆訊號", flush=True)
     with _lock:
         _reset_if_new_day()
         for s in signals:
@@ -337,6 +339,7 @@ def push_signals(minute_str: str, signals: list):
 
 def push_candles(stock_id: str, candles: list):
     """推入 K 線資料（index=datetime, open/high/low/close/volume/vwap）"""
+    print(f"[push_candles] {stock_id} 推入 {len(candles)} 根 K 線", flush=True)
     with _lock:
         _candles[stock_id] = candles
         _broadcast({"type": "candles", "stock_id": stock_id})
@@ -523,6 +526,7 @@ async def settings_post(request: Request):
 
 @app.get("/health", tags=["系統"], summary="健康檢查")
 def health():
+    print(f"[GET /health] sse_clients={len(_sse_clients)} signals={len(_signals)} positions={len(_positions)}", flush=True)
     with _lock:
         last_signal = _signals[-1]["time"] if _signals else None
     return {
@@ -542,6 +546,7 @@ def health():
     summary="上方資訊列統計",
 )
 def dashboard_summary():
+    print(f"[GET /dashboard/summary] 回傳摘要：holding={_summary.get('holding')} pnl={_summary.get('today_pnl_pct')}%", flush=True)
     with _lock:
         return dict(_summary)
 
@@ -553,6 +558,7 @@ def dashboard_summary():
     summary="今日訊號列表（左邊訊號區）",
 )
 def signals_today():
+    print(f"[GET /signals/today] 回傳 {len(_signals)} 筆訊號", flush=True)
     with _lock:
         return list(reversed(_signals))  # 最新在上
 
@@ -580,11 +586,13 @@ def signal_detail(stock_id: str):
 def chart_candles(stock_id: str):
     with _lock:
         candles = list(_candles.get(stock_id, []))
+    print(f"[GET /chart/{stock_id}/candles] 回傳 {len(candles)} 根 K 線", flush=True)
     return {"stock_id": stock_id, "candles": candles}
 
 
 @app.get("/monitoring", tags=["監控"], summary="監控中股票的最新推論結果（依信心度排序）")
 def get_monitoring():
+    print(f"[GET /monitoring] 回傳 {len(_monitoring)} 支監控股票", flush=True)
     with _lock:
         return sorted(_monitoring.values(), key=lambda x: -x["proba"])
 
@@ -635,6 +643,7 @@ def push_completed_trades_from_broker(closed_list: list, name_lookup=None):
     summary="當前持倉（下方持倉區）",
 )
 def positions():
+    print(f"[GET /positions] 回傳 {len(_positions)} 檔持倉", flush=True)
     with _lock:
         return list(_positions.values())
 
@@ -646,6 +655,7 @@ def positions():
     summary="今日成交記錄（下方成交區）",
 )
 def trades():
+    print(f"[GET /trades] 回傳 {len(_trades)} 筆成交", flush=True)
     with _lock:
         return list(reversed(_trades))  # 最新在上
 
