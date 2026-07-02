@@ -419,12 +419,11 @@ class LiveTrader:
         try:
             cancelled = trade_api.cancel_sent_orders(self._api)
             if cancelled["buy"]:
-                print(f"[CANCEL BUY]  取消未成交買單: {cancelled['buy']}")
-                for sid in cancelled["buy"]:
-                    pos = _api_positions.get(sid, {})
-                    cost = pos.get("entry_price", 0) * pos.get("quantity", 0) * 1000
-                    if cost > 0:
-                        self._used_quota = max(0, self._used_quota - cost)
+                # 從委託單本身的價格×數量還原額度（未成交，不在 _api_positions 裡）
+                restore = sum(cost for _, cost in cancelled["buy"])
+                self._used_quota = max(0, self._used_quota - restore)
+                sids = [sid for sid, _ in cancelled["buy"]]
+                print(f"[CANCEL BUY]  取消未成交買單: {sids}，還原額度 {restore/10000:.1f}萬")
             if cancelled["sell"]:
                 print(f"[CANCEL SELL] 取消未成交賣單: {cancelled['sell']}，本分鐘重新掛")
         except Exception as e:

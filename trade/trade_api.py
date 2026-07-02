@@ -200,15 +200,17 @@ def get_closed_today(api: sj.Shioaji) -> list[dict]:
     return result
 
 
-def cancel_sent_orders(api: sj.Shioaji) -> dict[str, list[str]]:
+def cancel_sent_orders(api: sj.Shioaji) -> dict:
     """
     取消今日所有 SENT（掛單未成交）的買/賣委託。
-    回傳 {"buy": [sid, ...], "sell": [sid, ...]}
+    回傳:
+      {"buy": [(sid, cost), ...], "sell": [sid, ...]}
+      cost = 委託價 × 委託張數 × 1000（未成交金額，供還原 _used_quota 用）
     """
     from datetime import date
     today = date.today()
     api.update_status()
-    cancelled = {"buy": [], "sell": []}
+    cancelled: dict = {"buy": [], "sell": []}
     for t in api.list_trades():
         order_dt = t.status.order_datetime
         order_date = getattr(order_dt, "date", lambda: order_dt)()
@@ -220,7 +222,11 @@ def cancel_sent_orders(api: sj.Shioaji) -> dict[str, list[str]]:
         direction = "buy" if "buy" in str(t.order.action).lower() else "sell"
         try:
             api.cancel_order(t)
-            cancelled[direction].append(sid)
+            if direction == "buy":
+                cost = float(t.order.price) * int(t.order.quantity) * 1000
+                cancelled["buy"].append((sid, cost))
+            else:
+                cancelled["sell"].append(sid)
         except Exception as e:
             print(f"[CANCEL] {sid} {direction} 取消失敗: {e}")
     return cancelled
