@@ -67,39 +67,43 @@ def _resolve_capital() -> float:
 TOTAL_CAPITAL = _resolve_capital()
 
 
-def _load_day_from_hf() -> "pd.DataFrame":
-    """從 HF Hub 下載最近 2 個月份的日K（月份分檔），只取近 60 天"""
-    import pandas as pd
+def _get_day_hf_path() -> "str | None":
+    """HF Hub 下載最新月份日K parquet，回傳本地快取路徑。"""
     from huggingface_hub import HfApi, hf_hub_download
-
     token = os.environ.get("HF_TOKEN") or None
-    api = HfApi()
-    print(f"從 HF Hub 下載日K：{_HF_REPO_ID}...")
-
     day_files = sorted([
-        f for f in api.list_repo_files(repo_id=_HF_REPO_ID, repo_type="dataset", token=token)
+        f for f in HfApi().list_repo_files(repo_id=_HF_REPO_ID, repo_type="dataset", token=token)
         if f.startswith("day_trade/day/") and f.endswith(".parquet")
     ])
-    # 只下載最近 2 個月份（60 天內一定落在最多 2 個月）
-    recent_files = day_files[-2:] if len(day_files) >= 2 else day_files
+    if not day_files:
+        return None
+    return hf_hub_download(repo_id=_HF_REPO_ID, filename=day_files[-1],
+                           repo_type="dataset", token=token)
 
-    frames = []
-    for hf_path in recent_files:
-        local_path = hf_hub_download(
-            repo_id=_HF_REPO_ID, filename=hf_path,
-            repo_type="dataset", token=token,
-        )
-        frames.append(pd.read_parquet(local_path))
 
-    if not frames:
+def _load_day(stocks: set, path: str) -> "pd.DataFrame":
+    """
+    兩次讀同一個 parquet，省記憶體：
+      第 1 次：只讀 volume → volume filter → 取前 MAX_SUBSCRIPTIONS 支
+      第 2 次：只讀過濾後的股票完整資料（供推論用）
+    """
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    # 第 1 次：只讀 volume 欄位，做均量過濾
+    df_vol = pd.read_parquet(path, columns=["stock_id", "date", "volume"])
+    top = set(_volume_filter(stocks, df_vol))
+    del df_vol
+
+    if not top:
         return pd.DataFrame()
 
-    df = pd.concat(frames, ignore_index=True)
-    cutoff = (pd.Timestamp.now() - timedelta(days=60)).strftime("%Y-%m-%d")
-    df = df[df["date"] >= cutoff].copy()
+    # 第 2 次：只讀前 500 支完整資料
+    df = pq.read_table(path, filters=[("stock_id", "in", list(top))]).to_pandas()
+    df["date"] = pd.to_datetime(df["date"])
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
-    print(f"  {len(df):,} 筆，{df['stock_id'].nunique():,} 支（最近 60 天）")
-    return df
+    print(f"  日K：{len(df):,} 筆，{df['stock_id'].nunique():,} 支（前 {len(top)} 支）")
+    return df, top
 
 
 _TW = timezone(timedelta(hours=8))
@@ -154,12 +158,19 @@ except Exception as e:
 if _day_trade_stocks:
     print("載入日K資料...", flush=True)
     try:
-        _day = _load_day_from_hf() if _HF_REPO_ID else load_day()
+        if _HF_REPO_ID:
+            _day_path = _get_day_hf_path()
+            _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_path)
+        else:
+            # 本機：load_day() 讀全部，再手動兩步過濾
+            _full = load_day()
+            _day_trade_stocks = _volume_filter(_day_trade_stocks, _full[["stock_id", "date", "volume"]])
+            _day = _full[_full["stock_id"].isin(set(_day_trade_stocks))].copy()
+            del _full
         print(f"✓ 日K 載入完成：{len(_day)} 筆", flush=True)
     except Exception as e:
         print(f"✗ 日K 載入失敗: {e}", flush=True)
         _day = pd.DataFrame()
-    _day_trade_stocks = _volume_filter(_day_trade_stocks, _day)
 else:
     _day = pd.DataFrame()
     print("非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
@@ -200,9 +211,15 @@ def _daily_refresh():
                 if not df.empty:
                     _tickers = df.set_index("stock_id")["name"].to_dict()
                     _day_trade_stocks = set(_tickers.keys()) or None
-                _day = _load_day_from_hf() if _HF_REPO_ID else load_day()
                 if _day_trade_stocks:
-                    _day_trade_stocks = _volume_filter(_day_trade_stocks, _day)
+                    if _HF_REPO_ID:
+                        _day_path = _get_day_hf_path()
+                        _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_path)
+                    else:
+                        _full = load_day()
+                        _day_trade_stocks = _volume_filter(_day_trade_stocks, _full[["stock_id", "date", "volume"]])
+                        _day = _full[_full["stock_id"].isin(set(_day_trade_stocks))].copy()
+                        del _full
                 last_refresh = today
                 print(f"  更新完成，當沖標的：{len(_day_trade_stocks) if _day_trade_stocks else 0} 支")
             except Exception as e:
