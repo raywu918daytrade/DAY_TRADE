@@ -27,7 +27,14 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import uvicorn
 
-from api import get_uvicorn_config, push_candles, push_monitoring, push_signals, set_collector_status, update_positions_price
+from api import (
+    get_uvicorn_config,
+    push_candles,
+    push_monitoring,
+    push_signals,
+    set_collector_status,
+    update_positions_price,
+)
 from strategy.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
 import os
 
@@ -35,16 +42,18 @@ from data.fugle_tickers import update_tickers
 from data.m1_rest import M1RestPoller
 from data.query import load_day, load_m1_live
 
-_HF_REPO_ID = os.environ.get("HF_REPO_ID", "")   # 設在 Render 環境變數
+_HF_REPO_ID = os.environ.get("HF_REPO_ID", "")  # 設在 Render 環境變數
 
-TRADE_MODE = os.environ.get("TRADE_MODE", "off")      # off | paper | sim | live
+TRADE_MODE = os.environ.get("TRADE_MODE", "off")  # off | paper | sim | live
 _TOTAL_CAPITAL_ENV = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
+
 
 # settings.json 存在且有 total_capital → 優先使用，否則回落 .env
 def _resolve_capital() -> float:
     # api.py 已初始化 _settings_cache（含 HF Hub fallback），直接用 get_setting
     try:
         from api import get_setting
+
         v = get_setting("total_capital")
         if v is not None:
             print(f"[設定] 總額度從 settings 載入：{float(v):,.0f}")
@@ -52,6 +61,7 @@ def _resolve_capital() -> float:
     except Exception:
         pass
     return _TOTAL_CAPITAL_ENV
+
 
 TOTAL_CAPITAL = _resolve_capital()
 
@@ -74,6 +84,7 @@ def _load_day_from_hf() -> "pd.DataFrame":
     df = df[df["date"] >= cutoff].copy()
     print(f"  {len(df):,} 筆，{df['stock_id'].nunique():,} 支（最近 60 天）")
     return df
+
 
 _TW = timezone(timedelta(hours=8))
 THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
@@ -98,6 +109,7 @@ def _volume_filter(stocks: set, day: "pd.DataFrame") -> list:
     print(f"  均量過濾（≥{MIN_AVG_VOL_LOTS}張）: {len(stocks)} → {len(qualified)} 支 → 訂閱前 {len(result)} 支")
     return result
 
+
 print("載入模型...")
 model = load_model()
 
@@ -108,7 +120,7 @@ if _tickers_df.empty:
     _tickers = {}
 else:
     _tickers = _tickers_df.set_index("stock_id")["name"].to_dict()
-_day_trade_stocks = set(_tickers.keys()) or None   # None = 不過濾
+_day_trade_stocks = set(_tickers.keys()) or None  # None = 不過濾
 print(f"  當沖標的（API）：{len(_tickers)} 支")
 
 # HF_REPO_ID 有設定 → 從 HF 下載（Render）；否則用本地（本機開發）
@@ -127,8 +139,10 @@ _executor = None
 if TRADE_MODE != "off":
     try:
         from trade.run_execute import make_executor
+
         _executor = make_executor(
-            TRADE_MODE, TOTAL_CAPITAL,
+            TRADE_MODE,
+            TOTAL_CAPITAL,
             name_lookup=lambda sid: _tickers.get(sid, sid),
         )
         print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}")
@@ -179,19 +193,22 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             for _, row in g.iterrows():
                 dt = datetime.strptime(str(row["date"]), "%Y-%m-%d %H:%M:%S")
                 ts = calendar.timegm(dt.timetuple())  # 以 TW 本地時間當 UTC，圖表顯示正確
-                candles.append({
-                    "time": ts,
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
-                    "volume": int(row["volume"]),
-                })
+                candles.append(
+                    {
+                        "time": ts,
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "volume": int(row["volume"]),
+                    }
+                )
             push_candles(str(sid), candles)
 
     # 模型推論：threshold=0 取得所有股票機率，供監控面板顯示
     all_results = predict_live(
-        minute_str, _day,
+        minute_str,
+        _day,
         model=model,
         threshold=0,
         day_trade_stocks=_day_trade_stocks,
@@ -200,6 +217,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         r["name"] = _tickers.get(r["stock_id"], r["stock_id"])
     # 每分鐘從 settings 讀信心度，允許前端即時調整
     from api import get_setting
+
     threshold = float(get_setting("threshold") or THRESHOLD)
 
     push_monitoring(minute_str, all_results, threshold)
@@ -212,11 +230,12 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     signals = [r for r in all_results if r["proba"] >= threshold]
     push_signals(minute_str, signals)
 
-    print(f"[{minute_str}] 推論 {len(all_results)} 支，信心度: " +
-          " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in all_results))
+    print(
+        f"[{minute_str}] 推論 {len(all_results)} 支，信心度: "
+        + " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in all_results)
+    )
     if signals:
-        print(f"  → 訊號（{len(signals)} 支）: " +
-              " ".join(f"{s['stock_id']} {s['proba']:.2f}" for s in signals))
+        print(f"  → 訊號（{len(signals)} 支）: " + " ".join(f"{s['stock_id']} {s['proba']:.2f}" for s in signals))
 
     if _executor is not None:
         try:
@@ -236,8 +255,10 @@ def _force_close_eod():
     while True:
         now = datetime.now(_TW)
         trigger = now.replace(
-            hour=_FORCE_CLOSE_HOUR, minute=_FORCE_CLOSE_MIN,
-            second=0, microsecond=0,
+            hour=_FORCE_CLOSE_HOUR,
+            minute=_FORCE_CLOSE_MIN,
+            second=0,
+            microsecond=0,
         )
         wait = (trigger - now).total_seconds()
         if wait > 0:
@@ -246,7 +267,9 @@ def _force_close_eod():
         today = now.date()
         if _force_close_done_date != today and _executor is not None:
             _force_close_done_date = today
-            print(f"[{now.strftime('%H:%M:%S')}] 強制平倉：本系統當沖倉位（{_FORCE_CLOSE_HOUR}:{_FORCE_CLOSE_MIN:02d}）")
+            print(
+                f"[{now.strftime('%H:%M:%S')}] 強制平倉：本系統當沖倉位（{_FORCE_CLOSE_HOUR}:{_FORCE_CLOSE_MIN:02d}）"
+            )
             try:
                 _executor.force_close_own_positions()  # 只平本系統追蹤的倉，長期持倉不動
             except Exception as e:
@@ -267,6 +290,7 @@ def _force_close_eod():
 def _get_stocks():
     """每次重連都取最新當沖標的；非盤中無清單時回退到所有可交易股票"""
     from data.fugle_tickers import fugle_stocks
+
     return list(_day_trade_stocks) if _day_trade_stocks else fugle_stocks()
 
 
