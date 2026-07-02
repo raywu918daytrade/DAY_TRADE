@@ -30,4 +30,4 @@ jobs:
           FUGLE: ${{ secrets.FUGLE }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO_ID: ${{ vars.HF_REPO_ID }}
-        run: python scripts/push_to_hf.py
+        run: python scripts/push_day_to_hf.py
