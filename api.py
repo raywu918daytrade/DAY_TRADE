@@ -65,7 +65,7 @@ class SignalRecord(BaseModel):
     pnl_pct: Optional[float] = None
 
 class Candle(BaseModel):
-    time: str
+    time: int | str   # Unix timestamp (int) 或舊格式字串
     open: float
     high: float
     low: float
@@ -100,6 +100,7 @@ class SignalDetail(BaseModel):
 class Position(BaseModel):
     stock_id: str
     name: str
+    quantity: int = 0
     pnl_pct: float
     entry_price: float
     current_price: float
@@ -139,6 +140,7 @@ _positions: dict = {}      # {stock_id: Position dict}
 _trades: list = []         # 今日成交記錄
 _candles: dict = {}        # {stock_id: [Candle dict, ...]}
 _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
+_monitoring: dict = {}     # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 
 # ── SSE 廣播 ─────────────────────────────────────────────────────────────────
 
@@ -167,7 +169,7 @@ def _broadcast(data: dict):
 # ── Public push functions（由 live_trader.py 呼叫）───────────────────────────
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _candles, _signal_detail, _positions
+    global _today_date, _summary, _signals, _trades, _candles, _signal_detail, _positions, _monitoring
     today = date.today()
     if _today_date != today:
         _today_date = today
@@ -176,7 +178,25 @@ def _reset_if_new_day():
         _candles.clear()
         _signal_detail.clear()
         _positions.clear()
+        _monitoring.clear()
         _summary = {k: 0 if isinstance(v, (int, float)) else "" for k, v in _summary.items()}
+
+
+def push_monitoring(minute_str: str, all_results: list, threshold: float):
+    """推入所有監控股票的最新推論結果（threshold=0 全部），由 on_minute 呼叫"""
+    with _lock:
+        for r in all_results:
+            _monitoring[r["stock_id"]] = {
+                "stock_id": r["stock_id"],
+                "name": r.get("name", r["stock_id"]),
+                "proba": round(r["proba"], 4),
+                "price": r["price"],
+                "direction": r.get("direction", "buy"),
+                "is_signal": r["proba"] >= threshold,
+                "minute": minute_str[11:16],
+            }
+        data = sorted(_monitoring.values(), key=lambda x: -x["proba"])
+        _broadcast({"type": "monitoring", "minute": minute_str[11:16], "data": data})
 
 
 def push_signals(minute_str: str, signals: list):
@@ -275,6 +295,31 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = ""):
         _broadcast({"type": "closed", "stock_id": stock_id, "pnl_pct": pnl_pct})
 
 
+def push_summary_update(updates: dict):
+    """直接更新 _summary 的部分欄位（重啟同步用）"""
+    with _lock:
+        _summary.update(updates)
+        _broadcast({"type": "summary", "data": dict(_summary)})
+
+
+def update_positions_price(price_map: dict):
+    """
+    每分鐘更新持倉卡片的現價與浮動損益，price_map = {stock_id: current_price}。
+    今日損益（_summary["today_pnl_pct"]）僅由 close_position() 在平倉時更新（已實現）。
+    """
+    with _lock:
+        if not _positions:
+            return
+        for sid, pos in _positions.items():
+            price = price_map.get(sid)
+            if price is None or pos.get("entry_price", 0) <= 0:
+                continue
+            entry = pos["entry_price"]
+            pos["current_price"] = price
+            pos["pnl_pct"] = round((price - entry) / entry * 100, 4)
+            _broadcast({"type": "position", "data": dict(pos)})
+
+
 # ── REST Endpoints ────────────────────────────────────────────────────────────
 
 def set_collector_status(status: str):
@@ -348,6 +393,12 @@ def chart_candles(stock_id: str):
     with _lock:
         candles = list(_candles.get(stock_id, []))
     return {"stock_id": stock_id, "candles": candles}
+
+
+@app.get("/monitoring", tags=["監控"], summary="監控中股票的最新推論結果（依信心度排序）")
+def get_monitoring():
+    with _lock:
+        return sorted(_monitoring.values(), key=lambda x: -x["proba"])
 
 
 @app.get(

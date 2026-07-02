@@ -73,12 +73,14 @@ class M1Collector:
         collector.start()   # 阻塞直到 KeyboardInterrupt 或 collector.stop()
     """
 
-    def __init__(self, on_minute=None):
+    def __init__(self, on_minute=None, stocks=None):
         self._on_minute = on_minute
+        self._stocks = stocks   # list | callable() -> list | None（None = 全部）
         self._lock = threading.Lock()
         self._pending: dict[str, dict] = {}   # {minute_str: {stock_id: row_dict}}
         self._client = None
         self._stop = False
+        self._last_error = ""
 
     # ─────────────────── 訊息處理 ───────────────────
 
@@ -139,21 +141,53 @@ class M1Collector:
         self._client = WebSocketClient(api_key=api_key)
         ws = self._client.stock
         authenticated = threading.Event()
+        subs_reply = threading.Event()
+        existing_ids: list[str] = []
+
+        self._last_error = ""
 
         def _on_message(raw):
             msg = json.loads(raw) if isinstance(raw, str) else raw
-            if msg.get("event") == "authenticated":
+            event = msg.get("event")
+            if event == "authenticated":
                 authenticated.set()
+            elif event == "subscriptions":
+                # server 回報目前所有訂閱，收集 id 準備清除
+                for sub in msg.get("data", []):
+                    sid = sub.get("id")
+                    if sid:
+                        existing_ids.append(sid)
+                subs_reply.set()
             self._handle(raw)
 
+        def _on_error(e):
+            self._last_error = str(e)
+            print(f"WS 錯誤: {e}")
+
         ws.on("message", _on_message)
-        ws.on("error", lambda e: print(f"WS 錯誤: {e}"))
+        ws.on("error", _on_error)
 
         def _subscribe_all():
             if not authenticated.wait(timeout=10):
                 print("認證逾時，跳過訂閱")
                 return
-            print("認證完成，開始訂閱...")
+
+            # Maximum connections 斷線 → 查詢並取消 server 端殘留訂閱
+            if "Maximum number of connections" in self._last_error:
+                print("查詢舊訂閱...")
+                ws.subscriptions()
+                subs_reply.wait(timeout=5)
+                if existing_ids:
+                    print(f"取消 {len(existing_ids)} 個舊訂閱...")
+                    for sub_id in existing_ids:
+                        try:
+                            ws.unsubscribe({"id": sub_id})
+                        except Exception:
+                            pass
+                    time.sleep(2)
+                    print("舊訂閱已清除，重新訂閱...")
+
+            print("開始訂閱...")
             for i, symbol in enumerate(stocks):
                 try:
                     ws.subscribe({"channel": "candles", "symbol": symbol})
@@ -172,16 +206,23 @@ class M1Collector:
         if not api_key:
             raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
 
-        stocks = fugle_stocks()
-        print(f"共 {len(stocks)} 支股票，開始連線...")
         os.makedirs(_LIVE_DIR, exist_ok=True)
         self._stop = False
         retry = 0
 
         while not self._stop:
+            # 每次重連都重新取得標的清單（daily refresh 可能已更新）
+            if callable(self._stocks):
+                stocks = self._stocks()
+            elif self._stocks:
+                stocks = self._stocks
+            else:
+                stocks = fugle_stocks()
+            print(f"共 {len(stocks)} 支股票，開始連線...")
             try:
                 if retry > 0:
-                    wait = min(5 * retry, 60)
+                    # Fugle server 釋放舊連線需要 60-120s，一律等 120s 起跳
+                    wait = min(120 * retry, 600)
                     print(f"第 {retry} 次重連，等待 {wait} 秒...")
                     time.sleep(wait)
                 self._connect_once(api_key, stocks)

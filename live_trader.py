@@ -10,6 +10,7 @@
                              → push_candles  → API /chart/{id}/candles
 """
 
+import calendar
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -17,15 +18,18 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import uvicorn
 
-from api import get_uvicorn_config, push_candles, push_signals, set_collector_status
+from api import get_uvicorn_config, push_candles, push_monitoring, push_signals, set_collector_status, update_positions_price
 from date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
 import os
 
 from tay_trade.fugle_tickers import update_tickers
-from tay_trade.m1_websocket import M1Collector
+from tay_trade.m1_rest import M1RestPoller
 from tay_trade.query import load_day, load_m1_live
 
 _HF_REPO_ID = os.environ.get("HF_REPO_ID", "")   # 設在 Render 環境變數
+
+TRADE_MODE = os.environ.get("TRADE_MODE", "off")      # off | paper | sim | live
+TOTAL_CAPITAL = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
 
 
 def _load_day_from_hf() -> "pd.DataFrame":
@@ -48,7 +52,25 @@ def _load_day_from_hf() -> "pd.DataFrame":
     return df
 
 _TW = timezone(timedelta(hours=8))
-THRESHOLD = 0.55
+THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
+MIN_AVG_VOL_LOTS = int(os.environ.get("MIN_AVG_VOL_LOTS", "1000"))  # 20日均量門檻（張）
+MAX_SUBSCRIPTIONS = int(os.environ.get("MAX_SUBSCRIPTIONS", "500"))  # Fugle 方案訂閱上限
+
+
+def _volume_filter(stocks: set, day: "pd.DataFrame") -> list:
+    """20日均量過濾，回傳按均量排序（高→低）的 stock_id list，最多 MAX_SUBSCRIPTIONS 支"""
+    if day.empty or not stocks:
+        result = list(stocks)[:MAX_SUBSCRIPTIONS]
+        print(f"  均量過濾：無日K，取前 {len(result)} 支")
+        return result
+    recent = day[day["stock_id"].isin(stocks)].copy()
+    recent["date"] = pd.to_datetime(recent["date"])
+    last20 = recent.sort_values("date").groupby("stock_id").tail(20)
+    avg_vol = last20.groupby("stock_id")["volume"].mean()
+    qualified = avg_vol[avg_vol >= MIN_AVG_VOL_LOTS * 1000].sort_values(ascending=False)
+    result = list(qualified.index[:MAX_SUBSCRIPTIONS])
+    print(f"  均量過濾（≥{MIN_AVG_VOL_LOTS}張）: {len(stocks)} → {len(qualified)} 支 → 訂閱前 {len(result)} 支")
+    return result
 
 print("載入模型...")
 model = load_model()
@@ -61,7 +83,7 @@ if _tickers_df.empty:
 else:
     _tickers = _tickers_df.set_index("stock_id")["name"].to_dict()
 _day_trade_stocks = set(_tickers.keys()) or None   # None = 不過濾
-print(f"  當沖標的：{len(_tickers)} 支")
+print(f"  當沖標的（API）：{len(_tickers)} 支")
 
 # HF_REPO_ID 有設定 → 從 HF 下載（Render）；否則用本地（本機開發）
 if _HF_REPO_ID:
@@ -69,7 +91,20 @@ if _HF_REPO_ID:
 else:
     _day = load_day()
 
+# 條件③：20日均量過濾
+if _day_trade_stocks:
+    _day_trade_stocks = _volume_filter(_day_trade_stocks, _day)
+
 print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...")
+
+_executor = None
+if TRADE_MODE != "off":
+    try:
+        from trade.run_execute import make_executor
+        _executor = make_executor(TRADE_MODE, TOTAL_CAPITAL)
+        print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}")
+    except Exception as e:
+        print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}")
 
 
 def _daily_refresh():
@@ -87,8 +122,10 @@ def _daily_refresh():
                     _tickers = df.set_index("stock_id")["name"].to_dict()
                     _day_trade_stocks = set(_tickers.keys()) or None
                 _day = _load_day_from_hf() if _HF_REPO_ID else load_day()
+                if _day_trade_stocks:
+                    _day_trade_stocks = _volume_filter(_day_trade_stocks, _day)
                 last_refresh = today
-                print(f"  更新完成，當沖標的：{len(_day_trade_stocks)} 支")
+                print(f"  更新完成，當沖標的：{len(_day_trade_stocks) if _day_trade_stocks else 0} 支")
             except Exception as e:
                 print(f"  更新失敗: {e}")
         time.sleep(60)
@@ -106,41 +143,60 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     m1_live = load_m1_live(date_str)
     if not m1_live.empty:
         for sid, g in m1_live.groupby("stock_id"):
-            candles = [
-                {
-                    "time": str(row["date"])[11:16],
+            candles = []
+            for _, row in g.iterrows():
+                dt = datetime.strptime(str(row["date"]), "%Y-%m-%d %H:%M:%S")
+                ts = calendar.timegm(dt.timetuple())  # 以 TW 本地時間當 UTC，圖表顯示正確
+                candles.append({
+                    "time": ts,
                     "open": float(row["open"]),
                     "high": float(row["high"]),
                     "low": float(row["low"]),
                     "close": float(row["close"]),
                     "volume": int(row["volume"]),
-                }
-                for _, row in g.iterrows()
-            ]
+                })
             push_candles(str(sid), candles)
 
-    # 模型推論 → 推入訊號
-    signals = predict_live(
+    # 模型推論：threshold=0 取得所有股票機率，供監控面板顯示
+    all_results = predict_live(
         minute_str, _day,
         model=model,
-        threshold=THRESHOLD,
+        threshold=0,
         day_trade_stocks=_day_trade_stocks,
     )
-    # 補上股票名稱
-    for s in signals:
-        s["name"] = _tickers.get(s["stock_id"], s["stock_id"])
+    for r in all_results:
+        r["name"] = _tickers.get(r["stock_id"], r["stock_id"])
+    push_monitoring(minute_str, all_results, THRESHOLD)
+
+    # 用最新分K收盤價更新持倉卡片浮動損益（今日損益只計已實現，不含此處）
+    price_map = {r["stock_id"]: r["price"] for r in all_results}
+    update_positions_price(price_map)
+
+    # 只有達門檻才產生交易訊號
+    signals = [r for r in all_results if r["proba"] >= THRESHOLD]
     push_signals(minute_str, signals)
 
+    print(f"[{minute_str}] 推論 {len(all_results)} 支，信心度: " +
+          " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in all_results))
     if signals:
-        print(f"\n[{minute_str}] 訊號（{len(signals)} 支）:")
-        for s in signals:
-            print(f"  {s['stock_id']:8s}  機率={s['proba']:.3f}  價={s['price']:.2f}")
-    else:
-        print(f"[{minute_str}] 無訊號")
+        print(f"  → 訊號（{len(signals)} 支）: " +
+              " ".join(f"{s['stock_id']} {s['proba']:.2f}" for s in signals))
+
+    if _executor is not None:
+        try:
+            _executor.reconcile(signals)
+        except Exception as e:
+            print(f"[TRADE ERROR] {e}")
+
+
+def _get_stocks():
+    """每次重連都取最新當沖標的；非盤中無清單時回退到所有可交易股票"""
+    from tay_trade.fugle_tickers import fugle_stocks
+    return list(_day_trade_stocks) if _day_trade_stocks else fugle_stocks()
 
 
 def _start_collector():
-    collector = M1Collector(on_minute=on_minute)
+    collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks)
     try:
         set_collector_status("running")
         collector.start()

@@ -29,10 +29,13 @@ def update_tickers() -> pd.DataFrame:
     for exchange in ("TWSE", "TPEx"):
         r = requests.get(
             f"{_BASE_URL}/intraday/tickers",
-            params={"type": "EQUITY", "exchange": exchange, "isDayTrading": "true"},
+            params={"type": "EQUITY", "exchange": exchange, "isDayTrading": "true", "isNormal": "true"},
             headers={"X-API-KEY": token},
             timeout=10,
         )
+        if r.status_code == 429:
+            print(f"  Fugle tickers API 429 限速，使用舊快取")
+            return load_tickers() if os.path.exists(_TICKERS_PATH) else pd.DataFrame()
         r.raise_for_status()
         for item in r.json().get("data", []):
             rows.append({

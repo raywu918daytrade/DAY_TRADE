@@ -51,6 +51,7 @@
     Accuracy、AUC（測試集）
 """
 
+import os
 from pathlib import Path
 
 import joblib
@@ -69,12 +70,14 @@ TP_PCT = 0.03  # 停利 3%
 SL_PCT = 0.03  # 停損 3%
 HOLD_BARS = 30  # 最多持有分K數
 
-# 訓練/推論的交易時段（早盤動能窗口）
-SESSION_START = (9, 1)  # 9:01（第一根完整分K）
-SESSION_END = (10, 0)  # 10:00（最晚進場時間）
-
 _ROOT = Path(__file__).parent
 load_dotenv(_ROOT / ".env")
+
+# 訓練/推論的交易時段；可用 .env 覆寫（本機測試用）
+SESSION_START = (9, 1)  # 9:01（第一根完整分K）
+_end_h = int(os.environ.get("SESSION_END_HOUR", "10"))
+_end_m = int(os.environ.get("SESSION_END_MIN", "0"))
+SESSION_END = (_end_h, _end_m)
 
 # ── Triple Barrier Label ──────────────────────────────────────────────────────
 
@@ -115,6 +118,10 @@ def _make_barrier_labels(m1: pd.DataFrame) -> pd.Series:
 
 
 def make_features(m1: pd.DataFrame, day: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame:
+    m1 = m1.copy()
+    day = day.copy()
+    m1["date"] = pd.to_datetime(m1["date"])
+    day["date"] = pd.to_datetime(day["date"])
     # 先建 day_date，供後面日內分組使用
     m1["day_date"] = m1["date"].dt.date
 
@@ -321,6 +328,29 @@ def predict_live(
         m1_live = m1_live[m1_live["stock_id"].isin(day_trade_stocks)]
     if m1_live.empty:
         return []
+
+    # make_features 以 day_date 做 merge；今日 day 資料尚不存在，補一行今日摘要
+    # day["date"] 可能是 object(str) 或 datetime64，統一轉換後比對
+    day = day.copy()
+    day["date"] = pd.to_datetime(day["date"])
+    today_ts = pd.Timestamp(date_str)
+    if not (day["date"] == today_ts).any():
+        rows = []
+        for sid, g in m1_live.groupby("stock_id"):
+            g_s = g.sort_values("date")
+            rows.append({
+                "stock_id": sid,
+                "date": today_ts,
+                "open": float(g_s.iloc[0]["open"]),
+                "high": float(g["high"].max()),
+                "low": float(g["low"].min()),
+                "close": float(g_s.iloc[-1]["close"]),
+                "volume": int(g["volume"].sum()),
+            })
+        if rows:
+            day = pd.concat([day, pd.DataFrame(rows)], ignore_index=True)
+            day["date"] = pd.to_datetime(day["date"])
+            day = day.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
     df = make_features(m1_live, day, compute_labels=False)
 
