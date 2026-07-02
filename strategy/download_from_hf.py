@@ -4,8 +4,8 @@
 用途：本機訓練前執行一次，把雲端最新資料拉下來。
 
 下載內容：
-    db/fugle_day/fugle_day.parquet  ← day_trade/day/fugle_day.parquet
-    db/m1/YYYY_M.parquet            ← day_trade/m1/YYYY_M.parquet（所有月份）
+    db/fugle_day/fugle_day.parquet  ← day_trade/day/fugle_day.parquet（每次全量，單一檔）
+    db/m1/YYYY_M.parquet            ← day_trade/m1/YYYY_M.parquet（增量：跳過本機已有的月份）
 
 需要的環境變數（.env）：
     HF_REPO_ID : HF dataset repo
@@ -46,7 +46,7 @@ dest_day.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(local_day, dest_day)
 print(f"  → {dest_day}")
 
-# ── 2. 分K（所有月份檔）───────────────────────────────────────────────────────
+# ── 2. 分K（增量：跳過本機已有的月份）────────────────────────────────────────
 print("下載分K（db/m1/）...")
 m1_files = [
     f for f in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
@@ -58,15 +58,21 @@ if not m1_files:
 else:
     dest_m1 = _ROOT / "db/m1"
     dest_m1.mkdir(parents=True, exist_ok=True)
+    # 找出 HF Hub 上最新的月份（當月資料每天都在更新，需重新下載）
+    latest = max(Path(f).stem for f in m1_files)  # e.g. "2026_7"
     for hf_path in sorted(m1_files):
         filename = Path(hf_path).name   # e.g. 2026_6.parquet
+        dest = dest_m1 / filename
+        # 已有且不是當月 → 跳過
+        if dest.exists() and Path(hf_path).stem != latest:
+            print(f"  跳過 {filename}（已有）")
+            continue
         local_path = hf_hub_download(
             repo_id=HF_REPO_ID,
             filename=hf_path,
             repo_type="dataset",
             token=HF_TOKEN,
         )
-        dest = dest_m1 / filename
         shutil.copy2(local_path, dest)
         print(f"  → {dest}")
 
