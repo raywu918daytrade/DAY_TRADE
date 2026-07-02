@@ -50,6 +50,7 @@ class DashboardSummary(BaseModel):
     filled: int
     holding: int
     closed: int
+    win_rate: Optional[float] = None
     today_pnl_pct: float
     risk_rejected: int
     errors: int
@@ -121,7 +122,7 @@ class TradeRecord(BaseModel):
 _lock = threading.Lock()
 _today_date: date = None
 
-_summary: dict = {
+_SUMMARY_DEFAULT: dict = {
     "today_signals": 0,
     "sent_orders": 0,
     "filled": 0,
@@ -134,6 +135,7 @@ _summary: dict = {
     "errors": 0,
     "last_updated": "",
 }
+_summary: dict = dict(_SUMMARY_DEFAULT)
 
 _collector_status: str = "stopped"   # "running" | "stopped" | "error"
 
@@ -183,7 +185,7 @@ def _reset_if_new_day():
         _signal_detail.clear()
         _positions.clear()
         _monitoring.clear()
-        _summary = {k: 0 if isinstance(v, (int, float)) else "" for k, v in _summary.items()}
+        _summary = dict(_SUMMARY_DEFAULT)
 
 
 def push_monitoring(minute_str: str, all_results: list, threshold: float):
@@ -327,6 +329,45 @@ def push_summary_update(updates: dict):
         _broadcast({"type": "summary", "data": dict(_summary)})
 
 
+def sync_broker_snapshot(
+    positions: list[dict],
+    trades: list[dict],
+    completed_trades: list[dict],
+    summary_updates: dict,
+):
+    """用永豐目前狀態重建 dashboard 快取；只覆蓋 broker 相關區塊。"""
+    with _lock:
+        _reset_if_new_day()
+
+        _positions.clear()
+        for pos in positions:
+            _positions[pos["stock_id"]] = pos
+
+        _trades.clear()
+        _trades.extend(trades)
+
+        _completed_trades.clear()
+        _completed_trades.extend(completed_trades)
+
+        _summary.update({
+            "holding": len(_positions),
+            "sent_orders": len(_trades),
+            "filled": sum(1 for t in _trades if t.get("status") in {"FILLED", "PARTIAL"}),
+            "closed": len(_completed_trades),
+        })
+        _summary.update(summary_updates)
+
+        snapshot = {
+            "summary": dict(_summary),
+            "positions": list(_positions.values()),
+            "trades": list(reversed(_trades)),
+            "completed_trades": list(reversed(_completed_trades)),
+        }
+
+    _broadcast({"type": "summary", "data": snapshot["summary"]})
+    _broadcast({"type": "broker_snapshot", "data": snapshot})
+
+
 def update_positions_price(price_map: dict):
     """
     每分鐘更新持倉卡片的現價與浮動損益，price_map = {stock_id: current_price}。
@@ -368,6 +409,7 @@ def health():
         "collector": _collector_status,
         "message": _COLLECTOR_MSG.get(_collector_status, _collector_status),
         "sse_clients": len(_sse_clients),
+        "ws_clients": len(_sse_clients),
         "last_signal_at": last_signal,
     }
 

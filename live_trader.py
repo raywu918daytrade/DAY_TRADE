@@ -2,12 +2,13 @@
 即時交易進入點（Render web service）
 
 架構：
-    主執行緒  → uvicorn（FastAPI + WebSocket）
-    背景執行緒 → M1Collector（Fugle WebSocket，阻塞式）
+    主執行緒  → uvicorn（FastAPI + SSE）
+    背景執行緒 → M1RestPoller（Fugle REST API，每分鐘 poll）
 
 流程：
-    on_minute → predict_live → push_signals → API /signals/today
-                             → push_candles  → API /chart/{id}/candles
+    on_minute → predict_live → push_monitoring → SSE monitoring event
+                             → push_signals    → API /signals/today
+                             → push_candles    → API /chart/{id}/candles
 """
 
 import calendar
@@ -55,6 +56,8 @@ _TW = timezone(timedelta(hours=8))
 THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
 MIN_AVG_VOL_LOTS = int(os.environ.get("MIN_AVG_VOL_LOTS", "1000"))  # 20日均量門檻（張）
 MAX_SUBSCRIPTIONS = int(os.environ.get("MAX_SUBSCRIPTIONS", "500"))  # Fugle 方案訂閱上限
+_FORCE_CLOSE_HOUR = int(os.environ.get("FORCE_CLOSE_HOUR", "13"))
+_FORCE_CLOSE_MIN = int(os.environ.get("FORCE_CLOSE_MIN", "25"))
 
 
 def _volume_filter(stocks: set, day: "pd.DataFrame") -> list:
@@ -101,8 +104,13 @@ _executor = None
 if TRADE_MODE != "off":
     try:
         from trade.run_execute import make_executor
-        _executor = make_executor(TRADE_MODE, TOTAL_CAPITAL)
+        _executor = make_executor(
+            TRADE_MODE, TOTAL_CAPITAL,
+            name_lookup=lambda sid: _tickers.get(sid, sid),
+        )
         print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}")
+        if hasattr(_executor, "sync_from_broker"):
+            _executor.sync_from_broker()
     except Exception as e:
         print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}")
 
@@ -189,6 +197,36 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             print(f"[TRADE ERROR] {e}")
 
 
+_force_close_done_date = None  # 防止同一天重複觸發
+
+
+def _force_close_eod():
+    """每天 FORCE_CLOSE_HOUR:FORCE_CLOSE_MIN 強制平倉所有當沖部位（不過夜）"""
+    global _force_closed_date
+    while True:
+        now = datetime.now(_TW)
+        trigger = now.replace(
+            hour=_FORCE_CLOSE_HOUR, minute=_FORCE_CLOSE_MIN,
+            second=0, microsecond=0,
+        )
+        wait = (trigger - now).total_seconds()
+        if wait > 0:
+            time.sleep(wait)
+            now = datetime.now(_TW)
+        today = now.date()
+        global _force_close_done_date
+        if _force_close_done_date != today and _executor is not None:
+            _force_close_done_date = today
+            print(f"[{now.strftime('%H:%M:%S')}] 強制平倉：當沖部位全部平倉（{_FORCE_CLOSE_HOUR}:{_FORCE_CLOSE_MIN:02d}）")
+            try:
+                _executor.reconcile([])  # 空訊號 → 平掉所有持倉
+            except Exception as e:
+                print(f"[FORCE CLOSE] 錯誤: {e}")
+        # 等到明天同一時間
+        next_trigger = trigger + timedelta(days=1)
+        time.sleep(max((next_trigger - datetime.now(_TW)).total_seconds(), 60))
+
+
 def _get_stocks():
     """每次重連都取最新當沖標的；非盤中無清單時回退到所有可交易股票"""
     from tay_trade.fugle_tickers import fugle_stocks
@@ -210,7 +248,9 @@ def _start_collector():
 if __name__ == "__main__":
     # 每日 08:45 更新排程
     threading.Thread(target=_daily_refresh, daemon=True).start()
-    # M1Collector 在背景執行緒
+    # 每日 13:25 強制平倉（當沖不過夜）
+    threading.Thread(target=_force_close_eod, daemon=True).start()
+    # M1RestPoller 在背景執行緒
     threading.Thread(target=_start_collector, daemon=True).start()
 
     # uvicorn 跑主執行緒（阻塞）

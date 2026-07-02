@@ -185,6 +185,38 @@ def list_orders(api: sj.Shioaji) -> list:
     ]
 
 
+def list_orders_today(api: sj.Shioaji) -> list[dict]:
+    """今日委託/成交狀態，供 dashboard 重啟後重建記憶體快取。"""
+    from datetime import date
+    today = date.today()
+    api.update_status()
+    trades = sorted(api.list_trades(), key=lambda t: t.status.order_datetime)
+
+    result = []
+    for t in trades:
+        order_dt = t.status.order_datetime
+        order_date = getattr(order_dt, "date", lambda: order_dt)()
+        if order_date != today:
+            continue
+
+        action = str(t.order.action)
+        direction = "buy" if "buy" in action.lower() else "sell"
+        result.append({
+            "order_id": t.order.id,
+            "time": order_dt,
+            "stock_id": t.contract.code,
+            "direction": direction,
+            "action": action,
+            "price": float(t.order.price),
+            "quantity": int(t.order.quantity),
+            "filled": int(t.status.deal_quantity),
+            "status": normalize_status(t.status.status),
+            "raw_status": str(t.status.status),
+            "msg": t.status.msg,
+        })
+    return result
+
+
 def get_settlements(api: sj.Shioaji) -> list:
     """交割明細（對帳單）"""
     print("交割明細（對帳單）")

@@ -20,16 +20,25 @@ try:
     from api import close_position as _close_pos
     from api import push_summary_update as _push_summary
     from api import push_completed_trades_from_broker as _push_closed_sync
+    from api import sync_broker_snapshot as _sync_broker_snapshot
 except ImportError:
     def _push_trade(*_): pass
     def _push_pos(*_): pass
     def _close_pos(*_): pass
     def _push_summary(*_): pass
     def _push_closed_sync(*_): pass
+    def _sync_broker_snapshot(*_): pass
 
 
 def _now() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _fmt_time(value) -> str:
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M:%S")
+    text = str(value or "")
+    return text[11:19] if len(text) >= 19 else text
 
 
 class PaperTrader:
@@ -130,11 +139,12 @@ class LiveTrader:
     登入失敗（例如雲端 IP 被擋）會印錯誤並直接 return，不影響 dashboard。
     """
 
-    def __init__(self, total_capital: float = 1_000_000, simulation: bool = True):
+    def __init__(self, total_capital: float = 1_000_000, simulation: bool = True, name_lookup=None):
         self.total_capital = total_capital
         self.simulation = simulation
         self._api = None
         self._positions_synced = False  # 啟動後第一次 reconcile 時同步現有持倉
+        self._name_lookup = name_lookup or (lambda sid: sid)
 
     def _connect(self) -> bool:
         if self._api is not None:
@@ -146,6 +156,114 @@ class LiveTrader:
         except Exception as e:
             print(f"[LIVE] 登入失敗: {e}")
             return False
+
+    def sync_from_broker(self) -> bool:
+        """重啟後從永豐只讀同步持倉、今日委託與已平倉到 dashboard 快取。"""
+        if not self._connect():
+            return False
+
+        try:
+            current = trade_api.get_positions(self._api)
+        except Exception as e:
+            print(f"[LIVE SYNC] 取得持倉失敗: {e}")
+            current = {}
+
+        try:
+            if current:
+                contracts = [self._api.Contracts.Stocks[sid] for sid in current]
+                snapshots = {s.code: s.close for s in self._api.snapshots(contracts)}
+            else:
+                snapshots = {}
+        except Exception as e:
+            print(f"[LIVE SYNC] 取得持倉報價失敗: {e}")
+            snapshots = {}
+
+        positions = []
+        for sid, pos in sorted(current.items()):
+            avg = pos["avg_price"]
+            qty = pos["quantity"]
+            curr_price = snapshots.get(sid, avg)
+            pnl = round((curr_price - avg) / avg * 100, 4) if avg else 0.0
+            positions.append({
+                "stock_id": sid,
+                "name": self._name_lookup(sid),
+                "quantity": qty,
+                "pnl_pct": pnl,
+                "entry_price": avg,
+                "current_price": curr_price,
+                "stop_loss": round(avg * 0.97, 2),
+                "take_profit": round(avg * 1.03, 2),
+            })
+
+        try:
+            orders = trade_api.list_orders_today(self._api)
+        except Exception as e:
+            print(f"[LIVE SYNC] 今日委託同步失敗: {e}")
+            orders = []
+
+        trades = [
+            {
+                "time": _fmt_time(o.get("time")),
+                "stock_id": o["stock_id"],
+                "direction": o["direction"],
+                "price": o["price"],
+                "quantity": o["quantity"],
+                "status": o["status"],
+                "broker_response": o.get("msg") or o["status"],
+            }
+            for o in orders
+        ]
+
+        try:
+            closed_today = trade_api.get_closed_today(self._api)
+        except Exception as e:
+            print(f"[LIVE SYNC] 今日已平倉同步失敗: {e}")
+            closed_today = []
+
+        completed_trades = []
+        for c in closed_today:
+            entry = c.get("buy_avg", 0)
+            exit_price = c.get("sell_avg", 0)
+            qty = c.get("quantity", 0)
+            pnl_pct = c.get("pnl_pct", 0.0)
+            pnl_amt = round((exit_price - entry) * qty * 1000, 0) if entry and exit_price else None
+            completed_trades.append({
+                "time": "-",
+                "stock_id": c["stock_id"],
+                "name": c["stock_id"],
+                "quantity": qty,
+                "entry_price": entry,
+                "exit_price": exit_price,
+                "pnl_pct": pnl_pct,
+                "pnl_amt": pnl_amt,
+                "exit_reason": "broker_sync",
+            })
+
+        wins = sum(1 for c in completed_trades if c["pnl_pct"] > 0)
+        closed = len(completed_trades)
+        avg_pnl = (
+            round(sum(c["pnl_pct"] for c in completed_trades) / closed, 4)
+            if closed else 0.0
+        )
+        last_updated = _fmt_time(orders[-1]["time"]) if orders else _now()
+
+        _sync_broker_snapshot(
+            positions,
+            trades,
+            completed_trades,
+            {
+                "wins": wins,
+                "win_rate": round(wins / closed * 100, 1) if closed else None,
+                "today_pnl_pct": avg_pnl,
+                "last_updated": last_updated,
+            },
+        )
+        self._positions_synced = True
+        print(
+            f"[LIVE SYNC] 啟動同步完成：持倉 {len(positions)}、"
+            f"今日委託 {len(trades)}、已平倉 {closed}"
+        )
+        return True
 
     def _on_order_event(self, state, msg):
         """永豐成交回報（SDEAL）→ 更新 dashboard 進場均價"""
@@ -178,7 +296,7 @@ class LiveTrader:
                     pnl = round((snap - avg) / avg * 100, 4) if avg else 0.0
                     _push_pos({
                         "stock_id": sid,
-                        "name": sid,
+                        "name": self._name_lookup(sid),
                         "quantity": qty,
                         "pnl_pct": pnl,
                         "entry_price": avg,
@@ -228,7 +346,7 @@ class LiveTrader:
                     pnl = round((curr_price - avg) / avg * 100, 4) if avg else 0.0
                     _push_pos({
                         "stock_id": sid,
-                        "name": sid,
+                        "name": self._name_lookup(sid),
                         "quantity": qty,
                         "pnl_pct": pnl,
                         "entry_price": avg,
@@ -342,17 +460,18 @@ class LiveTrader:
             self._api = None
 
 
-def make_executor(mode: str, total_capital: float = 1_000_000):
+def make_executor(mode: str, total_capital: float = 1_000_000, name_lookup=None):
     """
     mode:
       paper → PaperTrader（本機 JSON，不碰 API）
       sim   → LiveTrader(simulation=True)（永豐模擬環境）
       live  → LiveTrader(simulation=False)（正式下單）
+    name_lookup: callable(sid) → str，用於查詢公司名稱
     """
     if mode == "paper":
         return PaperTrader(total_capital)
     if mode == "sim":
-        return LiveTrader(total_capital, simulation=True)
+        return LiveTrader(total_capital, simulation=True, name_lookup=name_lookup)
     if mode == "live":
-        return LiveTrader(total_capital, simulation=False)
+        return LiveTrader(total_capital, simulation=False, name_lookup=name_lookup)
     raise ValueError(f"未知 mode: {mode!r}，應為 paper / sim / live")
