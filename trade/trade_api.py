@@ -135,9 +135,9 @@ def get_closed_today(api: sj.Shioaji) -> list[dict]:
     每筆賣出成交各算一回合（FIFO 配對對應買進），而非按股票合併。
     回傳 [{"stock_id", "buy_avg", "sell_avg", "quantity", "pnl_pct", "sell_time"}, ...]
     """
-    from datetime import date
+    from datetime import datetime, timezone, timedelta
     from collections import deque
-    today = date.today()
+    today = datetime.now(timezone(timedelta(hours=8))).date()  # 台灣時間
     api.update_status()
     trades = sorted(api.list_trades(), key=lambda t: t.status.order_datetime)
 
@@ -207,8 +207,8 @@ def cancel_sent_orders(api: sj.Shioaji) -> dict:
       {"buy": [(sid, cost), ...], "sell": [sid, ...]}
       cost = 委託價 × 委託張數 × 1000（未成交金額，供還原 _used_quota 用）
     """
-    from datetime import date
-    today = date.today()
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone(timedelta(hours=8))).date()  # 台灣時間
     api.update_status()
     cancelled: dict = {"buy": [], "sell": []}
     for t in api.list_trades():
@@ -253,8 +253,8 @@ def list_orders(api: sj.Shioaji) -> list:
 
 def list_orders_today(api: sj.Shioaji) -> list[dict]:
     """今日委託/成交狀態，供 dashboard 重啟後重建記憶體快取。"""
-    from datetime import date
-    today = date.today()
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone(timedelta(hours=8))).date()  # 台灣時間
     api.update_status()
     trades = sorted(api.list_trades(), key=lambda t: t.status.order_datetime)
 
