@@ -706,10 +706,10 @@ async def event_stream(request: Request):
                 if await request.is_disconnected():
                     break
                 try:
-                    data = await asyncio.wait_for(queue.get(), timeout=30)
+                    data = await asyncio.wait_for(queue.get(), timeout=5)
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": heartbeat\n\n"  # 保持連線
+                    yield ": heartbeat\n\n"  # 保持連線，同時讓 is_disconnected 有機會偵測
         finally:
             _sse_clients.discard(queue)
 
