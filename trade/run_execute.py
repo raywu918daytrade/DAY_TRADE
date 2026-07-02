@@ -1,7 +1,9 @@
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+_TW = timezone(timedelta(hours=8))
 
 # ── sys.path 注入（支援 Render 或其他環境）─────────────────────────────
 if str(Path(__file__).parent.parent) not in sys.path:
@@ -61,7 +63,7 @@ except (ImportError, ModuleNotFoundError):
 
 
 def _now() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now(_TW).strftime("%H:%M:%S")
 
 
 def _fmt_time(value) -> str:

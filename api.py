@@ -18,9 +18,11 @@ ReDoc      : http://localhost:8000/redoc
 import asyncio
 import json
 import threading
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+
+_TW = timezone(timedelta(hours=8))
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -279,7 +281,7 @@ def _broadcast(data: dict):
 
 def _reset_if_new_day():
     global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _signal_detail, _positions, _monitoring
-    today = date.today()
+    today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
         _signals.clear()
@@ -417,7 +419,7 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_pr
         pnl_amt = round((exit_price - entry) * qty * 1000, 0) if entry and exit_price else None
         _completed_trades.append(
             {
-                "time": datetime.now().strftime("%H:%M:%S"),
+                "time": datetime.now(_TW).strftime("%H:%M:%S"),
                 "stock_id": stock_id,
                 "name": pos.get("name", stock_id),
                 "quantity": qty,
