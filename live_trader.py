@@ -42,9 +42,8 @@ import os
 
 from data.fugle_tickers import update_tickers
 from data.m1_rest import M1RestPoller
-from data.query import load_day, load_m1_live
-
-_HF_REPO_ID = os.environ.get("HF_REPO_ID", "")  # 設在 Render 環境變數
+from data.query import load_m1_live
+from data.data_manager import Phase, load_d1  # noqa: F401 Phase 供外部 import 參考
 
 TRADE_MODE = os.environ.get("TRADE_MODE", "off")  # off | paper | sim | live
 _TOTAL_CAPITAL_ENV = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
@@ -68,86 +67,10 @@ def _resolve_capital() -> float:
 TOTAL_CAPITAL = _resolve_capital()
 
 
-_DAY_MONTHS_TO_LOAD = int(os.environ.get("DAY_MONTHS_TO_LOAD", "2"))  # 下載最近 N 個月的月份日K
-
-
-def _get_day_hf_paths() -> "list[str]":
-    """HF Hub 下載最近 N 個月份日K parquet，回傳本地快取路徑清單（舊→新）。"""
-    import re as _re
-    from huggingface_hub import HfApi, hf_hub_download
-    token = os.environ.get("HF_TOKEN") or None
-    # 只取 YYYY_M.parquet 月份格式，排除 fugle_day.parquet 等舊格式大檔
-    day_files = sorted([
-        f for f in HfApi().list_repo_files(repo_id=_HF_REPO_ID, repo_type="dataset", token=token)
-        if _re.match(r"day_trade/day/\d{4}_\d+\.parquet$", f)
-    ])
-    if not day_files:
-        return []
-    targets = day_files[-_DAY_MONTHS_TO_LOAD:]
-    paths = []
-    for fname in targets:
-        p = hf_hub_download(repo_id=_HF_REPO_ID, filename=fname,
-                            repo_type="dataset", token=token)
-        print(f"  → {p}", flush=True)
-        paths.append(p)
-    return paths
-
-
-def _load_day(stocks: set, paths: "list[str]") -> "tuple[pd.DataFrame, set]":
-    """
-    兩次讀 parquet（可多個月份），省記憶體：
-      第 1 次：只讀 volume → volume filter → 取前 MAX_SUBSCRIPTIONS 支
-      第 2 次：只讀過濾後的股票完整資料（供推論用）
-    """
-    import pyarrow.parquet as pq
-    import pyarrow as pa
-    import pandas as pd
-
-    if isinstance(paths, str):
-        paths = [paths]
-
-    # 第 1 次：只讀 volume 欄位，做均量過濾
-    tables_vol = [pq.read_table(p, columns=["stock_id", "date", "volume"]) for p in paths]
-    df_vol = pa.concat_tables(tables_vol).to_pandas()
-    del tables_vol
-    top = set(_volume_filter(stocks, df_vol))
-    del df_vol
-
-    if not top:
-        return pd.DataFrame(), set()
-
-    # 第 2 次：只讀過濾後的股票完整資料
-    tables = [pq.read_table(p, filters=[("stock_id", "in", list(top))]) for p in paths]
-    df = pa.concat_tables(tables).to_pandas()
-    del tables
-    df["date"] = pd.to_datetime(df["date"])
-    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
-    print(f"  日K：{len(df):,} 筆，{df['stock_id'].nunique():,} 支（前 {len(top)} 支）")
-    return df, top
-
-
 _TW = timezone(timedelta(hours=8))
 THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
-MIN_AVG_VOL_LOTS = int(os.environ.get("MIN_AVG_VOL_LOTS", "1000"))  # 20日均量門檻（張）
-MAX_SUBSCRIPTIONS = int(os.environ.get("MAX_SUBSCRIPTIONS", "500"))  # Fugle 方案訂閱上限
 _FORCE_CLOSE_HOUR = int(os.environ.get("FORCE_CLOSE_HOUR", "13"))
 _FORCE_CLOSE_MIN = int(os.environ.get("FORCE_CLOSE_MIN", "25"))
-
-
-def _volume_filter(stocks: set, day: "pd.DataFrame") -> list:
-    """20日均量過濾，回傳按均量排序（高→低）的 stock_id list，最多 MAX_SUBSCRIPTIONS 支"""
-    if day.empty or not stocks:
-        result = list(stocks)[:MAX_SUBSCRIPTIONS]
-        print(f"  均量過濾：無日K，取前 {len(result)} 支")
-        return result
-    recent = day[day["stock_id"].isin(stocks)].copy()
-    recent["date"] = pd.to_datetime(recent["date"])
-    last20 = recent.sort_values("date").groupby("stock_id").tail(20)
-    avg_vol = last20.groupby("stock_id")["volume"].mean()
-    qualified = avg_vol[avg_vol >= MIN_AVG_VOL_LOTS * 1000].sort_values(ascending=False)
-    result = list(qualified.index[:MAX_SUBSCRIPTIONS])
-    print(f"  均量過濾（≥{MIN_AVG_VOL_LOTS}張）: {len(stocks)} → {len(qualified)} 支 → 訂閱前 {len(result)} 支")
-    return result
 
 
 print("載入模型...")
@@ -176,22 +99,15 @@ except Exception as e:
 
 # 盤中才有標的清單，非盤中跳過日K載入（省記憶體）；_daily_refresh 在 06:00 補載
 if _day_trade_stocks:
-    _src = f"HF ({_HF_REPO_ID})" if _HF_REPO_ID else "本機 db/fugle_day/"
-    print(f"[D1] 載入日K（來源：{_src}）...", flush=True)
+    print(f"[D1] 載入日K（{Phase.PRE_MARKET.value}）...", flush=True)
     try:
-        if _HF_REPO_ID:
-            _day_paths = _get_day_hf_paths()
-            _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_paths)
-        else:
-            _full = load_day()
-            print(f"  全量日K：{len(_full):,} 筆，開始均量過濾...", flush=True)
-            _day_trade_stocks = _volume_filter(_day_trade_stocks, _full[["stock_id", "date", "volume"]])
-            _day = _full[_full["stock_id"].isin(set(_day_trade_stocks))].copy()
-            del _full
+        _day, _day_trade_stocks = load_d1(_day_trade_stocks)
         _d1_last = _day["date"].max() if not _day.empty else "無"
         print(f"✓ [D1] {len(_day):,} 筆，{_day['stock_id'].nunique():,} 支，最新日期：{_d1_last}", flush=True)
+        _log_sys(f"D1 載入完成：{_day['stock_id'].nunique() if not _day.empty else 0} 支，最新 {_d1_last}")
     except Exception as e:
         print(f"✗ [D1] 載入失敗: {e}", flush=True)
+        _log_sys(f"D1 載入失敗: {e}", "error")
         _day = pd.DataFrame()
 else:
     _day = pd.DataFrame()
@@ -263,16 +179,11 @@ def _daily_refresh():
                     _tickers = df.set_index("stock_id")["name"].to_dict()
                     _day_trade_stocks = set(_tickers.keys()) or None
                 if _day_trade_stocks:
-                    if _HF_REPO_ID:
-                        _day_paths = _get_day_hf_paths()
-                        _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_paths)
-                    else:
-                        _full = load_day()
-                        _day_trade_stocks = _volume_filter(_day_trade_stocks, _full[["stock_id", "date", "volume"]])
-                        _day = _full[_full["stock_id"].isin(set(_day_trade_stocks))].copy()
-                        del _full
+                    _day, _day_trade_stocks = load_d1(_day_trade_stocks)
                 last_refresh = today
-                print(f"  更新完成，當沖標的：{len(_day_trade_stocks) if _day_trade_stocks else 0} 支")
+                n = len(_day_trade_stocks) if _day_trade_stocks else 0
+                print(f"  更新完成，當沖標的：{n} 支")
+                _log_sys(f"每日更新完成（{Phase.PRE_MARKET.value}）：{n} 支標的")
             except Exception as e:
                 print(f"  更新失敗: {e}")
         time.sleep(60)
