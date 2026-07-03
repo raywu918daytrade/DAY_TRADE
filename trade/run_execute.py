@@ -374,8 +374,14 @@ class LiveTrader:
         return True
 
     def startup_sltp_check(self):
-        """重啟後立刻用 broker 現價檢查 SL/TP，不等下一分鐘 on_minute。"""
+        """
+        重啟後立刻用 broker 現價檢查 SL/TP，不等下一分鐘 on_minute。
+        sync_from_broker() 已打 snapshot，存在 _startup_prices；這裡直接用，
+        再補拉 _startup_prices 裡沒有的持倉（理論上不應發生）。
+        傳入假訊號讓所有持倉都視為「目標」，只靠 SL/TP 觸發平倉。
+        """
         prices = getattr(self, "_startup_prices", {})
+        print(f"[STARTUP SL/TP] _startup_prices 有 {len(prices)} 支報價：{list(prices.keys())}", flush=True)
         if not prices:
             print("[STARTUP SL/TP] 無持倉報價，略過", flush=True)
             return
@@ -389,12 +395,17 @@ class LiveTrader:
             return
         sl_pct = float(_get_setting("stop_loss_pct") or 3.0) / 100
         tp_pct = float(_get_setting("take_profit_pct") or 3.0) / 100
+        print(f"[STARTUP SL/TP] 持倉 {list(current.keys())}  SL={sl_pct*100:.0f}%  TP={tp_pct*100:.0f}%", flush=True)
+        for sid, pos in current.items():
+            p = prices.get(sid)
+            avg = pos["avg_price"]
+            pnl = round((p - avg) / avg * 100, 2) if p and avg else None
+            print(f"  {sid}: avg={avg} price={p} pnl={pnl}%", flush=True)
         # 傳入「保留所有持倉」的假訊號，讓 reconcile 只靠 SL/TP 決定平倉
         fake_signals = [
             {"stock_id": sid, "proba": 1.0, "price": prices.get(sid, pos["avg_price"])}
             for sid, pos in current.items()
         ]
-        print(f"[STARTUP SL/TP] 檢查 {len(current)} 支持倉（SL={sl_pct*100:.0f}% TP={tp_pct*100:.0f}%）", flush=True)
         self.reconcile(fake_signals, prices=prices)
 
     def _on_order_event(self, state, msg):
@@ -635,11 +646,13 @@ class LiveTrader:
             flush=True,
         )
         # 可用額度直接從 broker 持倉算（不用自追 _used_quota，永豐才是真實來源）
+        # 當沖買賣各佔一半額度，實際可買上限 = total_capital / 2
         self._used_quota = round(
             sum(p["avg_price"] * p["quantity"] * 1000 for p in current.values()), 0
         )
-        available = self.total_capital - self._used_quota
-        _push_summary({"used_quota": self._used_quota, "total_capital": self.total_capital})
+        available = max(0.0, self.total_capital / 2 - self._used_quota)
+        _push_summary({"used_quota": self._used_quota, "total_capital": self.total_capital,
+                       "available": available})
 
         if not to_open and not to_close:
             print(f"[RECONCILE] 無新增交易，完成", flush=True)
