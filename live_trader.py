@@ -263,6 +263,10 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     # 載入今日分K（只載一次，下面 push_candles 和 predict_live 共用）
     date_str = minute_str[:10]
     m1_live = load_m1_live(date_str)
+    print(
+        f"[on_minute] {minute_str[11:16]}  M1:{m1_live['stock_id'].nunique() if not m1_live.empty else 0} 支 {len(m1_live):,} 筆",
+        flush=True,
+    )
 
     if not m1_live.empty:
         for sid, g in m1_live.groupby("stock_id"):
@@ -308,12 +312,15 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     signals = [r for r in all_results if r["proba"] >= threshold]
     push_signals(minute_str, signals)
 
+    top = sorted(all_results, key=lambda x: -x["proba"])[:5]
+    top_str = " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in top)
     print(
-        f"[{minute_str}] 推論 {len(all_results)} 支，信心度: "
-        + " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in all_results)
+        f"  推論:{len(all_results)} 支  訊號:{len(signals)} 支（門檻={threshold:.2f}）  top5:[{top_str}]",
+        flush=True,
     )
     if signals:
-        print(f"  → 訊號（{len(signals)} 支）: " + " ".join(f"{s['stock_id']} {s['proba']:.2f}" for s in signals))
+        sig_str = " ".join(f"{s['stock_id']}={s['proba']:.2f}" for s in signals)
+        print(f"  → 訊號: {sig_str}", flush=True)
 
     if _executor is not None:
         try:
