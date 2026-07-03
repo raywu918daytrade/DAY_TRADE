@@ -35,9 +35,10 @@ api = HfApi()
 
 # ── 1. 日K（增量：跳過本機已有的月份）────────────────────────────────────────
 print("下載日K（db/fugle_day/）...")
+import re as _re
 day_files = [
     f for f in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
-    if f.startswith("day_trade/day/") and f.endswith(".parquet")
+    if _re.match(r"day_trade/day/\d{4}_\d+\.parquet$", f)  # 只取 YYYY_M.parquet，排除舊 fugle_day.parquet
 ]
 
 if not day_files:

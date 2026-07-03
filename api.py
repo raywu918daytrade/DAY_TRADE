@@ -254,6 +254,48 @@ _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
 _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
+# ── Log 緩衝區 ────────────────────────────────────────────────────────────────
+from collections import deque as _deque
+import json as _json_mod
+
+_system_logs: _deque = _deque(maxlen=500)  # 程式/系統事件
+_trade_logs: _deque = _deque(maxlen=500)   # 交易事件（補充 _trades 的詳細說明）
+_LOG_DIR = Path(__file__).parent / "logs"
+
+
+def _write_log_file(entry: dict, cat: str):
+    """Append one log entry to today's JSONL file (logs/YYYY-MM-DD.jsonl)."""
+    try:
+        _LOG_DIR.mkdir(exist_ok=True)
+        today = datetime.now(_TW).strftime("%Y-%m-%d")
+        path = _LOG_DIR / f"{today}.jsonl"
+        line = _json_mod.dumps({"cat": cat, **entry}, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as _f:
+            _f.write(line + "\n")
+    except Exception as _e:
+        print(f"[LOG FILE ERROR] {_e}", flush=True)
+
+
+def _read_log_file() -> list[dict]:
+    """Read today's JSONL log file; returns [] on any error."""
+    try:
+        today = datetime.now(_TW).strftime("%Y-%m-%d")
+        path = _LOG_DIR / f"{today}.jsonl"
+        if not path.exists():
+            return []
+        entries = []
+        with open(path, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line:
+                    try:
+                        entries.append(_json_mod.loads(_line))
+                    except Exception:
+                        pass
+        return entries
+    except Exception:
+        return []
+
 # ── SSE 廣播 ─────────────────────────────────────────────────────────────────
 
 _sse_clients: set[asyncio.Queue] = set()
@@ -292,6 +334,8 @@ def _reset_if_new_day():
         _candles.clear()
         _signal_detail.clear()
         _positions.clear()
+        _system_logs.clear()
+        _trade_logs.clear()
         _monitoring.clear()
         _summary = dict(_SUMMARY_DEFAULT)
 
@@ -442,12 +486,36 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_pr
         _broadcast({"type": "closed", "stock_id": stock_id, "pnl_pct": pnl_pct})
 
 
+def _log_ts() -> str:
+    return datetime.now(_TW).strftime("%m/%d %H:%M:%S")
+
+
+def append_system_log(message: str, level: str = "info"):
+    """寫入系統日誌環形緩衝區並廣播。level: info / warning / error"""
+    entry = {"time": _log_ts(), "level": level, "msg": message}
+    _system_logs.append(entry)
+    _write_log_file(entry, "system")
+    _broadcast({"type": "log", "cat": "system", **entry})
+
+
+def append_trade_log(stock_id: str, action: str, detail: str, status: str = ""):
+    """寫入交易日誌環形緩衝區並廣播。action: buy/sell/cancel/sltp/force"""
+    entry = {"time": _log_ts(), "stock_id": stock_id, "action": action,
+             "detail": detail, "status": status}
+    _trade_logs.append(entry)
+    _write_log_file(entry, "trade")
+    _broadcast({"type": "log", "cat": "trade", **entry})
+
+
 def push_alert(message: str, level: str = "warning"):
-    """推送系統通知到前端（SSE）。level: info / warning / error"""
-    from datetime import datetime, timezone, timedelta
-    ts = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+    """推送系統通知到前端（SSE）並寫入系統日誌。level: info / warning / error"""
+    ts = _log_ts()
     print(f"[ALERT:{level.upper()}] {message}", flush=True)
+    entry = {"time": ts, "level": level, "msg": message}
+    _system_logs.append(entry)
+    _write_log_file(entry, "system")
     _broadcast({"type": "alert", "level": level, "message": message, "time": ts})
+    _broadcast({"type": "log", "cat": "system", **entry})
 
 
 def push_summary_update(updates: dict):
@@ -647,6 +715,31 @@ def completed_trades():
 def failed_orders():
     with _lock:
         return list(reversed([t for t in _trades if t.get("status") == "FAILED"]))
+
+
+@app.get("/api/logs", tags=["系統"], summary="今日程式日誌與交易日誌（各最多500筆）")
+def get_logs(cat: str = "all"):
+    """
+    cat=system  → 程式/系統事件（限流、錯誤、reconcile）
+    cat=trade   → 交易事件（買/賣/SL/TP/force close）
+    cat=all     → 兩者合併，依時間倒序
+
+    優先讀今日 JSONL 檔（重啟不遺失）；檔案不存在時 fallback 到記憶體緩衝。
+    """
+    entries = _read_log_file()
+    if not entries:
+        # 檔案尚不存在（例如剛啟動當天第一次寫前），fallback 到記憶體
+        with _lock:
+            sys_list = list(_system_logs)
+            trd_list = list(_trade_logs)
+        entries = [{"cat": "system", **e} for e in sys_list] + [{"cat": "trade", **e} for e in trd_list]
+    if cat == "system":
+        result = [e for e in entries if e.get("cat") == "system"]
+    elif cat == "trade":
+        result = [e for e in entries if e.get("cat") == "trade"]
+    else:
+        result = entries
+    return list(reversed(sorted(result, key=lambda x: x.get("time", ""), reverse=False)))[:500]
 
 
 def get_force_close_queue() -> set:

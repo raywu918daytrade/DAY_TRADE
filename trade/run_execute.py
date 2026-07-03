@@ -46,6 +46,8 @@ try:
     from api import push_completed_trades_from_broker as _push_closed_sync
     from api import sync_broker_snapshot as _sync_broker_snapshot
     from api import get_setting as _get_setting
+    from api import append_system_log as _log_sys
+    from api import append_trade_log as _log_trade
 except (ImportError, ModuleNotFoundError):
 
     def _push_trade(*_):
@@ -69,16 +71,33 @@ except (ImportError, ModuleNotFoundError):
     def _get_setting(key, default=None):
         return default
 
+    def _log_sys(msg, level="info"):
+        pass
+
+    def _log_trade(sid, action, detail, status=""):
+        pass
+
 
 def _now() -> str:
-    return datetime.now(_TW).strftime("%H:%M:%S")
+    return datetime.now(_TW).strftime("%m/%d %H:%M:%S")
+
+
+def _to_bool(v, default: bool = True) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() not in ("false", "0", "no", "off", "")
 
 
 def _fmt_time(value) -> str:
     if hasattr(value, "strftime"):
-        return value.strftime("%H:%M:%S")
+        return value.strftime("%m/%d %H:%M:%S")
     text = str(value or "")
-    return text[11:19] if len(text) >= 19 else text
+    # "2026-07-03 11:20:06..." → "07/03 11:20:06"
+    if len(text) >= 19:
+        return text[5:7] + "/" + text[8:10] + " " + text[11:19]
+    return text
 
 
 class PaperTrader:
@@ -137,7 +156,7 @@ class PaperTrader:
             return
 
         # 當沖額度：買入 + 賣出 各佔一半
-        budget = self.total_capital / 2 / max(len(target), 1)
+        budget = self.total_capital / 2 / max(len(target), 1)  # PaperTrader: 沿用 /2 邏輯
 
         for sid in sorted(to_close):
             pos = self._positions.pop(sid)
@@ -211,6 +230,8 @@ class LiveTrader:
 
     def __init__(self, total_capital: float = 1_000_000, simulation: bool = True, name_lookup=None):
         self.total_capital = total_capital
+        # 現股當沖：買賣各佔一半資金。外部傳入總資金（如 200萬），內部自動取一半（100萬）作為買入上限。
+        self._buy_capital: float = total_capital / 2
         self.simulation = simulation
         self._api = None
         self._broker: "BrokerClient | None" = None  # 連線後建立
@@ -369,7 +390,7 @@ class LiveTrader:
                 "today_pnl_amt": total_pnl_amt,
                 "open_trades": open_count,
                 "closed": closed,
-                "total_capital": self.total_capital,
+                "total_capital": self._buy_capital,
                 "used_quota": used_quota,
                 "errors": failed_count,
                 "last_updated": last_updated,
@@ -419,6 +440,7 @@ class LiveTrader:
             action = str(msg.get("action", "")).lower()
             direction = "buy" if "buy" in action else "sell"
             print(f"[LIVE FILL] {sid} {direction} {fill_qty}張 @ {fill_price} ✓", flush=True)
+            _log_trade(sid, f"fill_{direction}", f"{fill_qty}張@{fill_price} 成交", "FILLED")
             _push_trade(
                 {
                     "order_id": msg.get("id", ""),
@@ -522,6 +544,7 @@ class LiveTrader:
         - 在券商持倉中但不在 signals → 下限價賣單
         下單後同步更新 api.py 的 in-memory 狀態，供 dashboard 顯示。
         """
+        _log_sys(f"reconcile 開始：{len(signals)} 筆訊號", "info")
         print(f"[RECONCILE] 開始調和：收到 {len(signals)} 筆訊號", flush=True)
         if not self._connect():
             print(f"[RECONCILE] ✗ 連線失敗，中止", flush=True)
@@ -531,6 +554,7 @@ class LiveTrader:
         cap_override = _get_setting("total_capital")
         if cap_override is not None:
             self.total_capital = float(cap_override)
+            self._buy_capital = self.total_capital / 2  # 買入上限 = 總額 / 2
 
         sig_map = {s["stock_id"]: s for s in signals}
         target = set(sig_map)
@@ -545,6 +569,7 @@ class LiveTrader:
         self._sync_positions_with_broker(current)
 
         # 取消上分鐘所有 SENT 未成交買/賣單（BrokerClient 負責更新追蹤）
+        cancelled = {"buy": [], "sell": []}  # 預設空，cancel 失敗時不影響後續
         try:
             if self._broker:
                 cancelled = self._broker.cancel_all_orders()
@@ -555,12 +580,16 @@ class LiveTrader:
                 self._used_quota = max(0, self._used_quota - restore)
                 sids = [sid for sid, _ in cancelled["buy"]]
                 print(f"[CANCEL BUY]  取消未成交買單: {sids}，還原額度 {restore/10000:.1f}萬")
+                _log_sys(f"取消買單: {sids}，還原 {restore/10000:.1f}萬", "info")
             if cancelled["sell"]:
                 print(f"[CANCEL SELL] 取消未成交賣單: {cancelled['sell']}，本分鐘重新掛")
+                _log_sys(f"取消賣單，重掛: {cancelled['sell']}", "info")
         except Exception as e:
+            _log_sys(f"取消委託失敗: {e}", "error")
             print(f"[CANCEL] 取消委託失敗: {e}")
 
         # 取消後重新取得委託狀態（PARTIAL 單仍保留不動）
+        pending_orders: list = []
         try:
             pending_orders = trade_api.list_orders_today(self._api)
             pending_buy = {
@@ -627,8 +656,8 @@ class LiveTrader:
             except Exception as e:
                 print(f"[LIVE SYNC] 已平倉同步失敗: {e}")
 
-        open_enabled = _get_setting("open_enabled") if _get_setting("open_enabled") is not None else True
-        close_enabled = _get_setting("close_enabled") if _get_setting("close_enabled") is not None else True
+        open_enabled = _to_bool(_get_setting("open_enabled"), default=True)
+        close_enabled = _to_bool(_get_setting("close_enabled"), default=True)
         # 模型只管進場；出場完全由 SL/TP（下方）決定，不因訊號消失而平倉
         to_open = (target - set(current) - pending_buy) if open_enabled else set()
         to_close: set = set()
@@ -672,30 +701,41 @@ class LiveTrader:
                 pnl = (price - avg) / avg if avg else 0
                 if pnl <= -sl_pct:
                     to_close.add(sid)
-                    print(f"[SL] {sid} 觸發停損 {pnl*100:.2f}% ≤ -{sl_pct*100:.0f}%", flush=True)
+                    msg = f"{sid} 停損 {pnl*100:.2f}% ≤ -{sl_pct*100:.0f}%（現價={price}）"
+                    print(f"[SL] {msg}", flush=True)
+                    _log_trade(sid, "sltp", msg, "SL")
                 elif pnl >= tp_pct:
                     to_close.add(sid)
-                    print(f"[TP] {sid} 觸發停利 {pnl*100:.2f}% ≥ +{tp_pct*100:.0f}%", flush=True)
+                    msg = f"{sid} 停利 {pnl*100:.2f}% ≥ +{tp_pct*100:.0f}%（現價={price}）"
+                    print(f"[TP] {msg}", flush=True)
+                    _log_trade(sid, "sltp", msg, "TP")
 
         print(
             f"[RECONCILE] 交易計畫：開倉 {len(to_open)}、平倉 {len(to_close)}（含SL/TP）、待核實 買={len(pending_buy)} 賣={len(pending_sell)}",
             flush=True,
         )
-        # 可用額度直接從 broker 持倉算（不用自追 _used_quota，永豐才是真實來源）
-        # 當沖買賣各佔一半額度，實際可買上限 = total_capital / 2
+        # 已用額度 = 已成交持倉成本 + 仍 SENT 中的買單（cancel 失敗時也不低估）
         self._used_quota = round(
             sum(p["avg_price"] * p["quantity"] * 1000 for p in current.values()), 0
         )
-        available = max(0.0, self.total_capital / 2 - self._used_quota)
-        _push_summary({"used_quota": self._used_quota, "total_capital": self.total_capital,
+        _pending_buy_reserve = round(sum(
+            o["price"] * max(0, o["quantity"] - o.get("filled", 0)) * 1000
+            for o in pending_orders
+            if o["status"] in {"SENT", "PARTIAL"} and o["direction"] == "buy"
+        ), 0)
+        if _pending_buy_reserve > 0:
+            print(f"[QUOTA] SENT 買單保留額度 {_pending_buy_reserve/10000:.1f}萬（cancel 失敗或尚未確認）", flush=True)
+        self._used_quota = round(self._used_quota + _pending_buy_reserve, 0)
+        available = max(0.0, self._buy_capital - self._used_quota)
+        _push_summary({"used_quota": self._used_quota, "total_capital": self._buy_capital,
                        "available": available})
 
         if not to_open and not to_close:
             print(f"[RECONCILE] 無新增交易，完成", flush=True)
             return
 
-        # 當沖額度：買入 + 賣出 各佔一半，所以買入預算 = total_capital / 2 / 持倉支數
-        budget = self.total_capital / 2 / max(len(target), 1)
+        # 買入預算 = 買入上限（_buy_capital = total_capital/2） / 本分鐘訊號支數
+        budget = self._buy_capital / max(len(target), 1)
         snapshots: dict[str, float] = {}
 
         if to_open:
@@ -727,20 +767,18 @@ class LiveTrader:
                     print(f"[LIVE SKIP] {sid} 股價 {price} 超過上限 {cfg_max_price}")
                     continue
 
-                # 單股預算：優先用 max_budget_per_stock 設定，否則均分總額度
+                # 單股預算：優先用 max_budget_per_stock 設定，否則均分買入上限
                 if cfg_max_budget_stock is not None:
                     stock_budget = float(cfg_max_budget_stock) * 10000
                 else:
-                    stock_budget = budget  # total_capital / 2 / N
+                    stock_budget = budget  # _buy_capital / N
                 stock_budget = min(stock_budget, available)  # 不超過剩餘可用額度
 
                 # 每張有效成本含手續費緩衝（確保不因小數截斷而超額）
                 effective_lot_cost = price * 1000 * lot_cost_factor
-                lots_by_budget = int(stock_budget / effective_lot_cost)
-                lots_by_quota = int((available / 2) / effective_lot_cost)
-                lots = min(lots_by_budget, lots_by_quota)
+                lots = int(stock_budget / effective_lot_cost)
                 if lots < 1:
-                    print(f"[LIVE SKIP] {sid} 額度不足（可用 {available/10000:.1f}萬，需 {price*2/10:.1f}萬/張）")
+                    print(f"[LIVE SKIP] {sid} 額度不足（可用 {available/10000:.1f}萬，需 {price/10:.1f}萬/張）")
                     continue
 
                 if self._broker:
@@ -755,6 +793,7 @@ class LiveTrader:
                     f"[LIVE OPEN] {sid} {lots}張 @ {price} → {status} [{order_id}]"
                     f"（剩餘可用 {available/10000:.1f}萬）"
                 )
+                _log_trade(sid, "buy", f"{lots}張@{price} [{order_id}]", status)
                 _push_trade(
                     {
                         "order_id": order_id,
@@ -802,6 +841,7 @@ class LiveTrader:
                     f"[LIVE CLOSE] {sid} {lots}張 {'當沖' if day_trade else '普通'}限價@{limit_price} → {status} [{order_id}]"
                     f"（等待成交確認後從持倉移除）"
                 )
+                _log_trade(sid, "sell", f"{lots}張@{limit_price} {'當沖' if day_trade else '普通'} [{order_id}]", status)
                 _push_trade(
                     {
                         "order_id": order_id,
@@ -823,7 +863,7 @@ class LiveTrader:
         _push_summary(
             {
                 "used_quota": self._used_quota,
-                "total_capital": self.total_capital,
+                "total_capital": self._buy_capital,
             }
         )
         print(
@@ -835,6 +875,7 @@ class LiveTrader:
         """13:25 強制平倉：只平本系統今日開的當沖倉，不動其他長期持倉。
         判斷依據：_api_positions（本系統追蹤的持倉），非永豐帳戶全部持倉。
         """
+        _log_sys("盤後強制平倉程序啟動", "warning")
         print(f"[FORCE CLOSE] 盤後強制平倉程序啟動", flush=True)
         if not self._connect():
             print(f"[FORCE CLOSE] ✗ 連線失敗，中止", flush=True)
@@ -859,17 +900,19 @@ class LiveTrader:
                 yd_qty = pos.get("yd_quantity", 0) or 0
                 day_trade = (yd_qty == 0)
                 if self._broker:
-                    trade = self._broker.sell(sid, lots, day_trade=day_trade)
+                    # 強制平倉用現價單（close_at_price），確保收盤前成交
+                    trade = self._broker.sell(sid, lots, day_trade=day_trade, market=True)
                 elif day_trade:
-                    trade = trade_api.close(self._api, sid, lots)
+                    trade = trade_api.close_at_price(self._api, sid, lots, day_trade=True)
                 else:
-                    trade = trade_api.close_normal(self._api, sid, lots)
+                    trade = trade_api.close_at_price(self._api, sid, lots, day_trade=False)
                 status = trade_api.normalize_status(trade.status.status)
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
                 exit_price = float(trade.order.price) if hasattr(trade, "order") else avg_price
                 entry_price = _get_pos_entry(sid)
                 pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
                 print(f"[FORCE CLOSE] {sid} {lots}張 {'當沖' if day_trade else '普通'}@{exit_price} → {status} [{order_id}]")
+                _log_trade(sid, "force", f"{lots}張@{exit_price} 強制平倉 [{order_id}]", status)
                 _push_trade(
                     {
                         "order_id": order_id,

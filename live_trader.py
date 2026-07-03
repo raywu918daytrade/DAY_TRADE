@@ -67,39 +67,58 @@ def _resolve_capital() -> float:
 TOTAL_CAPITAL = _resolve_capital()
 
 
-def _get_day_hf_path() -> "str | None":
-    """HF Hub 下載最新月份日K parquet，回傳本地快取路徑。"""
+_DAY_MONTHS_TO_LOAD = int(os.environ.get("DAY_MONTHS_TO_LOAD", "2"))  # 下載最近 N 個月的月份日K
+
+
+def _get_day_hf_paths() -> "list[str]":
+    """HF Hub 下載最近 N 個月份日K parquet，回傳本地快取路徑清單（舊→新）。"""
+    import re as _re
     from huggingface_hub import HfApi, hf_hub_download
     token = os.environ.get("HF_TOKEN") or None
+    # 只取 YYYY_M.parquet 月份格式，排除 fugle_day.parquet 等舊格式大檔
     day_files = sorted([
         f for f in HfApi().list_repo_files(repo_id=_HF_REPO_ID, repo_type="dataset", token=token)
-        if f.startswith("day_trade/day/") and f.endswith(".parquet")
+        if _re.match(r"day_trade/day/\d{4}_\d+\.parquet$", f)
     ])
     if not day_files:
-        return None
-    return hf_hub_download(repo_id=_HF_REPO_ID, filename=day_files[-1],
-                           repo_type="dataset", token=token)
+        return []
+    targets = day_files[-_DAY_MONTHS_TO_LOAD:]
+    paths = []
+    for fname in targets:
+        p = hf_hub_download(repo_id=_HF_REPO_ID, filename=fname,
+                            repo_type="dataset", token=token)
+        print(f"  → {p}", flush=True)
+        paths.append(p)
+    return paths
 
 
-def _load_day(stocks: set, path: str) -> "pd.DataFrame":
+def _load_day(stocks: set, paths: "list[str]") -> "tuple[pd.DataFrame, set]":
     """
-    兩次讀同一個 parquet，省記憶體：
+    兩次讀 parquet（可多個月份），省記憶體：
       第 1 次：只讀 volume → volume filter → 取前 MAX_SUBSCRIPTIONS 支
       第 2 次：只讀過濾後的股票完整資料（供推論用）
     """
     import pyarrow.parquet as pq
+    import pyarrow as pa
     import pandas as pd
 
+    if isinstance(paths, str):
+        paths = [paths]
+
     # 第 1 次：只讀 volume 欄位，做均量過濾
-    df_vol = pd.read_parquet(path, columns=["stock_id", "date", "volume"])
+    tables_vol = [pq.read_table(p, columns=["stock_id", "date", "volume"]) for p in paths]
+    df_vol = pa.concat_tables(tables_vol).to_pandas()
+    del tables_vol
     top = set(_volume_filter(stocks, df_vol))
     del df_vol
 
     if not top:
-        return pd.DataFrame()
+        return pd.DataFrame(), set()
 
-    # 第 2 次：只讀前 500 支完整資料
-    df = pq.read_table(path, filters=[("stock_id", "in", list(top))]).to_pandas()
+    # 第 2 次：只讀過濾後的股票完整資料
+    tables = [pq.read_table(p, filters=[("stock_id", "in", list(top))]) for p in paths]
+    df = pa.concat_tables(tables).to_pandas()
+    del tables
     df["date"] = pd.to_datetime(df["date"])
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     print(f"  日K：{len(df):,} 筆，{df['stock_id'].nunique():,} 支（前 {len(top)} 支）")
@@ -160,9 +179,8 @@ if _day_trade_stocks:
     print(f"[D1] 載入日K（來源：{_src}）...", flush=True)
     try:
         if _HF_REPO_ID:
-            _day_path = _get_day_hf_path()
-            print(f"  → {_day_path}", flush=True)
-            _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_path)
+            _day_paths = _get_day_hf_paths()
+            _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_paths)
         else:
             _full = load_day()
             print(f"  全量日K：{len(_full):,} 筆，開始均量過濾...", flush=True)
@@ -243,8 +261,8 @@ def _daily_refresh():
                     _day_trade_stocks = set(_tickers.keys()) or None
                 if _day_trade_stocks:
                     if _HF_REPO_ID:
-                        _day_path = _get_day_hf_path()
-                        _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_path)
+                        _day_paths = _get_day_hf_paths()
+                        _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_paths)
                     else:
                         _full = load_day()
                         _day_trade_stocks = _volume_filter(_day_trade_stocks, _full[["stock_id", "date", "volume"]])
@@ -262,7 +280,20 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     dt = pd.Timestamp(minute_str)
     h, m = dt.hour, dt.minute
 
-    if not (SESSION_START <= (h, m) <= SESSION_END):
+    if (h, m) < SESSION_START:
+        return
+
+    # SESSION_END 後：停止開倉，但繼續跑 reconcile 做 SL/TP 監控直到收盤
+    if (h, m) > SESSION_END:
+        if _executor is not None:
+            price_map = {}
+            if not df.empty and "stock_id" in df.columns and "close" in df.columns:
+                price_map = dict(zip(df["stock_id"].astype(str), df["close"].astype(float)))
+                update_positions_price(price_map)
+            try:
+                _executor.reconcile([], prices=price_map)  # signals=[] 不開倉，只跑 SL/TP
+            except Exception as e:
+                print(f"[TRADE ERROR after session] {e}")
         return
 
     # 載入今日分K（只載一次，下面 push_candles 和 predict_live 共用）
@@ -377,9 +408,19 @@ def _get_stocks():
     return list(_day_trade_stocks) if _day_trade_stocks else fugle_stocks()
 
 
+def _on_rate_limited():
+    """Fugle 429 時推送前端警示。"""
+    try:
+        from api import push_alert
+        push_alert("Fugle REST API 限流，使用快取分K繼續監控（SL/TP 仍有效）", level="warning")
+    except Exception:
+        pass
+
+
 def _start_collector():
     """M1RestPoller 收集器執行緒，異常時更新 collector 狀態供 /health 回傳。"""
-    collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks)
+    collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks,
+                             on_rate_limited=_on_rate_limited)
     try:
         set_collector_status("running")
         collector.start()

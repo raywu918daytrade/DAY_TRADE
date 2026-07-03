@@ -164,10 +164,16 @@ class M1RestPoller:
     def _mark_rate_limited(self, symbol: str, error: Exception):
         with self._rate_limit_lock:
             until = time.time() + _RATE_LIMIT_BACKOFF
-            if until > self._rate_limited_until:
+            first_hit = until > self._rate_limited_until
+            if first_hit:
                 self._rate_limited_until = until
                 retry_at = datetime.fromtimestamp(until, tz=_TW).strftime("%H:%M:%S")
                 print(f"  REST 觸發 rate limit（{symbol}），暫停到 {retry_at}: {error}")
+                if self._on_rate_limited:
+                    try:
+                        self._on_rate_limited()
+                    except Exception as _e:
+                        print(f"  on_rate_limited 回呼錯誤: {_e}")
 
     def _fetch_one(self, symbol: str, date_str: str) -> pd.DataFrame:
         if self._is_rate_limited():
