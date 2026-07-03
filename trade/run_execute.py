@@ -639,11 +639,12 @@ class LiveTrader:
                     print(f"[LIVE SKIP] {sid} 股價 {price} 超過上限 {cfg_max_price}")
                     continue
 
-                # 單股預算：均分額度 → 單股設定上限 → 可用額度上限（三取最小）
-                stock_budget = budget
+                # 單股預算：優先用 max_budget_per_stock 設定，否則均分總額度
                 if cfg_max_budget_stock is not None:
-                    stock_budget = min(stock_budget, float(cfg_max_budget_stock) * 10000)
-                stock_budget = min(stock_budget, available / 2)
+                    stock_budget = float(cfg_max_budget_stock) * 10000
+                else:
+                    stock_budget = budget  # total_capital / 2 / N
+                stock_budget = min(stock_budget, available)  # 不超過剩餘可用額度
 
                 # 每張有效成本含手續費緩衝（確保不因小數截斷而超額）
                 effective_lot_cost = price * 1000 * lot_cost_factor
