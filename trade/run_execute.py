@@ -93,7 +93,7 @@ class PaperTrader:
     def positions(self) -> dict:
         return dict(self._positions)
 
-    def reconcile(self, signals: list[dict]):
+    def reconcile(self, signals: list[dict], prices: dict | None = None):
         """
         依本分鐘模型訊號調整模擬持倉。
 
@@ -105,6 +105,25 @@ class PaperTrader:
         target = {s["stock_id"]: s for s in signals}
         to_open = set(target) - set(self._positions)
         to_close = set(self._positions) - set(target)
+
+        # 停損/停利：用傳入的現價檢查（不另打 API）
+        if prices:
+            sl_pct = float(_get_setting("stop_loss_pct") or 3.0) / 100
+            tp_pct = float(_get_setting("take_profit_pct") or 3.0) / 100
+            for sid, pos in self._positions.items():
+                if sid in to_close:
+                    continue
+                price = prices.get(sid)
+                if not price:
+                    continue
+                avg = pos["avg_price"]
+                pnl = (price - avg) / avg if avg else 0
+                if pnl <= -sl_pct:
+                    to_close.add(sid)
+                    print(f"[PAPER SL] {sid} 停損 {pnl*100:.2f}%", flush=True)
+                elif pnl >= tp_pct:
+                    to_close.add(sid)
+                    print(f"[PAPER TP] {sid} 停利 {pnl*100:.2f}%", flush=True)
 
         if not to_open and not to_close:
             return
@@ -438,7 +457,7 @@ class LiveTrader:
                     print(f"[SYNC POS] 移除已平倉 {sid}", flush=True)
                     _close_pos(sid, 0.0, exit_reason="broker_closed")
 
-    def reconcile(self, signals: list[dict]):
+    def reconcile(self, signals: list[dict], prices: dict | None = None):
         """
         依本分鐘模型訊號調整券商實際持倉。
 
@@ -553,8 +572,27 @@ class LiveTrader:
         to_open = (target - set(current) - pending_buy) if open_enabled else set()
         to_close = (set(current) - target - pending_sell) if close_enabled else set()
 
+        # 停損/停利：跟模型訊號無關，純粹用現價比對進場均價
+        if prices and close_enabled:
+            sl_pct = float(_get_setting("stop_loss_pct") or 3.0) / 100
+            tp_pct = float(_get_setting("take_profit_pct") or 3.0) / 100
+            for sid, pos in current.items():
+                if sid in to_close or sid in pending_sell:
+                    continue
+                price = prices.get(sid)
+                if not price:
+                    continue
+                avg = pos["avg_price"]
+                pnl = (price - avg) / avg if avg else 0
+                if pnl <= -sl_pct:
+                    to_close.add(sid)
+                    print(f"[SL] {sid} 觸發停損 {pnl*100:.2f}% ≤ -{sl_pct*100:.0f}%", flush=True)
+                elif pnl >= tp_pct:
+                    to_close.add(sid)
+                    print(f"[TP] {sid} 觸發停利 {pnl*100:.2f}% ≥ +{tp_pct*100:.0f}%", flush=True)
+
         print(
-            f"[RECONCILE] 交易計畫：開倉 {len(to_open)}、平倉 {len(to_close)}、待核實 買={len(pending_buy)} 賣={len(pending_sell)}",
+            f"[RECONCILE] 交易計畫：開倉 {len(to_open)}、平倉 {len(to_close)}（含SL/TP）、待核實 買={len(pending_buy)} 賣={len(pending_sell)}",
             flush=True,
         )
         # 可用額度直接從 broker 持倉算（不用自追 _used_quota，永豐才是真實來源）

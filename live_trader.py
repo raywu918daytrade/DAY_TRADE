@@ -324,7 +324,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
 
     if _executor is not None:
         try:
-            _executor.reconcile(signals)
+            _executor.reconcile(signals, prices=price_map)
         except Exception as e:
             print(f"[TRADE ERROR] {e}")
 
