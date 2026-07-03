@@ -333,43 +333,36 @@ _force_close_done_date = None  # 防止同一天重複觸發
 
 
 def _force_close_eod():
-    """每天 FORCE_CLOSE_HOUR:FORCE_CLOSE_MIN 強制平倉所有當沖部位（不過夜）。
-    reconcile([]) 傳空訊號 → 所有現倉視為「不在目標」而被賣出。
+    """每天強制平倉所有當沖部位（不過夜）。
+    時間優先讀 settings 的 force_close_time（HH:MM），否則用 .env 的 FORCE_CLOSE_HOUR/MIN。
+    每 30 秒檢查一次，允許前端即時改時間。
     """
     global _force_close_done_date
+    from api import get_setting
     while True:
         now = datetime.now(_TW)
-        trigger = now.replace(
-            hour=_FORCE_CLOSE_HOUR,
-            minute=_FORCE_CLOSE_MIN,
-            second=0,
-            microsecond=0,
-        )
-        wait = (trigger - now).total_seconds()
-        if wait > 0:
-            time.sleep(wait)
-            now = datetime.now(_TW)
         today = now.date()
-        if _force_close_done_date != today and _executor is not None:
+        # 每次都重新讀，允許前端即時改
+        fc_str = get_setting("force_close_time") or f"{_FORCE_CLOSE_HOUR}:{_FORCE_CLOSE_MIN:02d}"
+        try:
+            fc_h, fc_m = map(int, fc_str.split(":"))
+        except Exception:
+            fc_h, fc_m = _FORCE_CLOSE_HOUR, _FORCE_CLOSE_MIN
+        if (now.hour, now.minute) == (fc_h, fc_m) and _force_close_done_date != today and _executor is not None:
             _force_close_done_date = today
-            print(
-                f"[{now.strftime('%H:%M:%S')}] 強制平倉：本系統當沖倉位（{_FORCE_CLOSE_HOUR}:{_FORCE_CLOSE_MIN:02d}）"
-            )
+            print(f"[{now.strftime('%H:%M:%S')}] 強制平倉：本系統當沖倉位（{fc_str}）", flush=True)
             try:
-                _executor.force_close_own_positions()  # 只平本系統追蹤的倉，長期持倉不動
+                _executor.force_close_own_positions()
             except Exception as e:
-                print(f"[FORCE CLOSE] 錯誤: {e}")
-            # 等委託成交後，從永豐同步一次最終狀態（確保 dashboard 與 broker 一致）
+                print(f"[FORCE CLOSE] 錯誤: {e}", flush=True)
             time.sleep(10)
             if hasattr(_executor, "sync_from_broker"):
                 try:
                     _executor.sync_from_broker()
-                    print(f"[FORCE CLOSE] 盤後同步完成")
+                    print(f"[FORCE CLOSE] 盤後同步完成", flush=True)
                 except Exception as e:
-                    print(f"[FORCE CLOSE] 盤後同步失敗: {e}")
-        # 等到明天同一時間
-        next_trigger = trigger + timedelta(days=1)
-        time.sleep(max((next_trigger - datetime.now(_TW)).total_seconds(), 60))
+                    print(f"[FORCE CLOSE] 盤後同步失敗: {e}", flush=True)
+        time.sleep(30)
 
 
 def _get_stocks():
