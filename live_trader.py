@@ -156,42 +156,49 @@ except Exception as e:
 
 # 盤中才有標的清單，非盤中跳過日K載入（省記憶體）；_daily_refresh 在 06:00 補載
 if _day_trade_stocks:
-    print("載入日K資料...", flush=True)
+    _src = f"HF ({_HF_REPO_ID})" if _HF_REPO_ID else "本機 db/fugle_day/"
+    print(f"[D1] 載入日K（來源：{_src}）...", flush=True)
     try:
         if _HF_REPO_ID:
             _day_path = _get_day_hf_path()
+            print(f"  → {_day_path}", flush=True)
             _day, _day_trade_stocks = _load_day(_day_trade_stocks, _day_path)
         else:
-            # 本機：load_day() 讀全部，再手動兩步過濾
             _full = load_day()
+            print(f"  全量日K：{len(_full):,} 筆，開始均量過濾...", flush=True)
             _day_trade_stocks = _volume_filter(_day_trade_stocks, _full[["stock_id", "date", "volume"]])
             _day = _full[_full["stock_id"].isin(set(_day_trade_stocks))].copy()
             del _full
-        print(f"✓ 日K 載入完成：{len(_day)} 筆", flush=True)
+        _d1_last = _day["date"].max() if not _day.empty else "無"
+        print(f"✓ [D1] {len(_day):,} 筆，{_day['stock_id'].nunique():,} 支，最新日期：{_d1_last}", flush=True)
     except Exception as e:
-        print(f"✗ 日K 載入失敗: {e}", flush=True)
+        print(f"✗ [D1] 載入失敗: {e}", flush=True)
         _day = pd.DataFrame()
 else:
     _day = pd.DataFrame()
-    print("非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
+    print("[D1] 非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
 
 # 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
 if not _day.empty:
     try:
         _today_str = datetime.now(_TW).strftime("%Y-%m-%d")
+        print(f"[M1] 補載今日分K（{_today_str}）...", flush=True)
         _m1_now = load_m1_live(_today_str)
         if not _m1_now.empty:
             _last_min = str(_m1_now["date"].max())
+            print(f"  → {len(_m1_now):,} 筆，{_m1_now['stock_id'].nunique():,} 支，最新分鐘：{_last_min}", flush=True)
             _init_results = predict_live(
                 _last_min, _day,
                 day_trade_stocks=_day_trade_stocks,
                 m1_live=_m1_now,
             )
             push_monitoring(_last_min, _init_results, THRESHOLD)
-            print(f"  補載監控：{_last_min} → {len(_init_results)} 支訊號", flush=True)
+            print(f"✓ [M1] 補載監控完成：{len(_init_results)} 支訊號", flush=True)
+        else:
+            print("  → 今日無分K資料（尚未開盤或非交易日）", flush=True)
         del _m1_now
     except Exception as _e:
-        print(f"  補載監控失敗（可忽略）: {_e}", flush=True)
+        print(f"✗ [M1] 補載失敗: {_e}", flush=True)
 
 print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...", flush=True)
 
