@@ -85,7 +85,7 @@ def close(api: sj.Shioaji, stock_id: str, quantity: int):
             action=sj.Action.Sell,
             price_type=sj.StockPriceType.LMT,
             order_type=sj.OrderType.ROD,
-            order_cond=sj.OrderCondition.DayTradingSell,  # 現股當沖賣出，稅率 0.15%
+            order_cond=sj.StockOrderCond.Netting,  # 現股當沖賣出（新版 shioaji），稅率 0.15%
         ),
     )
     return trade
