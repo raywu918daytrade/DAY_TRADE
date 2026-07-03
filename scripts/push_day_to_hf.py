@@ -78,14 +78,19 @@ print(f"  使用 {len(stocks)} 支標的")
 
 # ── 2. 從 HF Hub 取現有月份清單，決定增量起始日 ───────────────────────────────
 print("掃描 HF Hub 現有日K月份...")
+import re as _re
 day_files = [
     f for f in api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
-    if f.startswith("day_trade/day/") and f.endswith(".parquet")
+    if _re.match(r"day_trade/day/\d{4}_\d+\.parquet$", f)
 ]
+
+def _month_key(f):
+    m = _re.search(r"(\d{4})_(\d+)\.parquet$", f)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 last_date = None
 if day_files:
-    latest_file = max(day_files)   # e.g. day_trade/day/2026_7.parquet
+    latest_file = max(day_files, key=_month_key)  # 按年月數字排，避免 2026_7 > 2026_10
     try:
         existing_path = hf_hub_download(
             repo_id=HF_REPO_ID, filename=latest_file,
