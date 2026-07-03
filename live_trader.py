@@ -19,11 +19,23 @@
                              → reconcile       → 永豐 / paper 下單
 """
 
+import builtins as _builtins
 import calendar
 import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+
+_TW_TS = timezone(timedelta(hours=8))
+_orig_print = _builtins.print
+
+
+def _ts_print(*args, **kwargs):
+    ts = datetime.now(_TW_TS).strftime("%H:%M:%S")
+    _orig_print(f"[{ts}]", *args, **kwargs)
+
+
+_builtins.print = _ts_print
 
 import pandas as pd
 import uvicorn
