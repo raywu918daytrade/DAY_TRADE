@@ -175,6 +175,24 @@ else:
     _day = pd.DataFrame()
     print("非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
 
+# 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
+if not _day.empty:
+    try:
+        _today_str = datetime.now(_TW).strftime("%Y-%m-%d")
+        _m1_now = load_m1_live(_today_str)
+        if not _m1_now.empty:
+            _last_min = str(_m1_now["date"].max())
+            _init_results = predict_live(
+                _last_min, _day,
+                day_trade_stocks=_day_trade_stocks,
+                m1_live=_m1_now,
+            )
+            push_monitoring(_last_min, _init_results, THRESHOLD)
+            print(f"  補載監控：{_last_min} → {len(_init_results)} 支訊號", flush=True)
+        del _m1_now
+    except Exception as _e:
+        print(f"  補載監控失敗（可忽略）: {_e}", flush=True)
+
 print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...", flush=True)
 
 _executor = None
