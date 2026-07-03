@@ -325,8 +325,8 @@ def predict_live(
     if model is None:
         model = load_model()
 
+    date_str = minute_str[:10]
     if m1_live is None:
-        date_str = minute_str[:10]
         m1_live = load_m1_live(date_str)
     if m1_live.empty:
         return []
