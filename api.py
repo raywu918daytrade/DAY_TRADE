@@ -252,6 +252,7 @@ _completed_trades: list = []  # 今日完整回合（進出配對，含損益）
 _candles: dict = {}  # {stock_id: [Candle dict, ...]}
 _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
 _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
+_force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
 # ── SSE 廣播 ─────────────────────────────────────────────────────────────────
 
@@ -403,6 +404,10 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_pr
 
     with _lock:
         pos = _positions.pop(stock_id, {})
+        entry = pos.get("entry_price", 0)
+        qty = pos.get("quantity", 0)
+        pnl_amt = round((exit_price - entry) * qty * 1000, 0) if entry and exit_price else None
+
         _summary["holding"] = len(_positions)
         _summary["closed"] += 1
         if pnl_pct > 0:
@@ -414,10 +419,6 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_pr
         if pnl_amt is not None:
             _summary["today_pnl_amt"] = round(_summary.get("today_pnl_amt", 0) + pnl_amt, 0)
 
-        # 完整回合記錄
-        entry = pos.get("entry_price", 0)
-        qty = pos.get("quantity", 0)
-        pnl_amt = round((exit_price - entry) * qty * 1000, 0) if entry and exit_price else None
         _completed_trades.append(
             {
                 "time": datetime.now(_TW).strftime("%H:%M:%S"),
@@ -439,6 +440,14 @@ def close_position(stock_id: str, pnl_pct: float, exit_reason: str = "", exit_pr
         if stock_id in _signal_detail:
             _signal_detail[stock_id]["exit_rule"] = exit_reason
         _broadcast({"type": "closed", "stock_id": stock_id, "pnl_pct": pnl_pct})
+
+
+def push_alert(message: str, level: str = "warning"):
+    """推送系統通知到前端（SSE）。level: info / warning / error"""
+    from datetime import datetime, timezone, timedelta
+    ts = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+    print(f"[ALERT:{level.upper()}] {message}", flush=True)
+    _broadcast({"type": "alert", "level": level, "message": message, "time": ts})
 
 
 def push_summary_update(updates: dict):
@@ -638,6 +647,38 @@ def completed_trades():
 def failed_orders():
     with _lock:
         return list(reversed([t for t in _trades if t.get("status") == "FAILED"]))
+
+
+def get_force_close_queue() -> set:
+    return set(_force_close_queue)
+
+
+def clear_force_close(sids: list):
+    _force_close_queue.difference_update(sids)
+
+
+_close_now_fn = None  # live_trader.py 啟動後注入
+
+
+def register_close_now(fn):
+    global _close_now_fn
+    _close_now_fn = fn
+
+
+@app.post("/close_now", tags=["交易"], summary="立即平倉指定股票（市價單）")
+async def close_now(request: Request):
+    """body: {"stock_ids": ["1409", "2367"]}"""
+    import threading
+    body = await request.json()
+    sids = body.get("stock_ids", [])
+    print(f"[CLOSE NOW] 前端觸發立即平倉: {sids}", flush=True)
+    if _close_now_fn:
+        threading.Thread(target=_close_now_fn, args=(sids,), daemon=True).start()
+        return {"ok": True, "executing": sids}
+    # fallback：executor 未就緒時排隊等下一分鐘
+    with _lock:
+        _force_close_queue.update(sids)
+    return {"ok": True, "queued": list(_force_close_queue)}
 
 
 def push_completed_trades_from_broker(closed_list: list, name_lookup=None):

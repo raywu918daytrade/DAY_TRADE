@@ -19,6 +19,14 @@ except (ImportError, ModuleNotFoundError):
         trade_api = None
 
 try:
+    from trade.broker_client import BrokerClient
+except (ImportError, ModuleNotFoundError):
+    try:
+        from broker_client import BrokerClient
+    except (ImportError, ModuleNotFoundError):
+        BrokerClient = None  # type: ignore
+
+try:
     from api import _positions as _api_positions
 
     def _get_pos_entry(sid: str) -> float:
@@ -104,7 +112,7 @@ class PaperTrader:
         """
         target = {s["stock_id"]: s for s in signals}
         to_open = set(target) - set(self._positions)
-        to_close = set(self._positions) - set(target)
+        to_close: set = set()  # 出場由 SL/TP 決定
 
         # 停損/停利：用傳入的現價檢查（不另打 API）
         if prices:
@@ -205,9 +213,10 @@ class LiveTrader:
         self.total_capital = total_capital
         self.simulation = simulation
         self._api = None
+        self._broker: "BrokerClient | None" = None  # 連線後建立
         self._positions_synced = False  # 啟動後第一次 reconcile 時同步現有持倉
         self._name_lookup = name_lookup or (lambda sid: sid)
-        self._used_quota = 0.0  # 今日已用額度（買入+賣出金額累計）；重啟由 sync_from_broker 恢復
+        self._used_quota = 0.0  # 今日已用額度；重啟由 sync_from_broker 恢復
 
     def _connect(self) -> bool:
         if self._api is not None:
@@ -221,6 +230,8 @@ class LiveTrader:
         try:
             self._api = trade_api.test() if self.simulation else trade_api.login()
             self._api.set_order_callback(self._on_order_event)
+            if BrokerClient is not None:
+                self._broker = BrokerClient(self._api)
             print(f"[LIVE CONNECT] 永豐 {mode}環境連線成功 ✓", flush=True)
             return True
         except Exception as e:
@@ -374,17 +385,10 @@ class LiveTrader:
         return True
 
     def startup_sltp_check(self):
+        """重啟後立刻檢查 SL/TP，不等下一分鐘 on_minute。
+        模型只管進場，出場完全靠 SL/TP；故直接呼叫 reconcile([])，
+        SL/TP 區塊會自動拉 broker 現價判斷是否需平倉。
         """
-        重啟後立刻用 broker 現價檢查 SL/TP，不等下一分鐘 on_minute。
-        sync_from_broker() 已打 snapshot，存在 _startup_prices；這裡直接用，
-        再補拉 _startup_prices 裡沒有的持倉（理論上不應發生）。
-        傳入假訊號讓所有持倉都視為「目標」，只靠 SL/TP 觸發平倉。
-        """
-        prices = getattr(self, "_startup_prices", {})
-        print(f"[STARTUP SL/TP] _startup_prices 有 {len(prices)} 支報價：{list(prices.keys())}", flush=True)
-        if not prices:
-            print("[STARTUP SL/TP] 無持倉報價，略過", flush=True)
-            return
         try:
             current = trade_api.get_positions(self._api, day_trade_only=True)
         except Exception as e:
@@ -395,21 +399,15 @@ class LiveTrader:
             return
         sl_pct = float(_get_setting("stop_loss_pct") or 3.0) / 100
         tp_pct = float(_get_setting("take_profit_pct") or 3.0) / 100
-        print(f"[STARTUP SL/TP] 持倉 {list(current.keys())}  SL={sl_pct*100:.0f}%  TP={tp_pct*100:.0f}%", flush=True)
-        for sid, pos in current.items():
-            p = prices.get(sid)
-            avg = pos["avg_price"]
-            pnl = round((p - avg) / avg * 100, 2) if p and avg else None
-            print(f"  {sid}: avg={avg} price={p} pnl={pnl}%", flush=True)
-        # 傳入「保留所有持倉」的假訊號，讓 reconcile 只靠 SL/TP 決定平倉
-        fake_signals = [
-            {"stock_id": sid, "proba": 1.0, "price": prices.get(sid, pos["avg_price"])}
-            for sid, pos in current.items()
-        ]
-        self.reconcile(fake_signals, prices=prices)
+        print(
+            f"[STARTUP SL/TP] 持倉 {list(current.keys())}  SL={sl_pct*100:.0f}%  TP={tp_pct*100:.0f}%  "
+            f"→ 開始即時 SL/TP 檢查",
+            flush=True,
+        )
+        self.reconcile([])
 
     def _on_order_event(self, state, msg):
-        """永豐成交回報（SDEAL）→ 更新 dashboard 進場均價"""
+        """永豐成交回報（SDEAL）→ 買進更新持倉均價；賣出立即移除持倉並記錄已平倉"""
         import shioaji as sj
 
         if state != sj.OrderState.StockDeal:
@@ -419,43 +417,52 @@ class LiveTrader:
             fill_price = float(msg["price"])
             fill_qty = int(msg["quantity"])
             action = str(msg.get("action", "")).lower()
-            print(f"[LIVE FILL] {sid} {action} {fill_qty}張 @ {fill_price} ✓", flush=True)
+            direction = "buy" if "buy" in action else "sell"
+            print(f"[LIVE FILL] {sid} {direction} {fill_qty}張 @ {fill_price} ✓", flush=True)
             _push_trade(
                 {
                     "order_id": msg.get("id", ""),
                     "time": _now(),
                     "stock_id": sid,
-                    "direction": "buy" if "buy" in action else "sell",
+                    "direction": direction,
                     "price": fill_price,
                     "quantity": fill_qty,
                     "status": "FILLED",
                     "broker_response": f"fill@{fill_price}",
                 }
             )
-            # 更新 dashboard 持倉的實際進場均價
-            try:
-                current = trade_api.get_positions(self._api, day_trade_only=True)
-                if sid in current:
-                    pos = current[sid]
-                    avg = pos["avg_price"]
-                    qty = pos["quantity"]
-                    snap = self._api.snapshots([self._api.Contracts.Stocks[sid]])[0].close
-                    pnl = round((snap - avg) / avg * 100, 4) if avg else 0.0
-                    print(f"[LIVE FILL] 更新持倉：{sid} avg={avg} qty={qty} pnl={pnl}%", flush=True)
-                    _push_pos(
-                        {
-                            "stock_id": sid,
-                            "name": self._name_lookup(sid),
-                            "quantity": qty,
-                            "pnl_pct": pnl,
-                            "entry_price": avg,
-                            "current_price": snap,
-                            "stop_loss": round(avg * 0.97, 2),
-                            "take_profit": round(avg * 1.03, 2),
-                        }
-                    )
-            except Exception as e:
-                print(f"[LIVE FILL] ✗ 更新持倉失敗: {e}", flush=True)
+            if direction == "sell":
+                if self._broker:
+                    self._broker.on_fill(sid, "sell")
+                entry_price = _get_pos_entry(sid)
+                pnl_pct = round((fill_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
+                print(f"[LIVE FILL] 賣出成交確認 {sid} entry={entry_price} fill={fill_price} pnl={pnl_pct:.2f}%", flush=True)
+                _close_pos(sid, pnl_pct, exit_price=fill_price, exit_reason="filled")
+            else:
+                # 買進成交：更新 dashboard 持倉的實際進場均價
+                try:
+                    current = trade_api.get_positions(self._api, day_trade_only=True)
+                    if sid in current:
+                        pos = current[sid]
+                        avg = pos["avg_price"]
+                        qty = pos["quantity"]
+                        snap = self._api.snapshots([self._api.Contracts.Stocks[sid]])[0].close
+                        pnl = round((snap - avg) / avg * 100, 4) if avg else 0.0
+                        print(f"[LIVE FILL] 更新持倉：{sid} avg={avg} qty={qty} pnl={pnl}%", flush=True)
+                        _push_pos(
+                            {
+                                "stock_id": sid,
+                                "name": self._name_lookup(sid),
+                                "quantity": qty,
+                                "pnl_pct": pnl,
+                                "entry_price": avg,
+                                "current_price": snap,
+                                "stop_loss": round(avg * 0.97, 2),
+                                "take_profit": round(avg * 1.03, 2),
+                            }
+                        )
+                except Exception as e:
+                    print(f"[LIVE FILL] ✗ 更新持倉失敗: {e}", flush=True)
         except Exception as e:
             print(f"[LIVE FILL] ✗ 解析回報失敗: {e} | {msg}", flush=True)
 
@@ -485,13 +492,25 @@ class LiveTrader:
                         "take_profit": round(avg * 1.03, 2),
                     }
                 )
-        # 移除 broker 已不存在的 ghost 持倉
+        # 移除 broker 已不存在的 ghost 持倉（賣單已成交）
         # 只有 broker 有回傳至少一筆時才移除，避免 API 短暫異常誤刪全部持倉
         if current:
-            for sid in list(_api_positions.keys()):
-                if sid not in current:
-                    print(f"[SYNC POS] 移除已平倉 {sid}", flush=True)
-                    _close_pos(sid, 0.0, exit_reason="broker_closed")
+            ghost_sids = [sid for sid in list(_api_positions.keys()) if sid not in current]
+            if ghost_sids:
+                # 查永豐今日已平倉取得真實出場價與損益（不用估算限價）
+                try:
+                    closed_map = {c["stock_id"]: c for c in trade_api.get_closed_today(self._api)}
+                except Exception as e:
+                    print(f"[SYNC POS] get_closed_today 失敗: {e}", flush=True)
+                    closed_map = {}
+                for sid in ghost_sids:
+                    if self._broker:
+                        self._broker.on_position_closed(sid)
+                    c = closed_map.get(sid, {})
+                    pnl_pct = c.get("pnl_pct", 0.0)
+                    exit_price = c.get("sell_avg") or 0.0
+                    print(f"[SYNC POS] 移除已平倉 {sid} pnl={pnl_pct:.2f}% exit={exit_price}", flush=True)
+                    _close_pos(sid, pnl_pct, exit_price=exit_price, exit_reason="broker_closed")
 
     def reconcile(self, signals: list[dict], prices: dict | None = None):
         """
@@ -525,13 +544,13 @@ class LiveTrader:
         # 每次 reconcile 都以永豐為準修正 dashboard（防止 SDEAL 漏接造成偏移）
         self._sync_positions_with_broker(current)
 
-        # 取消上分鐘所有 SENT 未成交單：
-        #   買單：訊號時效過，取消後若訊號還在本分鐘重新以新價掛
-        #   賣單：取消後持倉仍在 current → to_close 自動重掛新價
+        # 取消上分鐘所有 SENT 未成交買/賣單（BrokerClient 負責更新追蹤）
         try:
-            cancelled = trade_api.cancel_sent_orders(self._api)
+            if self._broker:
+                cancelled = self._broker.cancel_all_orders()
+            else:
+                cancelled = trade_api.cancel_sent_orders(self._api)
             if cancelled["buy"]:
-                # 從委託單本身的價格×數量還原額度（未成交，不在 _api_positions 裡）
                 restore = sum(cost for _, cost in cancelled["buy"])
                 self._used_quota = max(0, self._used_quota - restore)
                 sids = [sid for sid, _ in cancelled["buy"]]
@@ -547,12 +566,18 @@ class LiveTrader:
             pending_buy = {
                 o["stock_id"] for o in pending_orders if o["status"] in {"SENT", "PARTIAL"} and o["direction"] == "buy"
             }
-            pending_sell = {
+            # pending_sell: 以 BrokerClient 自追蹤為準（比 broker 即時狀態更可靠）
+            pending_sell = self._broker.pending_sell_sids if self._broker else {
                 o["stock_id"] for o in pending_orders if o["status"] in {"SENT", "PARTIAL"} and o["direction"] == "sell"
             }
         except Exception:
             pending_buy = set()
             pending_sell = set()
+
+        # 取消確認後立即更新本地追蹤（BrokerClient 已內部清理 _sell_orders）
+        if cancelled["buy"]:
+            pending_buy -= {sid for sid, _ in cancelled["buy"]}
+        # cancelled["sell"] 的 _broker._sell_orders 已在 cancel_all_orders 內部清理
 
         # 重啟後第一次 reconcile：把現有持倉推回 dashboard（使用永豐實際均價）
         if not self._positions_synced:
@@ -602,11 +627,22 @@ class LiveTrader:
             except Exception as e:
                 print(f"[LIVE SYNC] 已平倉同步失敗: {e}")
 
-        # 排除已有委託中的買/賣單，防止重複下單與「集保餘股不足」
         open_enabled = _get_setting("open_enabled") if _get_setting("open_enabled") is not None else True
         close_enabled = _get_setting("close_enabled") if _get_setting("close_enabled") is not None else True
+        # 模型只管進場；出場完全由 SL/TP（下方）決定，不因訊號消失而平倉
         to_open = (target - set(current) - pending_buy) if open_enabled else set()
-        to_close = (set(current) - target - pending_sell) if close_enabled else set()
+        to_close: set = set()
+
+        # 前端觸發的立即平倉（市價單）
+        try:
+            from api import get_force_close_queue, clear_force_close
+            forced = get_force_close_queue() & set(current) - pending_sell
+            if forced:
+                to_close.update(forced)
+                clear_force_close(list(forced))
+                print(f"[FORCE NOW] 前端觸發立即平倉: {forced}", flush=True)
+        except ImportError:
+            pass
 
         # 停損/停利：跟模型訊號無關，純粹用現價比對進場均價
         # prices 只含 _day_trade_stocks（前500支），持倉若不在其中需補拉 broker snapshot
@@ -707,7 +743,10 @@ class LiveTrader:
                     print(f"[LIVE SKIP] {sid} 額度不足（可用 {available/10000:.1f}萬，需 {price*2/10:.1f}萬/張）")
                     continue
 
-                trade = trade_api.open(self._api, sid, lots)
+                if self._broker:
+                    trade = self._broker.buy(sid, lots)
+                else:
+                    trade = trade_api.open(self._api, sid, lots)
                 status = trade_api.normalize_status(trade.status.status)
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
                 buy_cost = price * lots * 1000
@@ -746,18 +785,22 @@ class LiveTrader:
 
         for sid in sorted(to_close):
             try:
-                lots = current[sid]["quantity"]
-                avg_price = current[sid]["avg_price"]
-                trade = trade_api.close(self._api, sid, lots)
+                pos = current[sid]
+                lots = pos["quantity"]
+                yd_qty = pos.get("yd_quantity", 0) or 0
+                day_trade = (yd_qty == 0)
+                if self._broker:
+                    trade = self._broker.sell(sid, lots, day_trade=day_trade)
+                elif day_trade:
+                    trade = trade_api.close(self._api, sid, lots)
+                else:
+                    trade = trade_api.close_normal(self._api, sid, lots)
                 status = trade_api.normalize_status(trade.status.status)
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
-                # 用委託限價估算出場價（SDEAL 回報後 _on_order_event 會更新）
-                exit_price = float(trade.order.price) if hasattr(trade, "order") else avg_price
-                entry_price = _get_pos_entry(sid)
-                pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
+                limit_price = float(trade.order.price) if hasattr(trade, "order") else pos["avg_price"]
                 print(
-                    f"[LIVE CLOSE] {sid} {lots}張 @ {exit_price} → {status} [{order_id}]"
-                    f"（額度已用 {self._used_quota/10000:.1f}萬）"
+                    f"[LIVE CLOSE] {sid} {lots}張 {'當沖' if day_trade else '普通'}限價@{limit_price} → {status} [{order_id}]"
+                    f"（等待成交確認後從持倉移除）"
                 )
                 _push_trade(
                     {
@@ -765,13 +808,14 @@ class LiveTrader:
                         "time": _now(),
                         "stock_id": sid,
                         "direction": "sell",
-                        "price": exit_price,
+                        "price": limit_price,
                         "quantity": lots,
                         "status": status,
                         "broker_response": status,
                     }
                 )
-                _close_pos(sid, pnl_pct, exit_price=exit_price)
+                # 不在此呼叫 _close_pos：持倉留在 dashboard 直到 broker 確認成交
+                # BrokerClient 已在 sell() 內部追蹤 _sell_orders，不需額外 add
             except Exception as e:
                 print(f"[LIVE ERROR] 平倉 {sid}: {e}")
 
@@ -809,15 +853,23 @@ class LiveTrader:
             if sid not in current:
                 continue
             try:
-                lots = current[sid]["quantity"]
-                avg_price = current[sid]["avg_price"]
-                trade = trade_api.close(self._api, sid, lots)
+                pos = current[sid]
+                lots = pos["quantity"]
+                avg_price = pos["avg_price"]
+                yd_qty = pos.get("yd_quantity", 0) or 0
+                day_trade = (yd_qty == 0)
+                if self._broker:
+                    trade = self._broker.sell(sid, lots, day_trade=day_trade)
+                elif day_trade:
+                    trade = trade_api.close(self._api, sid, lots)
+                else:
+                    trade = trade_api.close_normal(self._api, sid, lots)
                 status = trade_api.normalize_status(trade.status.status)
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
                 exit_price = float(trade.order.price) if hasattr(trade, "order") else avg_price
                 entry_price = _get_pos_entry(sid)
                 pnl_pct = round((exit_price - entry_price) / entry_price * 100, 4) if entry_price else 0.0
-                print(f"[FORCE CLOSE] {sid} {lots}張 @ {exit_price} → {status} [{order_id}]")
+                print(f"[FORCE CLOSE] {sid} {lots}張 {'當沖' if day_trade else '普通'}@{exit_price} → {status} [{order_id}]")
                 _push_trade(
                     {
                         "order_id": order_id,
@@ -833,6 +885,50 @@ class LiveTrader:
                 _close_pos(sid, pnl_pct, exit_reason="force_close_eod", exit_price=exit_price)
             except Exception as e:
                 print(f"[FORCE CLOSE] 平倉 {sid} 失敗: {e}")
+
+    def close_stock_now(self, sids: list):
+        """前端「立即平倉」按鈕觸發，背景執行緒直接現價賣出，不等下一分鐘 reconcile。
+        BrokerClient.sell() 會先取消同股舊賣單再下新單，避免集保重複凍結。
+        """
+        if not self._connect():
+            print(f"[CLOSE NOW] 連線失敗", flush=True)
+            return
+        try:
+            current = trade_api.get_positions(self._api)  # 含 yd 持股
+        except Exception as e:
+            print(f"[CLOSE NOW] 取得持倉失敗: {e}", flush=True)
+            return
+        for sid in sids:
+            pos = current.get(sid)
+            if not pos:
+                print(f"[CLOSE NOW] {sid} 無持倉，略過", flush=True)
+                continue
+            lots = pos["quantity"]
+            yd_qty = pos.get("yd_quantity", 0) or 0
+            day_trade = (yd_qty == 0)
+            try:
+                if self._broker:
+                    # sell() 內部先取消舊賣單再以現價掛限價（close_at_price）
+                    trade = self._broker.sell(sid, lots, day_trade=day_trade, market=True)
+                else:
+                    trade = trade_api.close_at_price(self._api, sid, lots, day_trade=day_trade)
+                status = trade_api.normalize_status(trade.status.status)
+                order_id = getattr(getattr(trade, "order", None), "id", "") or ""
+                limit_price = float(trade.order.price) if hasattr(trade, "order") else 0
+                label = "當沖" if day_trade else "普通"
+                print(f"[CLOSE NOW] {sid} {lots}張 現價{label}賣出@{limit_price} → {status} [{order_id}]", flush=True)
+                _push_trade({
+                    "order_id": order_id,
+                    "time": _now(),
+                    "stock_id": sid,
+                    "direction": "sell",
+                    "price": limit_price,
+                    "quantity": lots,
+                    "status": status,
+                    "broker_response": "close_now",
+                })
+            except Exception as e:
+                print(f"[CLOSE NOW] {sid} 平倉失敗: {e}", flush=True)
 
     def logout(self):
         """登出永豐 API（程序結束前呼叫）。"""

@@ -217,6 +217,9 @@ if TRADE_MODE != "off":
             _executor.sync_from_broker()
         if hasattr(_executor, "startup_sltp_check"):
             _executor.startup_sltp_check()
+        if hasattr(_executor, "close_stock_now"):
+            from api import register_close_now
+            register_close_now(_executor.close_stock_now)
     except Exception as e:
         print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
 

@@ -91,6 +91,66 @@ def close(api: sj.Shioaji, stock_id: str, quantity: int):
     return trade
 
 
+def close_normal(api: sj.Shioaji, stock_id: str, quantity: int):
+    """普通賣出（昨日持股，yd_quantity > 0）—— 不用 Netting，稅率 0.3%"""
+    contract = api.Contracts.Stocks[stock_id]
+    price = api.snapshots([contract])[0].close
+    raw = price * 0.995
+    tick = _tick(raw)
+    limit_price = round(int(raw / tick) * tick, 2)
+    trade = api.place_order(
+        contract,
+        api.Order(
+            price=limit_price,
+            quantity=quantity,
+            action=sj.Action.Sell,
+            price_type=sj.StockPriceType.LMT,
+            order_type=sj.OrderType.ROD,
+        ),
+    )
+    return trade
+
+
+def close_at_price(api: sj.Shioaji, stock_id: str, quantity: int, day_trade: bool = True):
+    """以現價掛限價賣出（不打折），用於立即平倉場景（close_now）。
+    比 MKT 穩定：台股 MKT 在漲停/跌停時行為不一致；現價限價單集保不會出問題。
+    day_trade=True  → 使用 Netting（當沖，稅 0.15%）
+    day_trade=False → 普通賣出（昨日持股，稅 0.3%）
+    """
+    contract = api.Contracts.Stocks[stock_id]
+    price = api.snapshots([contract])[0].close
+    tick = _tick(price)
+    # 現價直接掛（不打折），確保立刻成交
+    limit_price = round(round(price / tick) * tick, 2)
+    order_kwargs = dict(
+        price=limit_price,
+        quantity=quantity,
+        action=sj.Action.Sell,
+        price_type=sj.StockPriceType.LMT,
+        order_type=sj.OrderType.ROD,
+    )
+    if day_trade:
+        order_kwargs["order_cond"] = sj.StockOrderCond.Netting
+    trade = api.place_order(contract, api.Order(**order_kwargs))
+    return trade
+
+
+def close_market(api: sj.Shioaji, stock_id: str, quantity: int, day_trade: bool = True):
+    """市價賣出，保證成交。day_trade=True 用 Netting（當沖），False 用普通賣出（昨日持股）"""
+    contract = api.Contracts.Stocks[stock_id]
+    order_kwargs = dict(
+        price=0,
+        quantity=quantity,
+        action=sj.Action.Sell,
+        price_type=sj.StockPriceType.MKT,
+        order_type=sj.OrderType.ROD,
+    )
+    if day_trade:
+        order_kwargs["order_cond"] = sj.StockOrderCond.Netting
+    trade = api.place_order(contract, api.Order(**order_kwargs))
+    return trade
+
+
 def open(api: sj.Shioaji, stock_id: str, quantity: int, action: sj.Action = sj.Action.Buy):
     """當沖買進（現股）"""
     contract = api.Contracts.Stocks[stock_id]
@@ -202,7 +262,9 @@ def get_closed_today(api: sj.Shioaji) -> list[dict]:
 
 def cancel_sent_orders(api: sj.Shioaji) -> dict:
     """
-    取消今日所有 SENT（掛單未成交）的買/賣委託。
+    取消今日所有 SENT（掛單未成交）的買單和賣單。
+    - 買單：訊號時效過，取消後若訊號還在本分鐘重新以新價掛
+    - 賣單：取消後由 BrokerClient 或 SL/TP 重掛新價
     回傳:
       {"buy": [(sid, cost), ...], "sell": [sid, ...]}
       cost = 委託價 × 委託張數 × 1000（未成交金額，供還原 _used_quota 用）
@@ -221,14 +283,19 @@ def cancel_sent_orders(api: sj.Shioaji) -> dict:
         sid = t.contract.code
         direction = "buy" if "buy" in str(t.order.action).lower() else "sell"
         try:
-            api.cancel_order(t)
-            if direction == "buy":
-                cost = float(t.order.price) * int(t.order.quantity) * 1000
-                cancelled["buy"].append((sid, cost))
-            else:
-                cancelled["sell"].append(sid)
+            print(f"[CANCEL] {sid} {direction} order_id={t.order.id} price={t.order.price}", flush=True)
+            result = api.cancel_order(t)
+            raw = str(result.status.status)
+            confirmed = raw in ("OrderStatus.Cancelled", "OrderStatus.Failed", "OrderStatus.Inactive")
+            print(f"[CANCEL] {sid} {direction} → {'✓' if confirmed else '✗ 未確認'} {raw}", flush=True)
+            if confirmed:
+                if direction == "buy":
+                    cost = float(t.order.price) * int(t.order.quantity) * 1000
+                    cancelled["buy"].append((sid, cost))
+                else:
+                    cancelled["sell"].append(sid)
         except Exception as e:
-            print(f"[CANCEL] {sid} {direction} 取消失敗: {e}")
+            print(f"[CANCEL] {sid} {direction} 取消失敗: {e}", flush=True)
     return cancelled
 
 

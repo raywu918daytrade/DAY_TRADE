@@ -139,14 +139,17 @@ class M1RestPoller:
     介面與 M1Collector（WebSocket 版）相同，可直接替換。
     """
 
-    def __init__(self, on_minute=None, stocks=None):
+    def __init__(self, on_minute=None, stocks=None, on_rate_limited=None):
         self._on_minute = on_minute
+        self._on_rate_limited = on_rate_limited  # callback(retry_at_str, stock_id)
         self._stocks = stocks
         self._stop = False
         self._client = None
         self._rate_limited_until = 0.0
         self._rate_limit_lock = threading.Lock()
         self._historical_backfilled_dates = set()
+        self._last_minute_str: str | None = None   # 最後一次成功的分鐘標籤
+        self._last_minute_df: "pd.DataFrame | None" = None  # 最後一次成功的 df
 
     def _get_stocks(self) -> list:
         if callable(self._stocks):
@@ -358,8 +361,15 @@ class M1RestPoller:
                 retry_at = datetime.fromtimestamp(self._rate_limited_until, tz=_TW)
                 wait = (retry_at - datetime.now(_TW)).total_seconds()
                 print(f"[{now.strftime('%H:%M:%S')}] Fugle rate limit backoff 到 {retry_at.strftime('%H:%M:%S')}")
+                # 限流期間仍按分鐘呼叫 on_minute（用最後快取的 df）
+                # 讓 reconcile 能繼續執行 SL/TP 和 cancel+重掛，不依賴 Fugle 資料
+                if self._on_minute and self._last_minute_df is not None:
+                    try:
+                        self._on_minute(self._last_minute_str, self._last_minute_df.copy())
+                    except Exception as _e:
+                        print(f"on_minute (rate_limited) 錯誤: {_e}")
                 if wait > 0:
-                    time.sleep(wait)
+                    time.sleep(min(wait, 60))  # 最多 sleep 60s，保持每分鐘觸發
                 continue
 
             stocks = self._get_stocks()
@@ -378,6 +388,9 @@ class M1RestPoller:
                   f"（fetch {elapsed:.2f}s，該分鐘 {len(minute_df)} 支）")
 
             if self._on_minute and not minute_df.empty:
+                # 記住最後成功的分鐘資料，限流時也能繼續呼叫 on_minute
+                self._last_minute_str = minute_str
+                self._last_minute_df = minute_df.copy()
                 try:
                     self._on_minute(minute_str, minute_df.copy())
                 except Exception as e:
