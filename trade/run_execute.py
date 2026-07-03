@@ -366,11 +366,36 @@ class LiveTrader:
         )
         self._used_quota = used_quota  # 重啟恢復已用額度
         self._positions_synced = True
+        self._startup_prices = snapshots  # 供 startup_sltp_check() 使用
         print(
             f"[LIVE SYNC] 啟動同步完成：持倉 {len(positions)}、"
             f"今日委託 {len(trades)}、已平倉 {closed}、已用額度 {used_quota/10000:.1f}萬"
         )
         return True
+
+    def startup_sltp_check(self):
+        """重啟後立刻用 broker 現價檢查 SL/TP，不等下一分鐘 on_minute。"""
+        prices = getattr(self, "_startup_prices", {})
+        if not prices:
+            print("[STARTUP SL/TP] 無持倉報價，略過", flush=True)
+            return
+        try:
+            current = trade_api.get_positions(self._api, day_trade_only=True)
+        except Exception as e:
+            print(f"[STARTUP SL/TP] 取得持倉失敗: {e}", flush=True)
+            return
+        if not current:
+            print("[STARTUP SL/TP] 無持倉，略過", flush=True)
+            return
+        sl_pct = float(_get_setting("stop_loss_pct") or 3.0) / 100
+        tp_pct = float(_get_setting("take_profit_pct") or 3.0) / 100
+        # 傳入「保留所有持倉」的假訊號，讓 reconcile 只靠 SL/TP 決定平倉
+        fake_signals = [
+            {"stock_id": sid, "proba": 1.0, "price": prices.get(sid, pos["avg_price"])}
+            for sid, pos in current.items()
+        ]
+        print(f"[STARTUP SL/TP] 檢查 {len(current)} 支持倉（SL={sl_pct*100:.0f}% TP={tp_pct*100:.0f}%）", flush=True)
+        self.reconcile(fake_signals, prices=prices)
 
     def _on_order_event(self, state, msg):
         """永豐成交回報（SDEAL）→ 更新 dashboard 進場均價"""
@@ -573,13 +598,27 @@ class LiveTrader:
         to_close = (set(current) - target - pending_sell) if close_enabled else set()
 
         # 停損/停利：跟模型訊號無關，純粹用現價比對進場均價
-        if prices and close_enabled:
+        # prices 只含 _day_trade_stocks（前500支），持倉若不在其中需補拉 broker snapshot
+        if close_enabled:
             sl_pct = float(_get_setting("stop_loss_pct") or 3.0) / 100
             tp_pct = float(_get_setting("take_profit_pct") or 3.0) / 100
+            missing = [
+                sid for sid in current
+                if sid not in (prices or {}) and sid not in to_close and sid not in pending_sell
+            ]
+            extra_prices: dict = {}
+            if missing:
+                try:
+                    contracts = [self._api.Contracts.Stocks[sid] for sid in missing]
+                    extra_prices = {s.code: s.close for s in self._api.snapshots(contracts)}
+                    print(f"[SL/TP] 補拉 {len(missing)} 支不在監控清單的持倉現價", flush=True)
+                except Exception as e:
+                    print(f"[SL/TP] 補拉現價失敗: {e}", flush=True)
+            all_prices = {**(prices or {}), **extra_prices}
             for sid, pos in current.items():
                 if sid in to_close or sid in pending_sell:
                     continue
-                price = prices.get(sid)
+                price = all_prices.get(sid)
                 if not price:
                     continue
                 avg = pos["avg_price"]

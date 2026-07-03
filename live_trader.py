@@ -215,6 +215,8 @@ if TRADE_MODE != "off":
         print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}", flush=True)
         if hasattr(_executor, "sync_from_broker"):
             _executor.sync_from_broker()
+        if hasattr(_executor, "startup_sltp_check"):
+            _executor.startup_sltp_check()
     except Exception as e:
         print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
 
