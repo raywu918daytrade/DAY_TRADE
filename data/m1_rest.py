@@ -18,6 +18,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+
+try:
+    from api import append_system_log as _log_sys
+except Exception:
+    def _log_sys(msg, level="info"): pass  # type: ignore
 from pathlib import Path
 
 import pandas as pd
@@ -234,6 +239,7 @@ class M1RestPoller:
             return
 
         print(f"[{date_str}] 收盤後 historical backfill 開始，共 {len(stocks)} 支")
+        _log_sys(f"收盤後 backfill 開始 {date_str}，{len(stocks)} 支")
         _BATCH = 100  # 每 100 支存一次，避免全量 concat 超過記憶體上限
         frames = []
         saved = 0
@@ -258,6 +264,7 @@ class M1RestPoller:
             print(f"[{date_str}] historical backfill 沒有取得今日資料")
             return
         print(f"[{date_str}] historical backfill 完成，{saved} 支（{elapsed:.1f}s）")
+        _log_sys(f"收盤後 backfill 完成 {date_str}，{saved} 支 ({elapsed:.1f}s)")
 
     def _fetch_all(self, stocks: list, date_str: str) -> pd.DataFrame:
         if not stocks:
@@ -390,8 +397,10 @@ class M1RestPoller:
             _atomic_save(df, _live_path(date_str))
             minute_df = df[df["date"] == minute_str]
             ts = now.strftime("%H:%M:%S")
-            print(f"[{ts}] {minute_str} 存檔，{len(df['stock_id'].unique())} 支股票"
+            n_stocks = len(df['stock_id'].unique())
+            print(f"[{ts}] {minute_str} 存檔，{n_stocks} 支股票"
                   f"（fetch {elapsed:.2f}s，該分鐘 {len(minute_df)} 支）")
+            _log_sys(f"M1 fetch {minute_str}：{n_stocks} 支 ({elapsed:.1f}s)")
 
             if self._on_minute and not minute_df.empty:
                 # 記住最後成功的分鐘資料，限流時也能繼續呼叫 on_minute
@@ -401,6 +410,7 @@ class M1RestPoller:
                     self._on_minute(minute_str, minute_df.copy())
                 except Exception as e:
                     print(f"on_minute 錯誤: {e}")
+                    _log_sys(f"on_minute 錯誤: {e}", "error")
 
     def stop(self):
         self._stop = True

@@ -18,6 +18,7 @@ ReDoc      : http://localhost:8000/redoc
 import asyncio
 import json
 import threading
+import time as _time_mod
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -44,6 +45,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_SKIP_LOG_PATHS = {"/stream", "/health"}
+
+@app.middleware("http")
+async def _log_http(request: Request, call_next):
+    """前端 → 後端每次 API 呼叫記錄到系統 log（/stream SSE 和 /health 除外）"""
+    if request.url.path in _SKIP_LOG_PATHS:
+        return await call_next(request)
+    t0 = _time_mod.time()
+    response = await call_next(request)
+    elapsed_ms = int((_time_mod.time() - t0) * 1000)
+    path = request.url.path
+    qs = f"?{request.url.query}" if request.url.query else ""
+    append_system_log(
+        f"{request.method} {path}{qs} → {response.status_code} ({elapsed_ms}ms)",
+        level="info" if response.status_code < 400 else "error",
+    )
+    return response
 
 # ── Pydantic response models（Swagger 自動生成文件）───────────────────────────
 

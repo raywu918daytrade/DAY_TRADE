@@ -19,6 +19,12 @@ except (ImportError, ModuleNotFoundError):
     except (ImportError, ModuleNotFoundError):
         trade_api = None  # type: ignore
 
+try:
+    from api import append_system_log as _log_sys, append_trade_log as _log_trade
+except Exception:
+    def _log_sys(msg, level="info"): pass  # type: ignore
+    def _log_trade(sid, action, detail, status=""): pass  # type: ignore
+
 
 class BrokerClient:
     def __init__(self, api):
@@ -32,10 +38,15 @@ class BrokerClient:
     # ── 買 ────────────────────────────────────────────────────────────────
 
     def buy(self, sid: str, qty: int) -> object:
-        trade = trade_api.open(self._api, sid, qty)
+        try:
+            trade = trade_api.open(self._api, sid, qty)
+        except Exception as e:
+            _log_sys(f"永豐 BUY 失敗 {sid} {qty}張: {e}", "error")
+            raise
         order_id = _order_id(trade)
         status = trade_api.normalize_status(trade.status.status)
         print(f"[BROKER BUY]  {sid} {qty}張 → {status} [{order_id}]", flush=True)
+        _log_trade(sid, "buy", f"{qty}張 → {status} [{order_id}]", status)
         return trade
 
     # ── 賣 ────────────────────────────────────────────────────────────────
@@ -47,18 +58,23 @@ class BrokerClient:
         if sid in self._sell_orders:
             self._cancel_sell(sid)
 
-        if market:
-            trade = trade_api.close_at_price(self._api, sid, qty, day_trade=day_trade)
-        elif day_trade:
-            trade = trade_api.close(self._api, sid, qty)
-        else:
-            trade = trade_api.close_normal(self._api, sid, qty)
+        label = ("市價" if market else "限價") + ("當沖" if day_trade else "普通")
+        try:
+            if market:
+                trade = trade_api.close_at_price(self._api, sid, qty, day_trade=day_trade)
+            elif day_trade:
+                trade = trade_api.close(self._api, sid, qty)
+            else:
+                trade = trade_api.close_normal(self._api, sid, qty)
+        except Exception as e:
+            _log_sys(f"永豐 SELL 失敗 {sid} {qty}張 {label}: {e}", "error")
+            raise
 
         order_id = _order_id(trade)
         self._sell_orders[sid] = order_id
         status = trade_api.normalize_status(trade.status.status)
-        label = ("市價" if market else "限價") + ("當沖" if day_trade else "普通")
         print(f"[BROKER SELL] {sid} {qty}張 {label} → {status} [{order_id}]", flush=True)
+        _log_trade(sid, "sell", f"{qty}張 {label} → {status} [{order_id}]", status)
         return trade
 
     # ── 取消 ──────────────────────────────────────────────────────────────
@@ -69,17 +85,23 @@ class BrokerClient:
         回傳 {"buy": [(sid, cost), ...], "sell": [sid, ...]}，
         結構與 trade_api.cancel_sent_orders 相同，供 reconcile 還原額度。
         """
-        result = trade_api.cancel_sent_orders(self._api)
+        try:
+            result = trade_api.cancel_sent_orders(self._api)
+        except Exception as e:
+            _log_sys(f"永豐 cancel_all_orders 失敗: {e}", "error")
+            raise
+        n_buy = len(result.get("buy", []))
+        n_sell = len(result.get("sell", []))
+        if n_buy or n_sell:
+            _log_sys(f"取消委託：買 {n_buy} 筆，賣 {n_sell} 筆")
         for sid in result.get("sell", []):
             self._sell_orders.pop(sid, None)
 
         # 若 _sell_orders 仍有殘留（cancel_sent_orders 未能取消），只記錄警告
-        # 可能原因：sim session 隔離（上一次 session 的單不可見）或 broker 延遲
         for sid in list(self._sell_orders):
-            print(
-                f"[BROKER] 警告：{sid} [{self._sell_orders[sid]}] 未被 cancel_sent_orders 取消，下次繼續嘗試",
-                flush=True,
-            )
+            msg = f"警告：{sid} [{self._sell_orders[sid]}] 未被 cancel 取消，下次繼續嘗試"
+            print(f"[BROKER] {msg}", flush=True)
+            _log_sys(f"[BROKER] {msg}", "warning")
 
         return result
 
@@ -114,9 +136,12 @@ class BrokerClient:
                             result = self._api.cancel_order(t)
                             raw = str(result.status.status)
                             print(f"[BROKER] 取消舊賣單 {sid} [{order_id}] → {raw}", flush=True)
+                            _log_sys(f"取消舊賣單 {sid} [{order_id}] → {raw}")
                         break
         except Exception as e:
-            print(f"[BROKER] 取消舊賣單 {sid} 失敗: {e}", flush=True)
+            msg = f"取消舊賣單 {sid} 失敗: {e}"
+            print(f"[BROKER] {msg}", flush=True)
+            _log_sys(f"[BROKER] {msg}", "error")
         finally:
             self._sell_orders.pop(sid, None)
 

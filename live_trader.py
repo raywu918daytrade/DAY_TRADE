@@ -29,6 +29,7 @@ import pandas as pd
 import uvicorn
 
 from api import (
+    append_system_log as _log_sys,
     get_uvicorn_config,
     push_candles,
     push_monitoring,
@@ -231,6 +232,7 @@ if TRADE_MODE != "off":
             name_lookup=lambda sid: _tickers.get(sid, sid),
         )
         print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}", flush=True)
+        _log_sys(f"交易引擎啟動：{TRADE_MODE} 模式，資金={TOTAL_CAPITAL:,.0f}")
         if hasattr(_executor, "sync_from_broker"):
             _executor.sync_from_broker()
         if hasattr(_executor, "startup_sltp_check"):
@@ -240,6 +242,7 @@ if TRADE_MODE != "off":
             register_close_now(_executor.close_stock_now)
     except Exception as e:
         print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
+        _log_sys(f"交易模組載入失敗: {e}", "error")
 
 
 def _daily_refresh():
@@ -354,15 +357,20 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         f"  推論:{len(all_results)} 支  訊號:{len(signals)} 支（門檻={threshold:.2f}）  top5:[{top_str}]",
         flush=True,
     )
+    _log_sys(
+        f"推論 {minute_str}：{len(all_results)} 支 → {len(signals)} 個訊號（門檻={threshold:.2f}）  top5:[{top_str}]"
+    )
     if signals:
         sig_str = " ".join(f"{s['stock_id']}={s['proba']:.2f}" for s in signals)
         print(f"  → 訊號: {sig_str}", flush=True)
+        _log_sys(f"訊號: {sig_str}")
 
     if _executor is not None:
         try:
             _executor.reconcile(signals, prices=price_map)
         except Exception as e:
             print(f"[TRADE ERROR] {e}")
+            _log_sys(f"reconcile 錯誤: {e}", "error")
 
 
 _force_close_done_date = None  # 防止同一天重複觸發
