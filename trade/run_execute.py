@@ -557,6 +557,13 @@ class LiveTrader:
             f"[RECONCILE] 交易計畫：開倉 {len(to_open)}、平倉 {len(to_close)}、待核實 買={len(pending_buy)} 賣={len(pending_sell)}",
             flush=True,
         )
+        # 可用額度直接從 broker 持倉算（不用自追 _used_quota，永豐才是真實來源）
+        self._used_quota = round(
+            sum(p["avg_price"] * p["quantity"] * 1000 for p in current.values()), 0
+        )
+        available = self.total_capital - self._used_quota
+        _push_summary({"used_quota": self._used_quota, "total_capital": self.total_capital})
+
         if not to_open and not to_close:
             print(f"[RECONCILE] 無新增交易，完成", flush=True)
             return
@@ -571,12 +578,6 @@ class LiveTrader:
                 snapshots = {s.code: s.close for s in self._api.snapshots(contracts)}
             except Exception as e:
                 self._reset_on_disconnect(e, "取得快照")
-
-        # 可用額度直接從 broker 持倉算（不用自追 _used_quota，永豐才是真實來源）
-        self._used_quota = round(
-            sum(p["avg_price"] * p["quantity"] * 1000 for p in current.values()), 0
-        )
-        available = self.total_capital - self._used_quota
 
         cfg_min_price = _get_setting("min_price")
         cfg_max_price = _get_setting("max_price")
