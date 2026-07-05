@@ -10,8 +10,18 @@ ReDoc      : http://localhost:8000/redoc
     GET  /signals/today              左邊訊號列表
     GET  /signals/{stock_id}/detail  右邊訊號詳情
     GET  /chart/{stock_id}/candles   中間 K 圖
+    GET  /chart/{stock_id}/candles/history   歷史K線（任意過去日期，交易回放用）
     GET  /positions                  下方持倉區
     GET  /trades                     下方成交記錄
+    GET  /analysis/trade_timeline     交易時間軸（給 AI agent 分析用）
+    GET  /analysis/summary           今日摘要（給 AI agent 分析用）
+    GET  /api/inference/history/dates        可回放日期清單（HF Hub 上實際有資料的日期）
+    GET  /api/inference/history      每分鐘推論歷史記錄（給前端分析用，今日記憶體/過去日期 HF Hub）
+    GET  /api/inference/evaluation           推論訊號事後驗證明細（Triple Barrier 逐筆勝負）
+    GET  /api/inference/evaluation/summary   推論訊號事後驗證摘要（勝率/損益/高信心度股票排行）
+    GET  /api/knowledge/topics/              知識庫主題列表
+    GET  /api/knowledge/topics/{topic}/      知識庫主題詳情
+    GET  /api/knowledge/search/              知識庫全文搜尋
     WS   /ws                         即時推送
 """
 
@@ -24,6 +34,22 @@ from pathlib import Path
 from typing import Optional
 
 _TW = timezone(timedelta(hours=8))
+
+
+def tw_naive_to_epoch(dt) -> int:
+    """把「naive datetime，但實際代表台北本地時間」的值轉成正確的 UTC epoch 秒數。
+
+    專案裡分K的 date 欄位（Fugle 回傳、db/m1_live 存的、db/m1 存的）一律是這種格式：
+    看起來沒有時區資訊，但實際上代表台北時間。絕對不能直接用 calendar.timegm() 或
+    .timestamp()（兩者都會把「台北時間」誤當成「UTC 時間」，導致 timestamp 多算 8 小時），
+    一律透過這支函式轉換，才不會每個新端點各自重犯同一個 bug。
+
+    接受 python datetime 或 pandas Timestamp（兩者的 tz 標記方式不同，這裡統一處理）。
+    """
+    if hasattr(dt, "tz_localize"):  # pandas Timestamp
+        return int(dt.tz_localize(_TW).timestamp())
+    return int(dt.replace(tzinfo=_TW).timestamp())
+
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -151,6 +177,83 @@ class TradeRecord(BaseModel):
     broker_response: Optional[str] = None
 
 
+class TimelineEvent(BaseModel):
+    time: str  # HH:MM:SS
+    stock_id: str
+    name: str
+    event: str  # signal / buy_filled / sell_filled / closed / force_close / order_failed
+    direction: Optional[str] = None
+    price: Optional[float] = None
+    quantity: Optional[int] = None
+    score: Optional[int] = None
+    pnl_pct: Optional[float] = None
+    pnl_amt: Optional[float] = None
+    exit_reason: Optional[str] = None
+    detail: str = ""
+
+
+class TradeSummary(BaseModel):
+    date: str
+    total_signals: int
+    total_trades: int
+    open_trades: int
+    closed_trades: int
+    win_count: int
+    loss_count: int
+    win_rate: Optional[float] = None
+    today_pnl_pct: float = 0.0
+    today_pnl_amt: float = 0.0
+    total_capital: float = 0.0
+    used_quota: float = 0.0
+    avg_win_pct: Optional[float] = None
+    avg_loss_pct: Optional[float] = None
+    best_trade: Optional[dict] = None
+    worst_trade: Optional[dict] = None
+    exit_reason_breakdown: dict = {}
+    risk_rejected: int = 0
+    errors: int = 0
+    last_updated: str = ""
+
+
+class InferenceRecord(BaseModel):
+    date: str
+    time: str
+    stock_id: str
+    name: str
+    proba: float
+    price: Optional[float] = None
+    direction: str = "buy"
+    is_signal: bool = False
+
+
+class InferenceEvalRecord(BaseModel):
+    date: str
+    time: str
+    stock_id: str
+    name: str
+    proba: float
+    entry_price: float
+    outcome: str  # win / loss / timeout_win / timeout_loss / unresolved
+    exit_price: Optional[float] = None
+    pnl_pct: Optional[float] = None
+    bars_to_exit: Optional[int] = None
+
+
+class InferenceEvalSummary(BaseModel):
+    date: str
+    total_signals: int
+    resolved_signals: int
+    unresolved_signals: int
+    win_count: int
+    loss_count: int
+    win_rate: Optional[float] = None
+    avg_pnl_pct: Optional[float] = None
+    total_pnl_pct: Optional[float] = None
+    by_confidence: list[dict] = []
+    by_time: list[dict] = []
+    top_signal_stocks: list[dict] = []
+
+
 # ── 使用者設定（settings.json + HF Hub 備份，覆蓋 .env 預設值）─────────────
 
 import os as _os
@@ -273,6 +376,15 @@ _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
 _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
+from collections import OrderedDict as _OrderedDict
+
+# 每分鐘推論記錄（全部監控股票，threshold=0）：今日累積在記憶體，背景同步整天到 HF Hub
+_inference_buffer: list = []
+_inference_date: date = None
+_inference_io_lock = threading.Lock()  # 序列化背景寫檔/上傳，避免同分鐘重疊
+_inference_hf_cache: _OrderedDict = _OrderedDict()  # 過去日期查詢快取（date_str -> DataFrame），LRU 上限 14 天
+_INFERENCE_HF_CACHE_MAX = 14
+
 # ── Log 緩衝區 ────────────────────────────────────────────────────────────────
 from collections import deque as _deque
 import json as _json_mod
@@ -375,6 +487,218 @@ def push_monitoring(minute_str: str, all_results: list, threshold: float):
             }
         data = sorted(_monitoring.values(), key=lambda x: -x["proba"])
         _broadcast({"type": "monitoring", "minute": minute_str[11:16], "data": data})
+
+
+_INFERENCE_LOCAL_DIR = Path(__file__).parent / "db" / "inference_live"
+_HF_INFERENCE_PREFIX = "day_trade/inference"
+
+
+def push_inference_log(minute_str: str, all_results: list, threshold: float = 0.0):
+    """每分鐘全部監控股票的推論結果落地：記憶體累積今日資料 + 背景寫本地 parquet + 同步至 HF Hub。
+    由 on_minute 在 push_monitoring 之後呼叫，供 /api/inference/history 分析查詢用。
+    """
+    global _inference_buffer, _inference_date
+    if not all_results:
+        return
+    date_str = minute_str[:10]
+    day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    with _lock:
+        if _inference_date != day:
+            _inference_date = day
+            _inference_buffer = []
+        for r in all_results:
+            _inference_buffer.append(
+                {
+                    "date": date_str,
+                    "time": minute_str[11:16],
+                    "stock_id": r["stock_id"],
+                    "name": r.get("name", r["stock_id"]),
+                    "proba": round(float(r["proba"]), 4),
+                    "price": r.get("price"),
+                    "direction": r.get("direction", "buy"),
+                    "is_signal": bool(r["proba"] >= threshold),
+                }
+            )
+        rows = list(_inference_buffer)
+    _persist_inference_log(date_str, rows)
+
+
+def _persist_inference_log(date_str: str, rows: list) -> None:
+    """背景執行緒：整天推論記錄覆寫本地 parquet，並同步到 HF Hub（無 HF_REPO_ID 時只寫本地）"""
+
+    def _write():
+        with _inference_io_lock:
+            try:
+                import pandas as pd
+
+                df = pd.DataFrame(rows)
+                _INFERENCE_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+                local_path = _INFERENCE_LOCAL_DIR / f"{date_str}.parquet"
+                df.to_parquet(local_path, index=False, compression="zstd")
+
+                repo_id = _os.environ.get("HF_REPO_ID", "")
+                token = _os.environ.get("HF_TOKEN", "") or None
+                if not repo_id:
+                    return
+                from huggingface_hub import HfApi
+
+                HfApi().upload_file(
+                    path_or_fileobj=str(local_path),
+                    path_in_repo=f"{_HF_INFERENCE_PREFIX}/{date_str}.parquet",
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    token=token,
+                    commit_message=f"inference log {date_str}",
+                )
+                print(f"[推論記錄] {date_str} 已同步至 HF Hub（{len(df)} 筆）", flush=True)
+            except Exception as e:
+                print(f"[推論記錄] 寫入/上傳失敗: {e}", flush=True)
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
+def _load_inference_day(date_str: str):
+    """取得指定日期的推論記錄 DataFrame：今日走記憶體 buffer，過去日期從 HF Hub 下載（含 LRU cache）"""
+    import pandas as pd
+
+    today_str = datetime.now(_TW).strftime("%Y-%m-%d")
+    if date_str == today_str:
+        with _lock:
+            rows = list(_inference_buffer)
+        return pd.DataFrame(rows)
+
+    if date_str in _inference_hf_cache:
+        _inference_hf_cache.move_to_end(date_str)
+        return _inference_hf_cache[date_str]
+
+    repo_id = _os.environ.get("HF_REPO_ID", "")
+    token = _os.environ.get("HF_TOKEN", "") or None
+    df = pd.DataFrame()
+    if repo_id:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            local = hf_hub_download(
+                repo_id=repo_id,
+                filename=f"{_HF_INFERENCE_PREFIX}/{date_str}.parquet",
+                repo_type="dataset",
+                token=token,
+            )
+            df = pd.read_parquet(local)
+        except Exception as e:
+            print(f"[推論記錄] {date_str} HF Hub 無資料: {e}", flush=True)
+
+    _inference_hf_cache[date_str] = df
+    _inference_hf_cache.move_to_end(date_str)
+    while len(_inference_hf_cache) > _INFERENCE_HF_CACHE_MAX:
+        _inference_hf_cache.popitem(last=False)
+    return df
+
+
+# ── 推論訊號事後驗證（scripts/evaluate_inference_log.py 產出，純讀取，不做即時計算）───
+
+_HF_EVAL_PREFIX = "day_trade/inference_eval"
+_eval_hf_cache: _OrderedDict = _OrderedDict()
+_EVAL_HF_CACHE_MAX = 14
+
+
+def _load_inference_eval_day(date_str: str):
+    """取得指定日期的推論驗證明細 DataFrame（HF Hub，含 LRU cache）。
+    這份資料是收盤後用 scripts/evaluate_inference_log.py 事後算好才上傳的，
+    沒有像 _load_inference_day 那樣的「今日走記憶體」分支。
+    """
+    import pandas as pd
+
+    if date_str in _eval_hf_cache:
+        _eval_hf_cache.move_to_end(date_str)
+        return _eval_hf_cache[date_str]
+
+    repo_id = _os.environ.get("HF_REPO_ID", "")
+    token = _os.environ.get("HF_TOKEN", "") or None
+    df = pd.DataFrame()
+    if repo_id:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            local = hf_hub_download(
+                repo_id=repo_id,
+                filename=f"{_HF_EVAL_PREFIX}/{date_str}.parquet",
+                repo_type="dataset",
+                token=token,
+            )
+            df = pd.read_parquet(local)
+        except Exception as e:
+            print(f"[推論驗證] {date_str} HF Hub 無資料: {e}", flush=True)
+
+    _eval_hf_cache[date_str] = df
+    _eval_hf_cache.move_to_end(date_str)
+    while len(_eval_hf_cache) > _EVAL_HF_CACHE_MAX:
+        _eval_hf_cache.popitem(last=False)
+    return df
+
+
+def _build_eval_summary(df) -> dict:
+    """從逐筆驗證明細算出摘要統計：整體勝率/損益、依信心度分組勝率、高頻訊號股票排行"""
+    total = len(df)
+    resolved = df[df["outcome"] != "unresolved"]
+    win_mask = resolved["outcome"].isin(["win", "timeout_win"])
+    win_count = int(win_mask.sum())
+    loss_count = int(len(resolved) - win_count)
+    win_rate = round(win_count / len(resolved) * 100, 1) if len(resolved) else None
+    avg_pnl = round(resolved["pnl_pct"].mean(), 4) if len(resolved) else None
+    total_pnl = round(resolved["pnl_pct"].sum(), 4) if len(resolved) else None
+
+    by_confidence = []
+    for min_proba in (0.5, 0.55, 0.6, 0.7, 0.8, 0.85, 0.9):
+        subset = resolved[resolved["proba"] >= min_proba]
+        if subset.empty:
+            continue
+        sub_win = int(subset["outcome"].isin(["win", "timeout_win"]).sum())
+        by_confidence.append({
+            "min_proba": min_proba,
+            "count": int(len(subset)),
+            "win_rate": round(sub_win / len(subset) * 100, 1),
+        })
+
+    top_signal_stocks = []
+    if not df.empty:
+        grouped = df.groupby(["stock_id", "name"]).agg(
+            signal_count=("proba", "size"),
+            avg_proba=("proba", "mean"),
+        ).reset_index()
+        win_by_stock = resolved.groupby("stock_id")["outcome"].apply(
+            lambda s: round(s.isin(["win", "timeout_win"]).sum() / len(s) * 100, 1) if len(s) else None
+        )
+        grouped["win_rate"] = grouped["stock_id"].map(win_by_stock)
+        grouped["avg_proba"] = grouped["avg_proba"].round(4)
+        grouped = grouped.sort_values(["signal_count", "avg_proba"], ascending=False).head(10)
+        top_signal_stocks = grouped.astype(object).where(grouped.notna(), None).to_dict("records")
+
+    # 依分鐘分組勝率/訊號數（每分鐘一筆，涵蓋當天完整訊號時段，不只 09:00~10:00 主要交易時段）
+    by_time = []
+    if not resolved.empty:
+        for minute, subset in resolved.groupby("time"):
+            sub_win = int(subset["outcome"].isin(["win", "timeout_win"]).sum())
+            by_time.append({
+                "time": minute,
+                "count": int(len(subset)),
+                "win_rate": round(sub_win / len(subset) * 100, 1),
+            })
+        by_time.sort(key=lambda x: x["time"])
+
+    return {
+        "total_signals": total,
+        "resolved_signals": int(len(resolved)),
+        "unresolved_signals": int(total - len(resolved)),
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "win_rate": win_rate,
+        "avg_pnl_pct": avg_pnl,
+        "total_pnl_pct": total_pnl,
+        "by_confidence": by_confidence,
+        "by_time": by_time,
+        "top_signal_stocks": top_signal_stocks,
+    }
 
 
 def push_signals(minute_str: str, signals: list):
@@ -626,16 +950,37 @@ def settings_get():
     return _load_settings()
 
 
-@app.post("/settings", tags=["系統"], summary="儲存使用者設定")
+# 設定儲存密碼（不要在原始碼裡放明碼，只放 hash；即使有原始碼也不會直接看到密碼）
+# 注意：這只是「防止隨手誤改」的簡單防呆，不是真正的安全機制——6碼數字密碼
+# 只有 100 萬種組合，任何人拿到原始碼都能在本機瞬間窮舉出這個 hash 對應的明碼，
+# 擋不住蓄意破解，只能擋住看原始碼隨手改的情況。
+_SETTINGS_PASSWORD_HASH = "f768ba2c8fe0938b19ee56666f5d16be47520cff612b6d75c5bf35bc0771fbd5"
+
+
+def _check_settings_password(password) -> bool:
+    import hashlib
+
+    if not isinstance(password, str):
+        return False
+    return hashlib.sha256(password.encode()).hexdigest() == _SETTINGS_PASSWORD_HASH
+
+
+@app.post("/settings", tags=["系統"], summary="儲存使用者設定（需密碼）")
 async def settings_post(request: Request):
     """
-    更新 settings.json 並立即套用至儀表板。
+    更新 settings.json 並立即套用至儀表板，需帶 password 欄位才能儲存。
     目前支援欄位：
+      password (str)：必填，儲存密碼
       total_capital (float)：當沖總額度（元）
     """
     body: dict = await request.json()
+    if not _check_settings_password(body.get("password")):
+        raise HTTPException(status_code=403, detail="密碼錯誤，未儲存")
+
     current = _load_settings()
     for k, v in body.items():
+        if k == "password":
+            continue  # 密碼只用來驗證，不寫進 settings.json
         if v is None:
             current.pop(k, None)  # null → 刪除 key，回落 .env 預設
         else:
@@ -717,6 +1062,76 @@ def chart_candles(stock_id: str):
     return {"stock_id": stock_id, "candles": candles}
 
 
+@app.get(
+    "/chart/{stock_id}/candles/history",
+    response_model=CandleResponse,
+    tags=["圖表"],
+    summary="歷史K線資料（任意過去日期，交易回放用）",
+)
+def chart_candles_history(
+    stock_id: str,
+    date: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    interval: str = "1m",
+):
+    """date: 必填，格式 YYYY-MM-DD（歷史日期，非當天，當天請用 /chart/{stock_id}/candles）。
+    start_time / end_time: 選填，格式 HH:MM，篩選時間區間（含頭尾），例如 09:00~10:00。
+    interval: 選填，預設 "1m"，目前只支援 1 分鐘K。
+
+    資料來源：Fugle /historical/candles，僅能查近30日資料（Fugle API 本身限制，
+    無法指定 from/to），超過30日的日期會回 404。
+    """
+    if interval != "1m":
+        raise HTTPException(status_code=400, detail="目前只支援 interval=1m")
+
+    import pandas as pd
+
+    from data.m1_data_loader import _download_m1
+
+    try:
+        df = _download_m1(stock_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"向 Fugle 取得歷史分K失敗: {e}")
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"{stock_id} 查無歷史分K資料")
+
+    df["date"] = pd.to_datetime(df["date"])
+    day_start = pd.Timestamp(date)
+    day_end = day_start + pd.Timedelta(days=1)
+    df = df[(df["date"] >= day_start) & (df["date"] < day_end)]
+    if df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{stock_id} 在 {date} 沒有分K資料（Fugle 歷史 API 僅能查近30日，或該日非交易日）",
+        )
+
+    df["_minute"] = df["date"].dt.strftime("%H:%M")
+    if start_time:
+        df = df[df["_minute"] >= start_time]
+    if end_time:
+        df = df[df["_minute"] <= end_time]
+    df = df.sort_values("date")
+
+    candles = [
+        {
+            "time": tw_naive_to_epoch(row["date"]),
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "volume": int(row["volume"]),
+        }
+        for _, row in df.iterrows()
+    ]
+    print(
+        f"[GET /chart/{stock_id}/candles/history] date={date} start_time={start_time} end_time={end_time} "
+        f"回傳 {len(candles)} 根 K 線",
+        flush=True,
+    )
+    return {"stock_id": stock_id, "candles": candles}
+
+
 @app.get("/monitoring", tags=["監控"], summary="監控中股票的最新推論結果（依信心度排序）")
 def get_monitoring():
     print(f"[GET /monitoring] 回傳 {len(_monitoring)} 支監控股票", flush=True)
@@ -728,6 +1143,331 @@ def get_monitoring():
 def completed_trades():
     with _lock:
         return list(reversed(_completed_trades))  # 最新在上
+
+
+def _name_for(sid: str) -> str:
+    """依 stock_id 查名稱：優先 _signal_detail，找不到 fallback 回 stock_id 本身"""
+    d = _signal_detail.get(sid)
+    if d and d.get("name"):
+        return d["name"]
+    p = _positions.get(sid)
+    if p and p.get("name"):
+        return p["name"]
+    return sid
+
+
+def _build_trade_timeline(stock_id: Optional[str] = None) -> list[dict]:
+    """合併 _signals / _trades / _completed_trades，依時間排序成單一時間軸（假設呼叫端已持有 _lock）"""
+    events: list[dict] = []
+
+    for s in _signals:
+        if stock_id and s["stock_id"] != stock_id:
+            continue
+        t = s["time"] if len(s["time"]) == 8 else f"{s['time']}:00"
+        events.append(
+            {
+                "time": t,
+                "stock_id": s["stock_id"],
+                "name": s["name"],
+                "event": "signal",
+                "direction": s["direction"],
+                "price": None,
+                "quantity": None,
+                "score": s["score"],
+                "pnl_pct": None,
+                "pnl_amt": None,
+                "exit_reason": None,
+                "detail": f"模型分數 {s['score']}，產生{'買進' if s['direction'] == 'buy' else '賣出'}訊號",
+            }
+        )
+
+    for tr in _trades:
+        if stock_id and tr["stock_id"] != stock_id:
+            continue
+        status = tr.get("status", "")
+        if status == "FAILED":
+            ev = "order_failed"
+        elif tr.get("direction") == "buy":
+            ev = "buy_filled"
+        else:
+            ev = "sell_filled"
+        events.append(
+            {
+                "time": tr["time"][-8:],
+                "stock_id": tr["stock_id"],
+                "name": _name_for(tr["stock_id"]),
+                "event": ev,
+                "direction": tr.get("direction"),
+                "price": tr.get("price"),
+                "quantity": tr.get("quantity"),
+                "score": None,
+                "pnl_pct": None,
+                "pnl_amt": None,
+                "exit_reason": None,
+                "detail": tr.get("broker_response") or f"{tr.get('quantity')} 股 @ {tr.get('price')}",
+            }
+        )
+
+    for c in _completed_trades:
+        if stock_id and c["stock_id"] != stock_id:
+            continue
+        reason = c.get("exit_reason") or ""
+        ev = "force_close" if reason == "force_close_eod" else "closed"
+        t = c["time"] if c["time"] != "-" else "00:00:00"
+        events.append(
+            {
+                "time": t[-8:],
+                "stock_id": c["stock_id"],
+                "name": c.get("name", c["stock_id"]),
+                "event": ev,
+                "direction": "sell",
+                "price": c.get("exit_price"),
+                "quantity": c.get("quantity"),
+                "score": None,
+                "pnl_pct": c.get("pnl_pct"),
+                "pnl_amt": c.get("pnl_amt"),
+                "exit_reason": reason or None,
+                "detail": f"平倉（{reason}）" if reason else "平倉",
+            }
+        )
+
+    events.sort(key=lambda e: e["time"])
+    return events
+
+
+def _build_trade_summary() -> dict:
+    """依 _completed_trades / _summary 計算 AI agent 分析用的當日統計（假設呼叫端已持有 _lock）"""
+    closed = list(_completed_trades)
+    wins = [c for c in closed if (c.get("pnl_pct") or 0) > 0]
+    losses = [c for c in closed if (c.get("pnl_pct") or 0) <= 0]
+
+    exit_breakdown: dict = {}
+    for c in closed:
+        reason = c.get("exit_reason") or "unknown"
+        exit_breakdown[reason] = exit_breakdown.get(reason, 0) + 1
+
+    best = max(closed, key=lambda c: c.get("pnl_pct") or float("-inf")) if closed else None
+    worst = min(closed, key=lambda c: c.get("pnl_pct") or float("inf")) if closed else None
+
+    def _pick(c):
+        return {
+            "stock_id": c["stock_id"],
+            "name": c.get("name", c["stock_id"]),
+            "pnl_pct": c.get("pnl_pct"),
+            "pnl_amt": c.get("pnl_amt"),
+        }
+
+    return {
+        "date": datetime.now(_TW).strftime("%Y-%m-%d"),
+        "total_signals": _summary.get("today_signals", 0),
+        "total_trades": len(_trades),
+        "open_trades": _summary.get("open_trades", 0),
+        "closed_trades": _summary.get("closed", 0),
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": _summary.get("win_rate"),
+        "today_pnl_pct": _summary.get("today_pnl_pct", 0.0),
+        "today_pnl_amt": _summary.get("today_pnl_amt", 0.0),
+        "total_capital": _summary.get("total_capital", 0.0),
+        "used_quota": _summary.get("used_quota", 0.0),
+        "avg_win_pct": round(sum(c["pnl_pct"] for c in wins) / len(wins), 4) if wins else None,
+        "avg_loss_pct": round(sum(c["pnl_pct"] for c in losses) / len(losses), 4) if losses else None,
+        "best_trade": _pick(best) if best else None,
+        "worst_trade": _pick(worst) if worst else None,
+        "exit_reason_breakdown": exit_breakdown,
+        "risk_rejected": _summary.get("risk_rejected", 0),
+        "errors": _summary.get("errors", 0),
+        "last_updated": _summary.get("last_updated", ""),
+    }
+
+
+def _check_today(date: Optional[str]) -> str:
+    """驗證 date 參數僅支援今日（記憶體內資料，重啟或跨日會清空），回傳今日字串"""
+    today = datetime.now(_TW).strftime("%Y-%m-%d")
+    if date and date != today:
+        raise HTTPException(status_code=400, detail=f"僅支援查詢今日資料（{today}），尚未支援歷史日期查詢")
+    return today
+
+
+@app.get(
+    "/analysis/trade_timeline",
+    response_model=list[TimelineEvent],
+    tags=["分析"],
+    summary="今日交易時間軸（給前端 AI agent 分析用）",
+)
+def analysis_trade_timeline(date: Optional[str] = None, stock_id: Optional[str] = None):
+    """date: 選填，格式 YYYY-MM-DD，目前僅支援查詢今日。
+    stock_id: 選填，只回傳單一股票的時間軸。
+    """
+    _check_today(date)
+    with _lock:
+        timeline = _build_trade_timeline(stock_id)
+    print(f"[GET /analysis/trade_timeline] 回傳 {len(timeline)} 筆時間軸事件", flush=True)
+    return timeline
+
+
+@app.get(
+    "/analysis/summary",
+    response_model=TradeSummary,
+    tags=["分析"],
+    summary="今日交易摘要（給前端 AI agent 分析用）",
+)
+def analysis_summary(date: Optional[str] = None):
+    """date: 選填，格式 YYYY-MM-DD，目前僅支援查詢今日。"""
+    _check_today(date)
+    with _lock:
+        summary = _build_trade_summary()
+    print(f"[GET /analysis/summary] 回傳今日摘要", flush=True)
+    return summary
+
+
+@app.get(
+    "/api/inference/history/dates",
+    tags=["分析"],
+    summary="可回放日期清單（HF Hub 上實際有推論記錄的日期，由新到舊）",
+)
+def inference_history_dates():
+    """回傳 day_trade/inference/ 底下實際存在的日期清單，前端可用來決定回放功能的日期選單，
+    避免選到沒有資料的日期。回傳格式：{"dates": ["2026-07-09", "2026-07-08", ...]}
+    """
+    repo_id = _os.environ.get("HF_REPO_ID", "")
+    token = _os.environ.get("HF_TOKEN", "") or None
+    if not repo_id:
+        return {"dates": []}
+
+    import re as _re
+
+    from huggingface_hub import HfApi
+
+    try:
+        files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset", token=token)
+    except Exception as e:
+        print(f"[GET /api/inference/history/dates] HF Hub 查詢失敗: {e}", flush=True)
+        return {"dates": []}
+
+    pattern = _re.compile(rf"{_re.escape(_HF_INFERENCE_PREFIX)}/(\d{{4}}-\d{{2}}-\d{{2}})\.parquet$")
+    dates = sorted(
+        {m.group(1) for f in files if (m := pattern.match(f))},
+        reverse=True,
+    )
+    print(f"[GET /api/inference/history/dates] 回傳 {len(dates)} 個可回放日期", flush=True)
+    return {"dates": dates}
+
+
+@app.get(
+    "/api/inference/history",
+    response_model=list[InferenceRecord],
+    tags=["分析"],
+    summary="每分鐘推論歷史記錄（給前端分析使用）",
+)
+def inference_history(
+    date: Optional[str] = None,
+    stock_id: Optional[str] = None,
+    min_proba: float = 0.0,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    limit: int = 5000,
+):
+    """date: 選填，格式 YYYY-MM-DD，預設今日；今日走記憶體，過去日期從 HF Hub 下載（需已設定 HF_REPO_ID）。
+    stock_id: 選填，只回傳單一股票。
+    min_proba: 選填，只回傳 proba >= min_proba 的記錄（例如只看有效訊號）。
+    start_time / end_time: 選填，格式 HH:MM，篩選時間區間（含頭尾），例如 09:00~09:30。
+    limit: 回傳筆數上限，預設 5000，依 time 排序後截斷。
+    """
+    date_str = date or datetime.now(_TW).strftime("%Y-%m-%d")
+    df = _load_inference_day(date_str)
+    if df.empty:
+        return []
+    if stock_id:
+        df = df[df["stock_id"] == stock_id]
+    if min_proba > 0:
+        df = df[df["proba"] >= min_proba]
+    if start_time:
+        df = df[df["time"] >= start_time]
+    if end_time:
+        df = df[df["time"] <= end_time]
+    df = df.sort_values(["time", "stock_id"]).head(limit)
+    print(
+        f"[GET /api/inference/history] date={date_str} stock_id={stock_id} min_proba={min_proba} "
+        f"start_time={start_time} end_time={end_time} 回傳 {len(df)} 筆",
+        flush=True,
+    )
+    return df.to_dict("records")
+
+
+@app.get(
+    "/api/inference/evaluation",
+    response_model=list[InferenceEvalRecord],
+    tags=["分析"],
+    summary="推論訊號事後驗證明細（Triple Barrier 逐筆勝負，給前端分析使用）",
+)
+def inference_evaluation(
+    date: str,
+    stock_id: Optional[str] = None,
+    outcome: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    limit: int = 5000,
+):
+    """date: 必填，格式 YYYY-MM-DD，須是已執行過 scripts/evaluate_inference_log.py 的日期。
+    stock_id: 選填，只回傳單一股票。
+    outcome: 選填，win / loss / timeout_win / timeout_loss / unresolved。
+    start_time / end_time: 選填，格式 HH:MM，篩選時間區間（含頭尾），例如 09:00~09:30。
+    limit: 回傳筆數上限，預設 5000，依 time 排序後截斷。
+    """
+    df = _load_inference_eval_day(date)
+    if df.empty:
+        return []
+    if stock_id:
+        df = df[df["stock_id"] == stock_id]
+    if outcome:
+        df = df[df["outcome"] == outcome]
+    if start_time:
+        df = df[df["time"] >= start_time]
+    if end_time:
+        df = df[df["time"] <= end_time]
+    df = df.sort_values(["time", "stock_id"]).head(limit)
+    df = df.astype(object).where(df.notna(), None)
+    print(
+        f"[GET /api/inference/evaluation] date={date} stock_id={stock_id} outcome={outcome} "
+        f"start_time={start_time} end_time={end_time} 回傳 {len(df)} 筆",
+        flush=True,
+    )
+    return df.to_dict("records")
+
+
+@app.get(
+    "/api/inference/evaluation/summary",
+    response_model=InferenceEvalSummary,
+    tags=["分析"],
+    summary="推論訊號事後驗證摘要（勝率/損益/高信心度股票排行，給前端分析使用）",
+)
+def inference_evaluation_summary(date: str, start_time: Optional[str] = None, end_time: Optional[str] = None):
+    """date: 必填，格式 YYYY-MM-DD，須是已執行過 scripts/evaluate_inference_log.py 的日期。
+    start_time / end_time: 選填，格式 HH:MM，只計算這段時間內的訊號（例如只看主要交易時段 09:00~10:00）；
+    不帶則計算當天完整訊號時段。
+    """
+    df = _load_inference_eval_day(date)
+    if df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"找不到 {date} 的推論驗證資料，請先執行 scripts/evaluate_inference_log.py --date {date}",
+        )
+    if start_time:
+        df = df[df["time"] >= start_time]
+    if end_time:
+        df = df[df["time"] <= end_time]
+    if df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{date} 在 {start_time or '00:00'}~{end_time or '23:59'} 這段時間內沒有任何訊號",
+        )
+    summary = _build_eval_summary(df)
+    print(
+        f"[GET /api/inference/evaluation/summary] date={date} start_time={start_time} end_time={end_time} 回傳摘要",
+        flush=True,
+    )
+    return {"date": date, **summary}
 
 
 @app.get("/failed_orders", tags=["成交"], summary="今日失敗委託（含錯誤訊息）")
@@ -872,6 +1612,183 @@ async def event_stream(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Knowledge API（策略/模型/Feature/風控文件，供前端 AI Service 當 Knowledge Tool 用）──
+#
+# 資料來源：knowledge/<type>/<id>.md，type ∈ strategy | model | feature | risk
+# 檔案格式：選填 YAML-like frontmatter（title / updated_at） + Markdown 內容
+#   ---
+#   title: 標題
+#   updated_at: 2026-07-03
+#   ---
+#   內容...
+# 沒有 frontmatter 時，title 取檔內第一個 "# " 標題（找不到則用檔名），
+# updated_at 取檔案 mtime。純讀檔案，不做 RAG / Embedding / Vector DB。
+
+_KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
+_KNOWLEDGE_TYPES = ["strategy", "model", "feature", "risk"]
+
+
+class KnowledgeTopicSummary(BaseModel):
+    id: str
+    type: str
+    title: str
+    updated_at: str
+
+
+class KnowledgeTopic(BaseModel):
+    id: str
+    type: str
+    title: str
+    content: str
+    updated_at: str
+
+
+class KnowledgeSearchResult(BaseModel):
+    id: str
+    type: str
+    title: str
+    snippet: str
+
+
+class KnowledgeSearchResponse(BaseModel):
+    query: str
+    results: list[KnowledgeSearchResult]
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """解析簡易 frontmatter（純 key: value，不支援巢狀結構），回傳 (meta, body)"""
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    _, fm_raw, body = parts
+    meta = {}
+    for line in fm_raw.strip().splitlines():
+        if ":" in line:
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip()
+    return meta, body.lstrip("\n")
+
+
+def _load_knowledge_file(path: Path, ktype: str) -> dict:
+    text = path.read_text(encoding="utf-8")
+    meta, body = _parse_frontmatter(text)
+    title = meta.get("title")
+    if not title:
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                title = stripped.lstrip("#").strip()
+                break
+    title = title or path.stem
+    updated_at = meta.get("updated_at") or datetime.fromtimestamp(
+        path.stat().st_mtime, _TW
+    ).strftime("%Y-%m-%d")
+    return {
+        "id": path.stem,
+        "type": ktype,
+        "title": title,
+        "content": body.strip(),
+        "updated_at": updated_at,
+    }
+
+
+def _load_all_knowledge(type_filter: Optional[str] = None) -> list[dict]:
+    docs = []
+    if not _KNOWLEDGE_DIR.exists():
+        return docs
+    types = [type_filter] if type_filter else _KNOWLEDGE_TYPES
+    for ktype in types:
+        d = _KNOWLEDGE_DIR / ktype
+        if not d.exists():
+            continue
+        for f in sorted(d.glob("*.md")):
+            try:
+                docs.append(_load_knowledge_file(f, ktype))
+            except Exception as e:
+                print(f"[KNOWLEDGE] 讀取 {f} 失敗: {e}", flush=True)
+    return docs
+
+
+def _find_knowledge_doc(topic_id: str) -> Optional[dict]:
+    for ktype in _KNOWLEDGE_TYPES:
+        f = _KNOWLEDGE_DIR / ktype / f"{topic_id}.md"
+        if f.exists():
+            return _load_knowledge_file(f, ktype)
+    return None
+
+
+def _make_snippet(content: str, query: str, width: int = 60) -> str:
+    idx = content.lower().find(query.lower())
+    if idx == -1:
+        snippet = content[: width * 2].strip()
+        return snippet + ("..." if len(content) > width * 2 else "")
+    start = max(0, idx - width)
+    end = min(len(content), idx + len(query) + width)
+    snippet = content[start:end].strip()
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(content) else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
+@app.get(
+    "/api/knowledge/topics/",
+    response_model=list[KnowledgeTopicSummary],
+    tags=["知識庫"],
+    summary="知識庫主題列表",
+)
+def knowledge_topics(type: Optional[str] = None):
+    """type: 選填，strategy / model / feature / risk 其中之一；不帶則回傳全部"""
+    if type and type not in _KNOWLEDGE_TYPES:
+        raise HTTPException(status_code=400, detail=f"type 必須是 {_KNOWLEDGE_TYPES} 其中之一")
+    docs = _load_all_knowledge(type)
+    print(f"[GET /api/knowledge/topics/] 回傳 {len(docs)} 筆主題", flush=True)
+    return [
+        {"id": d["id"], "type": d["type"], "title": d["title"], "updated_at": d["updated_at"]}
+        for d in docs
+    ]
+
+
+@app.get(
+    "/api/knowledge/topics/{topic}/",
+    response_model=KnowledgeTopic,
+    tags=["知識庫"],
+    summary="知識庫主題詳情",
+)
+def knowledge_topic_detail(topic: str):
+    doc = _find_knowledge_doc(topic)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"找不到知識庫主題：{topic}")
+    return doc
+
+
+@app.get(
+    "/api/knowledge/search/",
+    response_model=KnowledgeSearchResponse,
+    tags=["知識庫"],
+    summary="知識庫全文搜尋",
+)
+def knowledge_search(q: str = ""):
+    q = q.strip()
+    if not q:
+        return {"query": q, "results": []}
+    results = []
+    for doc in _load_all_knowledge():
+        haystack = f"{doc['title']}\n{doc['content']}"
+        if q.lower() in haystack.lower():
+            results.append(
+                {
+                    "id": doc["id"],
+                    "type": doc["type"],
+                    "title": doc["title"],
+                    "snippet": _make_snippet(doc["content"], q),
+                }
+            )
+    print(f"[GET /api/knowledge/search/] q={q!r} 回傳 {len(results)} 筆結果", flush=True)
+    return {"query": q, "results": results}
 
 
 # ── Start（由 live_trader.py 呼叫）───────────────────────────────────────────

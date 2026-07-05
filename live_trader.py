@@ -20,7 +20,6 @@
 """
 
 import builtins as _builtins
-import calendar
 import sys
 import threading
 import time
@@ -44,9 +43,11 @@ from api import (
     append_system_log as _log_sys,
     get_uvicorn_config,
     push_candles,
+    push_inference_log,
     push_monitoring,
     push_signals,
     set_collector_status,
+    tw_naive_to_epoch,
     update_positions_price,
 )
 from strategy.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
@@ -135,7 +136,8 @@ if not _day.empty:
             _last_min = str(_m1_now["date"].max())
             print(f"  → {len(_m1_now):,} 筆，{_m1_now['stock_id'].nunique():,} 支，最新分鐘：{_last_min}", flush=True)
             _init_results = predict_live(
-                _last_min, _day,
+                _last_min,
+                _day,
                 day_trade_stocks=_day_trade_stocks,
                 m1_live=_m1_now,
             )
@@ -167,6 +169,7 @@ if TRADE_MODE != "off":
             _executor.startup_sltp_check()
         if hasattr(_executor, "close_stock_now"):
             from api import register_close_now
+
             register_close_now(_executor.close_stock_now)
     except Exception as e:
         print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
@@ -180,7 +183,7 @@ def _daily_refresh():
     while True:
         now = datetime.now(_TW)
         today = now.date()
-        need_refresh = (last_refresh != today and now.hour == 6 and now.minute >= 0)
+        need_refresh = last_refresh != today and now.hour == 6 and now.minute >= 0
         # 啟動時若日K是空的（非盤中跳過）且已過 06:00，立即補載
         need_refresh = need_refresh or (last_refresh is None and _day.empty and now.hour >= 6)
         if need_refresh:
@@ -235,7 +238,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             candles = []
             for _, row in g.iterrows():
                 dt = datetime.strptime(str(row["date"]), "%Y-%m-%d %H:%M:%S")
-                ts = calendar.timegm(dt.timetuple())
+                ts = tw_naive_to_epoch(dt)
                 candles.append(
                     {
                         "time": ts,
@@ -265,6 +268,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     threshold = float(get_setting("threshold") or THRESHOLD)
 
     push_monitoring(minute_str, all_results, threshold)
+    push_inference_log(minute_str, all_results, threshold)
 
     # 用最新分K收盤價更新持倉卡片浮動損益（今日損益只計已實現，不含此處）
     price_map = {r["stock_id"]: r["price"] for r in all_results}
@@ -306,6 +310,7 @@ def _force_close_eod():
     """
     global _force_close_done_date
     from api import get_setting
+
     while True:
         now = datetime.now(_TW)
         today = now.date()
@@ -343,6 +348,7 @@ def _on_rate_limited():
     """Fugle 429 時推送前端警示。"""
     try:
         from api import push_alert
+
         push_alert("Fugle REST API 限流，使用快取分K繼續監控（SL/TP 仍有效）", level="warning")
     except Exception:
         pass
@@ -350,8 +356,7 @@ def _on_rate_limited():
 
 def _start_collector():
     """M1RestPoller 收集器執行緒，異常時更新 collector 狀態供 /health 回傳。"""
-    collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks,
-                             on_rate_limited=_on_rate_limited)
+    collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks, on_rate_limited=_on_rate_limited)
     try:
         set_collector_status("running")
         collector.start()
