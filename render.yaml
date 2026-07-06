@@ -7,3 +7,11 @@ services:
     envVars:
       - key: FUGLE
         sync: false   # 在 Render dashboard 手動填入 API Key
+      - key: SESSION_END_HOUR
+        value: "13"   # 推論/監控時段結束時間；不設則 code 預設 10，導致過 10 點監控全空
+      - key: SESSION_END_MIN
+        value: "0"
+      - key: REST_POLL_END_HOUR
+        value: "13"   # REST 收盤邊界：延伸到 13:30，SESSION_END 後停止開倉但繼續 SL/TP
+      - key: REST_POLL_END_MIN
+        value: "30"
