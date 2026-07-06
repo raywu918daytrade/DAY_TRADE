@@ -350,6 +350,34 @@ def list_orders_today(api: sj.Shioaji) -> list[dict]:
     return result
 
 
+def get_trading_limits(api: sj.Shioaji) -> dict | None:
+    """永豐 trading_limits() 原始欄位，供測試/確認是否等同當沖核准額度用。"""
+    limits = api.trading_limits(api.stock_account)
+    if getattr(limits, "errmsg", None):
+        print(f"[TRADING LIMITS] 查詢失敗: {limits.errmsg}", flush=True)
+        return None
+    return {
+        "trading_limit": limits.trading_limit,
+        "trading_used": limits.trading_used,
+        "trading_available": limits.trading_available,
+        "margin_limit": limits.margin_limit,
+        "margin_used": limits.margin_used,
+        "margin_available": limits.margin_available,
+        "short_limit": limits.short_limit,
+        "short_used": limits.short_used,
+        "short_available": limits.short_available,
+    }
+
+
+def get_account_balance(api: sj.Shioaji) -> float | None:
+    """股票帳戶現金餘額（永豐 acc_balance）。僅供 dashboard 顯示參考，非官方當沖核准額度。"""
+    balance = api.account_balance()
+    if getattr(balance, "errmsg", None):
+        print(f"[ACCOUNT BALANCE] 查詢失敗: {balance.errmsg}", flush=True)
+        return None
+    return float(balance.acc_balance)
+
+
 def get_settlements(api: sj.Shioaji) -> list:
     """交割明細（對帳單）"""
     print("交割明細（對帳單）")

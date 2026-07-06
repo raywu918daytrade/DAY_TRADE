@@ -229,9 +229,8 @@ class LiveTrader:
     """
 
     def __init__(self, total_capital: float = 1_000_000, simulation: bool = True, name_lookup=None):
+        # 當沖總額度：當日買賣合計金額共用同一個額度，買進、平倉都會扣，不因平倉歸還。
         self.total_capital = total_capital
-        # 現股當沖：買賣各佔一半資金。外部傳入總資金（如 200萬），內部自動取一半（100萬）作為買入上限。
-        self._buy_capital: float = total_capital / 2
         self.simulation = simulation
         self._api = None
         self._broker: "BrokerClient | None" = None  # 連線後建立
@@ -367,17 +366,23 @@ class LiveTrader:
         avg_pnl = round(sum(c["pnl_pct"] for c in completed_trades) / closed, 4) if closed else 0.0
         total_pnl_amt = round(sum(c.get("pnl_amt") or 0 for c in completed_trades), 0)
 
-        # 已用額度 = 目前持倉買入成本（當沖資金循環：平倉後歸還，不累計賣出）
+        # 已用額度 = 當日買賣合計成交金額（買進、平倉都扣，不因平倉歸還）
+        # 直接從當日委託重算（非累加），避免重複扣款；未成交單 filled=0 自動不計入
         used_quota = round(
-            sum(p["entry_price"] * p["quantity"] * 1000 for p in positions),
+            sum(t["price"] * t["filled"] * 1000 for t in trades),
             0,
         )
-        filled_set = {"FILLED", "PARTIAL"}
         # 開倉成交 = FILLED 買進筆數；平倉回合 = FIFO 配對數（closed）
         filled = {"FILLED", "PARTIAL"}
         open_count = sum(1 for t in trades if t.get("direction") == "buy" and t.get("status") in filled)
         failed_count = sum(1 for t in trades if t.get("status") == "FAILED")
         last_updated = _fmt_time(orders[-1]["time"]) if orders else _now()
+
+        try:
+            broker_balance = trade_api.get_account_balance(self._api)
+        except Exception as e:
+            print(f"[LIVE SYNC] 查詢永豐帳戶餘額失敗: {e}", flush=True)
+            broker_balance = None
 
         _sync_broker_snapshot(
             positions,
@@ -390,8 +395,9 @@ class LiveTrader:
                 "today_pnl_amt": total_pnl_amt,
                 "open_trades": open_count,
                 "closed": closed,
-                "total_capital": self._buy_capital,
+                "total_capital": self.total_capital,
                 "used_quota": used_quota,
+                "broker_balance": broker_balance,
                 "errors": failed_count,
                 "last_updated": last_updated,
             },
@@ -554,7 +560,6 @@ class LiveTrader:
         cap_override = _get_setting("total_capital")
         if cap_override is not None:
             self.total_capital = float(cap_override)
-            self._buy_capital = self.total_capital / 2  # 買入上限 = 總額 / 2
 
         sig_map = {s["stock_id"]: s for s in signals}
         target = set(sig_map)
@@ -714,9 +719,10 @@ class LiveTrader:
             f"[RECONCILE] 交易計畫：開倉 {len(to_open)}、平倉 {len(to_close)}（含SL/TP）、待核實 買={len(pending_buy)} 賣={len(pending_sell)}",
             flush=True,
         )
-        # 已用額度 = 已成交持倉成本 + 仍 SENT 中的買單（cancel 失敗時也不低估）
+        # 已用額度 = 當日買賣合計成交金額（買進、平倉都扣，不因平倉歸還）+ 仍 SENT 中未成交買單（預先保留）
+        # 直接從當日委託重算（非累加），避免重複扣款；未成交單 filled=0 自動不計入
         self._used_quota = round(
-            sum(p["avg_price"] * p["quantity"] * 1000 for p in current.values()), 0
+            sum(o["price"] * o.get("filled", 0) * 1000 for o in pending_orders), 0
         )
         _pending_buy_reserve = round(sum(
             o["price"] * max(0, o["quantity"] - o.get("filled", 0)) * 1000
@@ -726,16 +732,33 @@ class LiveTrader:
         if _pending_buy_reserve > 0:
             print(f"[QUOTA] SENT 買單保留額度 {_pending_buy_reserve/10000:.1f}萬（cancel 失敗或尚未確認）", flush=True)
         self._used_quota = round(self._used_quota + _pending_buy_reserve, 0)
-        available = max(0.0, self._buy_capital - self._used_quota)
-        _push_summary({"used_quota": self._used_quota, "total_capital": self._buy_capital,
-                       "available": available})
+        available = max(0.0, self.total_capital - self._used_quota)
+        try:
+            broker_balance = trade_api.get_account_balance(self._api)
+        except Exception as e:
+            print(f"[RECONCILE] 查詢永豐帳戶餘額失敗: {e}", flush=True)
+            broker_balance = None
+        _push_summary({"used_quota": self._used_quota, "total_capital": self.total_capital,
+                       "available": available, "broker_balance": broker_balance})
 
         if not to_open and not to_close:
             print(f"[RECONCILE] 無新增交易，完成", flush=True)
             return
 
-        # 買入預算 = 買入上限（_buy_capital = total_capital/2） / 本分鐘訊號支數
-        budget = self._buy_capital / max(len(target), 1)
+        # 買新倉前先保留「目前持倉之後平倉」也要再扣一次額度的空間，
+        # 避免把 available 全部買光，導致持倉平倉時卡在額度不足送不出賣單
+        _open_position_reserve = round(
+            sum(p["avg_price"] * p["quantity"] * 1000 for p in current.values()), 0
+        )
+        safe_buy_room = max(0.0, available - _open_position_reserve)
+        if _open_position_reserve > 0:
+            print(
+                f"[QUOTA] 持倉平倉預留 {_open_position_reserve/10000:.1f}萬，買進安全額度剩 {safe_buy_room/10000:.1f}萬",
+                flush=True,
+            )
+
+        # 買入預算 = 買進安全額度 / 本分鐘訊號支數（實際仍受 safe_buy_room 限制，見下方 min）
+        budget = safe_buy_room / max(len(target), 1)
         snapshots: dict[str, float] = {}
 
         if to_open:
@@ -771,14 +794,14 @@ class LiveTrader:
                 if cfg_max_budget_stock is not None:
                     stock_budget = float(cfg_max_budget_stock) * 10000
                 else:
-                    stock_budget = budget  # _buy_capital / N
-                stock_budget = min(stock_budget, available)  # 不超過剩餘可用額度
+                    stock_budget = budget  # safe_buy_room / N
+                stock_budget = min(stock_budget, safe_buy_room)  # 不超過扣除平倉預留後的安全額度
 
                 # 每張有效成本含手續費緩衝（確保不因小數截斷而超額）
                 effective_lot_cost = price * 1000 * lot_cost_factor
                 lots = int(stock_budget / effective_lot_cost)
                 if lots < 1:
-                    print(f"[LIVE SKIP] {sid} 額度不足（可用 {available/10000:.1f}萬，需 {price/10:.1f}萬/張）")
+                    print(f"[LIVE SKIP] {sid} 額度不足（買進安全額度 {safe_buy_room/10000:.1f}萬，需 {price/10:.1f}萬/張）")
                     continue
 
                 if self._broker:
@@ -788,10 +811,13 @@ class LiveTrader:
                 status = trade_api.normalize_status(trade.status.status)
                 order_id = getattr(getattr(trade, "order", None), "id", "") or ""
                 buy_cost = price * lots * 1000
-                available -= buy_cost  # 本分鐘內給後續股票用；下次 reconcile 從 broker 重算
+                # 本分鐘內給後續股票用；下次 reconcile 從 broker 重算。
+                # 新買的部位之後也要平倉，safe_buy_room 要多扣一次（買進本身 + 預留平倉）
+                available -= buy_cost
+                safe_buy_room = max(0.0, safe_buy_room - buy_cost * 2)
                 print(
                     f"[LIVE OPEN] {sid} {lots}張 @ {price} → {status} [{order_id}]"
-                    f"（剩餘可用 {available/10000:.1f}萬）"
+                    f"（剩餘可用 {available/10000:.1f}萬，買進安全額度 {safe_buy_room/10000:.1f}萬）"
                 )
                 _log_trade(sid, "buy", f"{lots}張@{price} [{order_id}]", status)
                 _push_trade(
@@ -863,7 +889,7 @@ class LiveTrader:
         _push_summary(
             {
                 "used_quota": self._used_quota,
-                "total_capital": self._buy_capital,
+                "total_capital": self.total_capital,
             }
         )
         print(

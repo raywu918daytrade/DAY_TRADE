@@ -356,8 +356,9 @@ _SUMMARY_DEFAULT: dict = {
     "win_rate": None,
     "today_pnl_pct": 0.0,
     "today_pnl_amt": 0.0,  # 今日已實現損益（元，估算）
-    "total_capital": 0.0,  # 當沖總額度（元），來自 TOTAL_CAPITAL 環境變數
+    "total_capital": 0.0,  # 當沖總額度（元），使用者設定值，來自 settings.json / TOTAL_CAPITAL 環境變數
     "used_quota": 0.0,  # 今日已用額度 = 買入金額 + 賣出金額
+    "broker_balance": None,  # 永豐帳戶現金餘額（元），僅供顯示參考，非官方當沖核准額度
     "today_signals": 0,
     "risk_rejected": 0,
     "errors": 0,
