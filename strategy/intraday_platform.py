@@ -188,5 +188,8 @@ if __name__ == "__main__":
     from strategy.date_trade_model import predict
 
     df_proba = predict()  # 載入已訓練模型並產生預測機率
-    portfolio_df, trades_df = run_backtest(df_proba)
+    portfolio_df, trades_df = run_backtest(
+        df_proba,
+        threshold=0.60,
+    )
     print_trades(trades_df)

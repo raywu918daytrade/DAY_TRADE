@@ -12,14 +12,21 @@
 
 資料來源
     分K (db/m1/)      ：還原股價歷史1分鐘OHLCV，所有股票合併訓練
+                         3/5分鐘K由1分鐘OHLCV滾動聚合產生
     日K (db/day_trade/)：還原股價歷史日線，提供趨勢背景特徵
 
 特徵
-    分K 特徵：
-        ret_1/3/5/10/20/30  當前收盤相對N分鐘前的報酬率
-        vol_ratio           當前成交量 / 20分鐘均量
+    1分鐘分K 特徵：
+        ret_1/3/5/10/15     當前收盤相對N分鐘前的報酬率
+        vol_ratio           當前成交量 / 15分鐘均量
         close_pos           close 在當根 (high-low) 的相對位置 [0,1]
         hour / minute       盤中時間（捕捉開收盤效應）
+    多週期分K 特徵（3/5分鐘K，由當下與過去1分鐘K滾動聚合，不使用未來資料）：
+        tf3_*/tf5_*          多週期報酬率、量比、K棒位置、振幅、低點反彈
+    過去K線序列特徵：
+        k1_*_lag_0~14        最近15根1分鐘K
+        k3_*_lag_0~4         最近5根3分鐘K（每分鐘滾動、每根間隔3分鐘）
+        k5_*_lag_0~2         最近3根5分鐘K（每分鐘滾動、每根間隔5分鐘）
     當日盤中特徵（累積計算，不含未來資料）：
         price_vs_open       close vs 今日開盤（當日漲跌幅）
         vwap_dev            close vs 今日累積VWAP（強弱位置）
@@ -69,14 +76,22 @@ if str(Path(__file__).parent.parent) not in sys.path:
 from data.query import load_day, load_m1, load_m1_live
 
 _MODEL_PATH = Path(__file__).parent.parent / "models/m1_lgbm.pkl"
+_ROOT = Path(__file__).parent.parent
+load_dotenv(_ROOT / ".env")
 
 # Triple Barrier 參數（需與回測保持一致）
 TP_PCT = 0.03  # 停利 3%
 SL_PCT = 0.03  # 停損 3%
 HOLD_BARS = 30  # 最多持有分K數
 
-_ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+# 多週期特徵：以1分鐘K為基礎，滾動聚合出3/5分鐘K。
+MULTI_TIMEFRAME_MINUTES = (3, 5)
+MULTI_TIMEFRAME_RET_BARS = (1, 2, 3)
+MULTI_TIMEFRAME_VOL_MA_BARS = 5
+KLINE_SEQUENCE_WINDOWS = {1: 15, 3: 5, 5: 3}
+KLINE_SEQUENCE_VOL_MA_BARS = 5
+KLINE_SEQUENCE_PARTS = ("ret", "body", "range", "close_pos", "vol_ratio")
+USE_KLINE_SEQUENCE_FEATURES = os.environ.get("USE_KLINE_SEQUENCE_FEATURES", "0").lower() in {"1", "true", "yes"}
 
 # 訓練/推論的交易時段；可用 .env 覆寫（本機測試用）
 SESSION_START = (9, 1)  # 9:01（第一根完整分K）
@@ -122,11 +137,117 @@ def _make_barrier_labels(m1: pd.DataFrame) -> pd.Series:
 # ── 特徵工程 ──────────────────────────────────────────────────────────────────
 
 
-def make_features(m1: pd.DataFrame, day: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame:
+def _add_multi_timeframe_features(m1: pd.DataFrame) -> pd.DataFrame:
+    """由1分鐘K滾動聚合出3/5分鐘K特徵；每列只使用當下與過去資料。"""
+    temp_cols: list[str] = []
+
+    for minutes in MULTI_TIMEFRAME_MINUTES:
+        prefix = f"tf{minutes}"
+        g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+
+        open_col = f"_{prefix}_open"
+        high_col = f"_{prefix}_high"
+        low_col = f"_{prefix}_low"
+        volume_col = f"_{prefix}_volume"
+        vol_ma_col = f"_{prefix}_vol_ma{MULTI_TIMEFRAME_VOL_MA_BARS}"
+        temp_cols.extend([open_col, high_col, low_col, volume_col, vol_ma_col])
+
+        m1[open_col] = g_day["open"].transform(lambda x, n=minutes: x.shift(n - 1))
+        m1[high_col] = g_day["high"].transform(lambda x, n=minutes: x.rolling(n, min_periods=n).max())
+        m1[low_col] = g_day["low"].transform(lambda x, n=minutes: x.rolling(n, min_periods=n).min())
+        m1[volume_col] = g_day["volume"].transform(lambda x, n=minutes: x.rolling(n, min_periods=n).sum())
+
+        for bars in MULTI_TIMEFRAME_RET_BARS:
+            lag = minutes * bars
+            m1[f"{prefix}_ret_{bars}"] = g_day["close"].transform(lambda x, l=lag: x.pct_change(l))
+
+        g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+        m1[vol_ma_col] = g_day[volume_col].transform(
+            lambda x: x.rolling(MULTI_TIMEFRAME_VOL_MA_BARS, min_periods=MULTI_TIMEFRAME_VOL_MA_BARS).mean()
+        )
+        m1[f"{prefix}_vol_ratio"] = m1[volume_col] / m1[vol_ma_col].replace(0, np.nan)
+
+        tf_range = (m1[high_col] - m1[low_col]).replace(0, np.nan)
+        m1[f"{prefix}_close_pos"] = (m1["close"] - m1[low_col]) / tf_range
+        m1[f"{prefix}_range_pct"] = tf_range / m1[open_col].replace(0, np.nan)
+        m1[f"{prefix}_reversal"] = (m1["close"] - m1[low_col]) / m1[low_col].replace(0, np.nan)
+
+    return m1.drop(columns=temp_cols)
+
+
+def _add_kline_sequence_features(m1: pd.DataFrame) -> pd.DataFrame:
+    """展開過去1/3/5分鐘K序列；lag_0是截至當前分鐘的最新一根。"""
+    temp_cols: list[str] = []
+    sequence_data: dict[str, pd.Series] = {}
+
+    for minutes, n_lags in KLINE_SEQUENCE_WINDOWS.items():
+        prefix = f"k{minutes}"
+        g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+
+        open_col = f"_{prefix}_open"
+        high_col = f"_{prefix}_high"
+        low_col = f"_{prefix}_low"
+        close_col = f"_{prefix}_close"
+        volume_col = f"_{prefix}_volume"
+        vol_ma_col = f"_{prefix}_vol_ma{KLINE_SEQUENCE_VOL_MA_BARS}"
+        temp_cols.extend([open_col, high_col, low_col, close_col, volume_col, vol_ma_col])
+
+        if minutes == 1:
+            m1[open_col] = m1["open"]
+            m1[high_col] = m1["high"]
+            m1[low_col] = m1["low"]
+            m1[close_col] = m1["close"]
+            m1[volume_col] = m1["volume"]
+        else:
+            m1[open_col] = g_day["open"].transform(lambda x, n=minutes: x.shift(n - 1))
+            m1[high_col] = g_day["high"].transform(lambda x, n=minutes: x.rolling(n, min_periods=n).max())
+            m1[low_col] = g_day["low"].transform(lambda x, n=minutes: x.rolling(n, min_periods=n).min())
+            m1[close_col] = m1["close"]
+            m1[volume_col] = g_day["volume"].transform(lambda x, n=minutes: x.rolling(n, min_periods=n).sum())
+
+        g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+        m1[vol_ma_col] = g_day[volume_col].transform(
+            lambda x: x.rolling(KLINE_SEQUENCE_VOL_MA_BARS, min_periods=KLINE_SEQUENCE_VOL_MA_BARS).mean()
+        )
+
+        for lag in range(n_lags):
+            shift = minutes * lag
+            prev_shift = shift + minutes
+
+            shifted_open = g_day[open_col].transform(lambda x, s=shift: x.shift(s))
+            shifted_high = g_day[high_col].transform(lambda x, s=shift: x.shift(s))
+            shifted_low = g_day[low_col].transform(lambda x, s=shift: x.shift(s))
+            shifted_close = g_day[close_col].transform(lambda x, s=shift: x.shift(s))
+            shifted_volume = g_day[volume_col].transform(lambda x, s=shift: x.shift(s))
+            shifted_vol_ma = g_day[vol_ma_col].transform(lambda x, s=shift: x.shift(s))
+            prev_close = g_day[close_col].transform(lambda x, s=prev_shift: x.shift(s))
+
+            k_range = (shifted_high - shifted_low).replace(0, np.nan)
+            sequence_data[f"{prefix}_ret_lag_{lag}"] = shifted_close / prev_close.replace(0, np.nan) - 1
+            sequence_data[f"{prefix}_body_lag_{lag}"] = shifted_close / shifted_open.replace(0, np.nan) - 1
+            sequence_data[f"{prefix}_range_lag_{lag}"] = k_range / shifted_open.replace(0, np.nan)
+            sequence_data[f"{prefix}_close_pos_lag_{lag}"] = (shifted_close - shifted_low) / k_range
+            sequence_data[f"{prefix}_vol_ratio_lag_{lag}"] = shifted_volume / shifted_vol_ma.replace(0, np.nan)
+
+    sequence_df = pd.DataFrame(sequence_data, index=m1.index).astype("float32")
+    m1 = pd.concat([m1, sequence_df], axis=1)
+    return m1.drop(columns=temp_cols)
+
+
+def make_features(
+    m1: pd.DataFrame,
+    day: pd.DataFrame,
+    compute_labels: bool = True,
+    include_kline_sequence: bool | None = None,
+) -> pd.DataFrame:
     m1 = m1.copy()
     day = day.copy()
+    if include_kline_sequence is None:
+        include_kline_sequence = USE_KLINE_SEQUENCE_FEATURES
     m1["date"] = pd.to_datetime(m1["date"])
     day["date"] = pd.to_datetime(day["date"])
+    m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
+    day = day.sort_values(["stock_id", "date"]).reset_index(drop=True)
     # 先建 day_date，供後面日內分組使用
     m1["day_date"] = m1["date"].dt.date
 
@@ -144,6 +265,13 @@ def make_features(m1: pd.DataFrame, day: pd.DataFrame, compute_labels: bool = Tr
     # close 在當根 high-low 的位置
     bar_range = (m1["high"] - m1["low"]).replace(0, np.nan)
     m1["close_pos"] = (m1["close"] - m1["low"]) / bar_range
+
+    # 3/5分鐘K多週期特徵（由1分鐘K滾動聚合；不跨日、不使用未來資料）
+    m1 = _add_multi_timeframe_features(m1)
+
+    # 過去1/3/5分鐘K序列特徵（每分鐘滾動，讓模型看見近期K線形狀）
+    if include_kline_sequence:
+        m1 = _add_kline_sequence_features(m1)
 
     # 時間特徵
     m1["hour"] = m1["date"].dt.hour
@@ -215,7 +343,26 @@ def make_features(m1: pd.DataFrame, day: pd.DataFrame, compute_labels: bool = Tr
     return m1
 
 
-FEATURES = [
+MULTI_TIMEFRAME_FEATURES = [
+    feature
+    for minutes in MULTI_TIMEFRAME_MINUTES
+    for feature in (
+        *[f"tf{minutes}_ret_{bars}" for bars in MULTI_TIMEFRAME_RET_BARS],
+        f"tf{minutes}_vol_ratio",
+        f"tf{minutes}_close_pos",
+        f"tf{minutes}_range_pct",
+        f"tf{minutes}_reversal",
+    )
+]
+
+KLINE_SEQUENCE_FEATURES = [
+    f"k{minutes}_{part}_lag_{lag}"
+    for minutes, n_lags in KLINE_SEQUENCE_WINDOWS.items()
+    for lag in range(n_lags)
+    for part in KLINE_SEQUENCE_PARTS
+]
+
+PRE_SEQUENCE_FEATURES = [
     # 分K 報酬率（日內，最長15根，9:16起有效）
     "ret_1",
     "ret_3",
@@ -225,6 +372,8 @@ FEATURES = [
     # 量比、K線形態
     "vol_ratio",
     "close_pos",
+    # 3/5分鐘多週期分K特徵
+    *MULTI_TIMEFRAME_FEATURES,
     # 時間
     "hour",
     "minute",
@@ -246,6 +395,63 @@ FEATURES = [
     *[f"day_vol_{i}" for i in range(1, 11)],
 ]
 
+ALL_FEATURES = [*PRE_SEQUENCE_FEATURES, *KLINE_SEQUENCE_FEATURES]
+FEATURES = ALL_FEATURES if USE_KLINE_SEQUENCE_FEATURES else PRE_SEQUENCE_FEATURES
+
+_MULTI_TIMEFRAME_FEATURE_SET = set(MULTI_TIMEFRAME_FEATURES)
+_KLINE_SEQUENCE_FEATURE_SET = set(KLINE_SEQUENCE_FEATURES)
+LEGACY_FEATURES = [
+    feature
+    for feature in PRE_SEQUENCE_FEATURES
+    if feature not in _MULTI_TIMEFRAME_FEATURE_SET and feature not in _KLINE_SEQUENCE_FEATURE_SET
+]
+
+
+def _model_features(model) -> list[str]:
+    """使用模型訓練時的欄位；新模型才會吃完整多週期 FEATURES。"""
+    known_features = set(ALL_FEATURES)
+    feature_names = getattr(model, "feature_name_", None)
+    if feature_names and set(feature_names).issubset(known_features):
+        return list(feature_names)
+    booster = getattr(model, "booster_", None)
+    if booster is not None:
+        try:
+            feature_names = booster.feature_name()
+        except Exception:
+            feature_names = None
+        if feature_names and set(feature_names).issubset(known_features):
+            return list(feature_names)
+
+    n_features = getattr(model, "n_features_in_", None)
+    if n_features == len(LEGACY_FEATURES):
+        return LEGACY_FEATURES
+    if n_features == len(PRE_SEQUENCE_FEATURES):
+        return PRE_SEQUENCE_FEATURES
+    if n_features == len(ALL_FEATURES):
+        return ALL_FEATURES
+    if n_features == len(FEATURES):
+        return FEATURES
+
+    if booster is not None:
+        try:
+            n_features = booster.num_feature()
+        except Exception:
+            n_features = None
+        if n_features == len(LEGACY_FEATURES):
+            return LEGACY_FEATURES
+        if n_features == len(PRE_SEQUENCE_FEATURES):
+            return PRE_SEQUENCE_FEATURES
+        if n_features == len(ALL_FEATURES):
+            return ALL_FEATURES
+        if n_features == len(FEATURES):
+            return FEATURES
+
+    return FEATURES
+
+
+def _needs_kline_sequence(features: list[str]) -> bool:
+    return any(feature in _KLINE_SEQUENCE_FEATURE_SET for feature in features)
+
 
 # ── 訓練 ──────────────────────────────────────────────────────────────────────
 
@@ -260,8 +466,10 @@ def train(test_days: int = 10):
     print(f"  {len(day):,} 筆")
 
     print("特徵工程...")
-    df = make_features(m1, day)
+    df = make_features(m1, day, include_kline_sequence=USE_KLINE_SEQUENCE_FEATURES)
     df = df.dropna(subset=FEATURES + ["target"])
+    seq_msg = "，含過去K線序列" if USE_KLINE_SEQUENCE_FEATURES else ""
+    print(f"  使用特徵: {len(FEATURES)} 欄（含 1/3/5 分鐘K{seq_msg}）")
 
     # 只保留早盤時段（盤中動能窗口，label 仍看當日整段未來）
     hhmm = df["hour"] * 100 + df["minute"]
@@ -362,18 +570,24 @@ def predict_live(
             day["date"] = pd.to_datetime(day["date"])
             day = day.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
-    df = make_features(m1_live, day, compute_labels=False)
+    model_features = _model_features(model)
+    df = make_features(
+        m1_live,
+        day,
+        compute_labels=False,
+        include_kline_sequence=_needs_kline_sequence(model_features),
+    )
 
     current = df[df["date"] == pd.Timestamp(minute_str)]
     if current.empty:
         return []
 
     # 只保留特徵齊全的 bar（早盤前幾根 lag 特徵可能為 NaN）
-    valid = current.dropna(subset=FEATURES)
+    valid = current.dropna(subset=model_features)
     if valid.empty:
         return []
 
-    proba = model.predict_proba(valid[FEATURES])[:, 1]
+    proba = model.predict_proba(valid[model_features])[:, 1]
     signals = [
         {"stock_id": row["stock_id"], "proba": float(p), "price": float(row["close"])}
         for (_, row), p in zip(valid.iterrows(), proba)
@@ -392,13 +606,14 @@ def confidence_report(model=None, test_days: int = 10):
 
     m1 = load_m1()
     day = load_day()
-    df = make_features(m1, day)
-    df = df.dropna(subset=FEATURES + ["target"])
+    model_features = _model_features(model)
+    df = make_features(m1, day, include_kline_sequence=_needs_kline_sequence(model_features))
+    df = df.dropna(subset=model_features + ["target"])
 
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     test_df = df[df["date"] > cutoff].copy()
 
-    test_df["proba"] = model.predict_proba(test_df[FEATURES])[:, 1]
+    test_df["proba"] = model.predict_proba(test_df[model_features])[:, 1]
 
     bins = [0.0, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 1.01]
     labels = [
@@ -435,13 +650,14 @@ def coverage_report(model=None, test_days: int = 10):
 
     m1 = load_m1()
     day = load_day()
-    df = make_features(m1, day)
-    df = df.dropna(subset=FEATURES + ["target"])
+    model_features = _model_features(model)
+    df = make_features(m1, day, include_kline_sequence=_needs_kline_sequence(model_features))
+    df = df.dropna(subset=model_features + ["target"])
 
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     test_df = df[df["date"] > cutoff].copy()
 
-    test_df["proba"] = model.predict_proba(test_df[FEATURES])[:, 1]
+    test_df["proba"] = model.predict_proba(test_df[model_features])[:, 1]
 
     total_pos = test_df["target"].sum()  # 實際漲的總數
     total_neg = (test_df["target"] == 0).sum()
@@ -472,8 +688,9 @@ def predict(model=None) -> pd.DataFrame:
 
     m1 = load_m1()
     day = load_day()
-    df = make_features(m1, day)
-    df = df.dropna(subset=FEATURES)
+    model_features = _model_features(model)
+    df = make_features(m1, day, include_kline_sequence=_needs_kline_sequence(model_features))
+    df = df.dropna(subset=model_features)
 
     # 只保留早盤時段（與訓練一致）
     hhmm = df["hour"] * 100 + df["minute"]
@@ -481,7 +698,7 @@ def predict(model=None) -> pd.DataFrame:
         (hhmm >= SESSION_START[0] * 100 + SESSION_START[1]) & (hhmm <= SESSION_END[0] * 100 + SESSION_END[1])
     ].copy()
 
-    df["proba"] = model.predict_proba(df[FEATURES])[:, 1]
+    df["proba"] = model.predict_proba(df[model_features])[:, 1]
     df_proba = df.pivot(index="date", columns="stock_id", values="proba")
     return df_proba
 
@@ -498,8 +715,10 @@ def optimize_model(n_trials: int = 50, test_days: int = 10):
     print("載入資料...")
     m1 = load_m1()
     day = load_day()
-    df = make_features(m1, day)
+    df = make_features(m1, day, include_kline_sequence=USE_KLINE_SEQUENCE_FEATURES)
     df = df.dropna(subset=FEATURES + ["target"])
+    seq_msg = "，含過去K線序列" if USE_KLINE_SEQUENCE_FEATURES else ""
+    print(f"使用特徵: {len(FEATURES)} 欄（含 1/3/5 分鐘K{seq_msg}）")
 
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     train_df = df[df["date"] <= cutoff]
