@@ -95,8 +95,53 @@ def _make_barrier_labels(m1: pd.DataFrame) -> pd.Series:
 
 
 FEATURES = [
-    "ret_1",  # 前1分鐘報酬率（close 變動）
-    "vol_ratio",  # 當前量 / 15分鐘均量
+    # 1分鐘K OHLCV（價格除以當日開盤正規化，量除以當日累積均量）
+    "m1_open",
+    "m1_high",
+    "m1_low",
+    "m1_close",
+    "m1_volume",
+    # 3分鐘K OHLCV（當前 + 前2根，每根間隔3分鐘）
+    "m3_open",
+    "m3_high",
+    "m3_low",
+    "m3_close",
+    "m3_volume",
+    "m3_ret",  # 3分鐘K報酬率（K棒間變化%）
+    "m3_open_lag1",
+    "m3_high_lag1",
+    "m3_low_lag1",
+    "m3_close_lag1",
+    "m3_volume_lag1",
+    "m3_open_lag2",
+    "m3_high_lag2",
+    "m3_low_lag2",
+    "m3_close_lag2",
+    "m3_volume_lag2",
+    # 5分鐘K OHLCV（當前 + 前2根，每根間隔5分鐘）
+    "m5_open",
+    "m5_high",
+    "m5_low",
+    "m5_close",
+    "m5_volume",
+    "m5_ret",  # 5分鐘K報酬率（K棒間變化%）
+    "m5_open_lag1",
+    "m5_high_lag1",
+    "m5_low_lag1",
+    "m5_close_lag1",
+    "m5_volume_lag1",
+    "m5_open_lag2",
+    "m5_high_lag2",
+    "m5_low_lag2",
+    "m5_close_lag2",
+    "m5_volume_lag2",
+    # 報酬率與量比
+    "ret_1",
+    "vol_ratio",
+    "tf3_ret",
+    "tf3_vol_ratio",
+    "tf5_ret",
+    "tf5_vol_ratio",
 ]
 
 
@@ -105,10 +150,11 @@ def make_features(
     compute_labels: bool = True,
 ) -> pd.DataFrame:
     """
-    簡單特徵工程：只用 close 與 volume 衍生 2 個特徵。
+    簡單特徵工程：只用 close 與 volume 衍生特徵。
 
     回傳欄位：
-      ret_1, vol_ratio, target（若 compute_labels=True）
+      ret_1, vol_ratio, tf3_ret, tf3_vol_ratio, tf5_ret, tf5_vol_ratio,
+      target（若 compute_labels=True）
     """
     m1 = m1.copy()
     m1["date"] = pd.to_datetime(m1["date"])
@@ -117,11 +163,88 @@ def make_features(
 
     g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
 
-    # 特徵 1: 前1分鐘報酬率
+    # ── 當日開盤價（第一根 open）用於正規化 ──────────────────────────
+    day_open = g_day["open"].transform("first").replace(0, np.nan)
+
+    # ── 1分鐘K OHLCV（價格 / 當日開盤，量用當日累積均量正規化） ─────
+    m1["m1_open"] = m1["open"] / day_open
+    m1["m1_high"] = m1["high"] / day_open
+    m1["m1_low"] = m1["low"] / day_open
+    m1["m1_close"] = m1["close"] / day_open
+    # 量比（當前量 / 當日累積平均量）
+    m1["_cum_vol"] = g_day["volume"].transform("cumsum")
+    m1["_bar_count"] = g_day["volume"].transform("cumcount") + 1
+    m1["m1_volume"] = m1["volume"] / (m1["_cum_vol"] / m1["_bar_count"]).replace(0, np.nan)
+
+    # ── 3分鐘K OHLCV（由1分K滾動聚合，不跨日）───────────────────────
+    # 當前3分鐘K
+    m1["m3_open"] = g_day["open"].transform(lambda x: x.shift(2)) / day_open
+    m1["m3_high"] = g_day["high"].transform(lambda x: x.rolling(3).max()) / day_open
+    m1["m3_low"] = g_day["low"].transform(lambda x: x.rolling(3).min()) / day_open
+    m1["m3_close"] = m1["close"] / day_open
+    m1["m3_volume"] = g_day["volume"].transform(lambda x: x.rolling(3).sum().pct_change(3))
+    # 3分鐘K報酬率（K棒間變化%）
+    m1["m3_ret"] = g_day["close"].transform(lambda x: x.pct_change(3))
+    # 前1根3分鐘K（shift 3）
+    m1["m3_open_lag1"] = g_day["m3_open"].transform(lambda x: x.shift(3))
+    m1["m3_high_lag1"] = g_day["m3_high"].transform(lambda x: x.shift(3))
+    m1["m3_low_lag1"] = g_day["m3_low"].transform(lambda x: x.shift(3))
+    m1["m3_close_lag1"] = g_day["m3_close"].transform(lambda x: x.shift(3))
+    m1["m3_volume_lag1"] = g_day["m3_volume"].transform(lambda x: x.shift(3))
+    # 前2根3分鐘K（shift 6）
+    m1["m3_open_lag2"] = g_day["m3_open"].transform(lambda x: x.shift(6))
+    m1["m3_high_lag2"] = g_day["m3_high"].transform(lambda x: x.shift(6))
+    m1["m3_low_lag2"] = g_day["m3_low"].transform(lambda x: x.shift(6))
+    m1["m3_close_lag2"] = g_day["m3_close"].transform(lambda x: x.shift(6))
+    m1["m3_volume_lag2"] = g_day["m3_volume"].transform(lambda x: x.shift(6))
+
+    # ── 5分鐘K OHLCV（由1分K滾動聚合，不跨日）───────────────────────
+    # 當前5分鐘K
+    m1["m5_open"] = g_day["open"].transform(lambda x: x.shift(4)) / day_open
+    m1["m5_high"] = g_day["high"].transform(lambda x: x.rolling(5).max()) / day_open
+    m1["m5_low"] = g_day["low"].transform(lambda x: x.rolling(5).min()) / day_open
+    m1["m5_close"] = m1["close"] / day_open
+    m1["m5_volume"] = g_day["volume"].transform(lambda x: x.rolling(5).sum().pct_change(5))
+    # 5分鐘K報酬率（K棒間變化%）
+    m1["m5_ret"] = g_day["close"].transform(lambda x: x.pct_change(5))
+    # 前1根5分鐘K（shift 5）
+    m1["m5_open_lag1"] = g_day["m5_open"].transform(lambda x: x.shift(5))
+    m1["m5_high_lag1"] = g_day["m5_high"].transform(lambda x: x.shift(5))
+    m1["m5_low_lag1"] = g_day["m5_low"].transform(lambda x: x.shift(5))
+    m1["m5_close_lag1"] = g_day["m5_close"].transform(lambda x: x.shift(5))
+    m1["m5_volume_lag1"] = g_day["m5_volume"].transform(lambda x: x.shift(5))
+    # 前2根5分鐘K（shift 10）
+    m1["m5_open_lag2"] = g_day["m5_open"].transform(lambda x: x.shift(10))
+    m1["m5_high_lag2"] = g_day["m5_high"].transform(lambda x: x.shift(10))
+    m1["m5_low_lag2"] = g_day["m5_low"].transform(lambda x: x.shift(10))
+    m1["m5_close_lag2"] = g_day["m5_close"].transform(lambda x: x.shift(10))
+    m1["m5_volume_lag2"] = g_day["m5_volume"].transform(lambda x: x.shift(10))
+
+    # ── 報酬率與量比 ────────────────────────────────────────────────
+    # 前1分鐘報酬率
     m1["ret_1"] = g_day["close"].transform(lambda x: x.pct_change(1))
 
-    # 特徵 2: 量比（當前量 / 前1分鐘量，捕捉瞬間爆量）
+    # 量比（當前量 / 前1分鐘量）
     m1["vol_ratio"] = g_day["volume"].transform(lambda x: x / x.shift(1).replace(0, np.nan))
+
+    # 3分鐘K報酬率
+    m1["tf3_ret"] = g_day["close"].transform(lambda x: x.pct_change(3))
+
+    # 3分鐘K量比
+    m1["tf3_vol_ratio"] = g_day["volume"].transform(
+        lambda x: x.rolling(3).sum() / x.rolling(3).sum().shift(3).replace(0, np.nan)
+    )
+
+    # 5分鐘K報酬率
+    m1["tf5_ret"] = g_day["close"].transform(lambda x: x.pct_change(5))
+
+    # 5分鐘K量比
+    m1["tf5_vol_ratio"] = g_day["volume"].transform(
+        lambda x: x.rolling(5).sum() / x.rolling(5).sum().shift(5).replace(0, np.nan)
+    )
+
+    # 清除暫存欄位
+    m1 = m1.drop(columns=["_cum_vol", "_bar_count"], errors="ignore")
 
     # 時間特徵（用於過濾時段，不作為模型輸入）
     m1["hour"] = m1["date"].dt.hour
@@ -414,7 +537,7 @@ if __name__ == "__main__":
     #
     #  start_date / end_date 可指定日期區間（留空 = 全部資料）
     # ══════════════════════════════════════════════════════════════════════
-    mode = "importance"
+    mode = "train"
     test_days = 10
     start_date = ""
     end_date = ""
