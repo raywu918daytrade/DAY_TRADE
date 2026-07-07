@@ -10,6 +10,7 @@
     load_day()     → db/fugle_day/ 日K（模型特徵用，GHA 每日更新）
     load_m1_live() → db/m1_live/   今日即時分K（交易用，500支，收盤後丟棄）
 """
+
 from pathlib import Path
 
 import pandas as pd
@@ -31,6 +32,26 @@ def load_day() -> pd.DataFrame:
     df = ds.dataset(str(_ROOT / "db/fugle_day"), format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"])
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def load_m3() -> pd.DataFrame:
+    """載入 db/m3/ 全部 3 分鐘K（由 build_m3_m5.py 預先聚合）"""
+    path = _ROOT / "db/m3"
+    if not path.exists():
+        return pd.DataFrame()
+    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def load_m5() -> pd.DataFrame:
+    """載入 db/m5/ 全部 5 分鐘K（由 build_m3_m5.py 預先聚合）"""
+    path = _ROOT / "db/m5"
+    if not path.exists():
+        return pd.DataFrame()
+    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
