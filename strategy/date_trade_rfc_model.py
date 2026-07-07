@@ -120,9 +120,8 @@ def make_features(
     # 特徵 1: 前1分鐘報酬率
     m1["ret_1"] = g_day["close"].transform(lambda x: x.pct_change(1))
 
-    # 特徵 2: 量比（當前量 / 15分鐘均量）
-    m1["vol_ma15"] = g_day["volume"].transform(lambda x: x.rolling(15).mean())
-    m1["vol_ratio"] = m1["volume"] / m1["vol_ma15"].replace(0, np.nan)
+    # 特徵 2: 量比（當前量 / 前1分鐘量，捕捉瞬間爆量）
+    m1["vol_ratio"] = g_day["volume"].transform(lambda x: x / x.shift(1).replace(0, np.nan))
 
     # 時間特徵（用於過濾時段，不作為模型輸入）
     m1["hour"] = m1["date"].dt.hour
@@ -415,7 +414,7 @@ if __name__ == "__main__":
     #
     #  start_date / end_date 可指定日期區間（留空 = 全部資料）
     # ══════════════════════════════════════════════════════════════════════
-    mode = "train"
+    mode = "importance"
     test_days = 10
     start_date = ""
     end_date = ""
