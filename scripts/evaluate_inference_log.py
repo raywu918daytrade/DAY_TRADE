@@ -50,8 +50,10 @@ def _load_signals(date_str: str) -> pd.DataFrame:
     from huggingface_hub import hf_hub_download
 
     local = hf_hub_download(
-        repo_id=repo_id, filename=f"{_HF_INFERENCE_PREFIX}/{date_str}.parquet",
-        repo_type="dataset", token=token,
+        repo_id=repo_id,
+        filename=f"{_HF_INFERENCE_PREFIX}/{date_str}.parquet",
+        repo_type="dataset",
+        token=token,
     )
     df = pd.read_parquet(local)
     signals = df[df["is_signal"]].copy()
@@ -122,7 +124,7 @@ def main():
     date_str = args.date
     print(f"驗證日期：{date_str}")
 
-    from strategy.date_trade_model import HOLD_BARS, SL_PCT, TP_PCT
+    from strategy.base.date_trade_model import HOLD_BARS, SL_PCT, TP_PCT
 
     signals = _load_signals(date_str)
     print(f"共 {len(signals)} 筆訊號要驗證（{signals['stock_id'].nunique()} 支股票）")
@@ -144,21 +146,21 @@ def main():
             if len(future) == 0:
                 outcome, exit_price, pnl_pct, bars = "unresolved", None, None, None
             else:
-                outcome, exit_price, pnl_pct, bars = _evaluate_one(
-                    sig["price"], future, TP_PCT, SL_PCT, HOLD_BARS
-                )
-            rows.append({
-                "date": date_str,
-                "time": sig["time"],
-                "stock_id": stock_id,
-                "name": sig["name"],
-                "proba": sig["proba"],
-                "entry_price": sig["price"],
-                "outcome": outcome,
-                "exit_price": exit_price,
-                "pnl_pct": pnl_pct,
-                "bars_to_exit": bars,
-            })
+                outcome, exit_price, pnl_pct, bars = _evaluate_one(sig["price"], future, TP_PCT, SL_PCT, HOLD_BARS)
+            rows.append(
+                {
+                    "date": date_str,
+                    "time": sig["time"],
+                    "stock_id": stock_id,
+                    "name": sig["name"],
+                    "proba": sig["proba"],
+                    "entry_price": sig["price"],
+                    "outcome": outcome,
+                    "exit_price": exit_price,
+                    "pnl_pct": pnl_pct,
+                    "bars_to_exit": bars,
+                }
+            )
 
     if not rows:
         raise RuntimeError(f"{date_str} 沒有任何訊號能對應到分K資料")

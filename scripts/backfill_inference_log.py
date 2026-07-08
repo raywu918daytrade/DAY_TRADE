@@ -106,7 +106,7 @@ def main():
 
     from data.data_manager import load_d1
     from data.fugle_tickers import update_tickers
-    from strategy.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
+    from strategy.base.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
 
     # 1. 當沖候選清單（名稱查詢也用這份）
     print("取得當沖候選清單...")
@@ -133,22 +133,28 @@ def main():
         h, mm = divmod(m, 60)
         minute_str = f"{date_str} {h:02d}:{mm:02d}:00"
         all_results = predict_live(
-            minute_str, day, model=model, threshold=0,
-            day_trade_stocks=day_trade_stocks, m1_live=m1_live,
+            minute_str,
+            day,
+            model=model,
+            threshold=0,
+            day_trade_stocks=day_trade_stocks,
+            m1_live=m1_live,
         )
         if not all_results:
             continue
         for r in all_results:
-            rows.append({
-                "date": date_str,
-                "time": minute_str[11:16],
-                "stock_id": r["stock_id"],
-                "name": tickers.get(r["stock_id"], r["stock_id"]),
-                "proba": round(float(r["proba"]), 4),
-                "price": r.get("price"),
-                "direction": r.get("direction", "buy"),
-                "is_signal": bool(r["proba"] >= threshold),
-            })
+            rows.append(
+                {
+                    "date": date_str,
+                    "time": minute_str[11:16],
+                    "stock_id": r["stock_id"],
+                    "name": tickers.get(r["stock_id"], r["stock_id"]),
+                    "proba": round(float(r["proba"]), 4),
+                    "price": r.get("price"),
+                    "direction": r.get("direction", "buy"),
+                    "is_signal": bool(r["proba"] >= threshold),
+                }
+            )
         print(f"  {minute_str[11:16]}  {len(all_results)} 支")
 
     if not rows:

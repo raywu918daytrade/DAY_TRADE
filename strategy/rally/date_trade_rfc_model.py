@@ -32,12 +32,12 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 # 確保能從根目錄導入
-if str(Path(__file__).parent.parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+if str(Path(__file__).parent.parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.query import load_day, load_m1, load_m3, load_m5, load_m1_live
 
-_ROOT = Path(__file__).parent.parent
+_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_ROOT / ".env")
 
 _MODEL_PATH = _ROOT / "models/m1_rfc.pkl"
@@ -211,6 +211,19 @@ FEATURES = [
     "day_vol_4",
     "day_vol_5",
     "day_atr",  # 日K ATR(14) 相對波動（前一日，/ 當日開盤）
+    # 大盤代理（0050）日K 特徵（前 5 天，無未來洩漏，廣播至所有個股）
+    "idx_day_ret_1",
+    "idx_day_ret_2",
+    "idx_day_ret_3",
+    "idx_day_ret_4",
+    "idx_day_ret_5",
+    "idx_day_atr",  # 0050 日K ATR(14) 相對波動（前一日，/ 當日開盤）
+    # 大盤代理（0050）1分K 特徵（廣播至所有個股）
+    "idx_ret_1",  # 0050 前1分報酬率
+    "idx_vs_open",  # 0050 收盤 / 0050 當日開盤（大盤相對開盤漲跌幅）
+    "idx_atr",  # 0050 1分K ATR(14) 相對波動（/ 0050 當日開盤）
+    "idx_up",  # 0050 收盤 > 開盤（0/1，大盤是否站上開盤）
+    "idx_breakout",  # 0050 破底翻（前1分跌 + 當分漲，0/1）
 ]
 
 
@@ -357,8 +370,86 @@ def make_features(
     day_feat_cols = ["stock_id", "day_date"] + day_ret_cols + day_vol_cols + ["day_atr"]
     m1 = m1.merge(day[day_feat_cols], on=["stock_id", "day_date"], how="left")
 
+    # ── 大盤（0050）日K 特徵（前 5 天，廣播至所有個股）────────────────
+    idx_day = day[day["stock_id"] == "0050"].copy()
+    if not idx_day.empty:
+        idx_dg = idx_day.groupby("stock_id")
+        idx_vol_ma5 = idx_dg["volume"].transform(lambda x: x.rolling(5).mean()).replace(0, np.nan)
+        idx_day_ret_cols = []
+        for lag in range(1, 6):
+            cr = f"idx_day_ret_{lag}"
+            idx_day[cr] = idx_dg["close"].transform(lambda x, l=lag: x.pct_change(1).shift(l - 1))
+            idx_day_ret_cols.append(cr)
+        # 0050 日K ATR
+        idx_day["_idx_prev_close"] = idx_dg["close"].shift(1)
+        idx_day["_idx_day_tr"] = np.maximum(
+            np.maximum((idx_day["high"] - idx_day["low"]).abs(), (idx_day["high"] - idx_day["_idx_prev_close"]).abs()),
+            (idx_day["low"] - idx_day["_idx_prev_close"]).abs(),
+        )
+        idx_day["_idx_atr14"] = idx_dg["_idx_day_tr"].transform(lambda x: x.rolling(14, min_periods=14).mean())
+        idx_day["idx_day_atr"] = idx_day["_idx_atr14"].shift(1) / idx_day["open"].replace(0, np.nan)
+        idx_day["day_date"] = idx_day["date"].dt.date
+        idx_day_feat_cols = ["day_date"] + idx_day_ret_cols + ["idx_day_atr"]
+        m1 = m1.merge(idx_day[idx_day_feat_cols], on=["day_date"], how="left")
+
+    # ── 大盤（0050）1分K 特徵（廣播至所有個股）──────────────────────────
+    idx_m1 = m1[m1["stock_id"] == "0050"].copy()
+    if not idx_m1.empty:
+        idx_g_day = idx_m1.groupby("day_date", group_keys=False)
+        # 0050 當日開盤價
+        idx_day_open = idx_g_day["open"].transform("first").replace(0, np.nan)
+        # 0050 前1分報酬率
+        m1["idx_ret_1"] = np.nan
+        m1.loc[idx_m1.index, "idx_ret_1"] = idx_g_day["close"].transform(lambda x: x.pct_change(1)).values
+        # 0050 收盤 / 當日開盤（大盤相對開盤漲跌幅）
+        m1["idx_vs_open"] = np.nan
+        m1.loc[idx_m1.index, "idx_vs_open"] = (idx_m1["close"] / idx_day_open).values
+        # 0050 1分K ATR(14) 相對波動
+        idx_prev_close = idx_g_day["close"].shift(1).fillna(idx_m1["open"])
+        idx_m1["_idx_tr"] = np.maximum(
+            np.maximum((idx_m1["high"] - idx_m1["low"]).abs(), (idx_m1["high"] - idx_prev_close).abs()),
+            (idx_m1["low"] - idx_prev_close).abs(),
+        )
+        m1["idx_atr"] = np.nan
+        m1.loc[idx_m1.index, "idx_atr"] = (
+            idx_g_day["_idx_tr"].transform(lambda x: x.rolling(14, min_periods=14).mean()) / idx_day_open
+        ).values
+        # 0050 收盤 > 開盤（0/1）
+        m1["idx_up"] = np.nan
+        m1.loc[idx_m1.index, "idx_up"] = (idx_m1["close"] > idx_day_open).astype(int).values
+        # 0050 破底翻（前1分跌 + 當分漲）
+        m1["idx_breakout"] = np.nan
+        m1.loc[idx_m1.index, "idx_breakout"] = (
+            (
+                (idx_g_day["close"].transform(lambda x: x.pct_change(1)).shift(1) < 0)
+                & (idx_g_day["close"].transform(lambda x: x.pct_change(1)) > 0)
+            )
+            .astype(int)
+            .values
+        )
+        # 廣播 0050 特徵至所有個股（以完整時間戳 date 為 key，逐分鐘對齊，
+        # 不能只用 day_date——那樣 drop_duplicates 只會留下每天第一根，
+        # 而第一根的 idx_ret_1/idx_atr 必為 NaN，等於整欄報廢）
+        idx_feat_cols = ["date", "idx_ret_1", "idx_vs_open", "idx_atr", "idx_up", "idx_breakout"]
+        idx_feat = m1.loc[idx_m1.index, idx_feat_cols].drop_duplicates("date")
+        m1 = m1.drop(columns=["idx_ret_1", "idx_vs_open", "idx_atr", "idx_up", "idx_breakout"], errors="ignore")
+        m1 = m1.merge(idx_feat, on=["date"], how="left")
+
     # 清除暫存欄位
-    m1 = m1.drop(columns=["_cum_vol", "_bar_count", "m3_vol_raw", "m5_vol_raw", "_tr"], errors="ignore")
+    m1 = m1.drop(
+        columns=[
+            "_cum_vol",
+            "_bar_count",
+            "m3_vol_raw",
+            "m5_vol_raw",
+            "_tr",
+            "_idx_prev_close",
+            "_idx_day_tr",
+            "_idx_atr14",
+            "_idx_tr",
+        ],
+        errors="ignore",
+    )
 
     # 時間特徵（用於過濾時段，不作為模型輸入）
     m1["hour"] = m1["date"].dt.hour
@@ -1182,7 +1273,7 @@ if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     #  在這裡直接改 mode，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "breakout"
+    mode = "compare"
     test_days = 10
     start_date = ""
     end_date = ""

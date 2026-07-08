@@ -50,7 +50,7 @@ from api import (
     tw_naive_to_epoch,
     update_positions_price,
 )
-from strategy.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
+from strategy.base.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
 import os
 
 from data.fugle_tickers import update_tickers

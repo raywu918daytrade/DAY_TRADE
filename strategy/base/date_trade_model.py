@@ -70,13 +70,13 @@ from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 # 確保能從根目錄導入
-if str(Path(__file__).parent.parent) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+if str(Path(__file__).parent.parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.query import load_day, load_m1, load_m1_live
 
-_MODEL_PATH = Path(__file__).parent.parent / "models/m1_lgbm.pkl"
-_ROOT = Path(__file__).parent.parent
+_MODEL_PATH = Path(__file__).parent.parent.parent / "models/m1_lgbm.pkl"
+_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_ROOT / ".env")
 
 # Triple Barrier 參數（需與回測保持一致）

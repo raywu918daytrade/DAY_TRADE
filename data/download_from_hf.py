@@ -33,6 +33,19 @@ if not HF_REPO_ID:
 
 api = HfApi()
 
+
+def _normalize_month_stem(stem: str) -> str:
+    """"2026_7" / "2026_07" 一律歸一成補零格式 "2026_07"。
+
+    HF Hub 上早期上傳的月檔沒補零，近期（push_day_to_hf.py／push_m1_to_hf.py
+    用 pd.Period.astype(str)）一律補零；下載時若直接沿用 HF 檔名，同一個月
+    可能因為補零與否落地成本機兩個不同檔案，讀取時 schema 衝突。一律用補零
+    檔名存本機，並用它做「是否已下載過」的判斷，避免重複／衝突。
+    """
+    year, month = stem.split("_")
+    return f"{year}_{int(month):02d}"
+
+
 # ── 1. 日K（增量：跳過本機已有的月份）────────────────────────────────────────
 print("下載日K（db/fugle_day/）...")
 import re as _re
@@ -46,11 +59,12 @@ if not day_files:
 else:
     dest_day_dir = _ROOT / "db/fugle_day"
     dest_day_dir.mkdir(parents=True, exist_ok=True)
-    latest = max(Path(f).stem for f in day_files)
+    latest = max(_normalize_month_stem(Path(f).stem) for f in day_files)
     for hf_path in sorted(day_files):
-        filename = Path(hf_path).name   # e.g. 2026_6.parquet
+        stem = _normalize_month_stem(Path(hf_path).stem)
+        filename = f"{stem}.parquet"   # 本機一律用補零檔名，例如 2026_06.parquet
         dest = dest_day_dir / filename
-        if dest.exists() and Path(hf_path).stem != latest:
+        if dest.exists() and stem != latest:
             print(f"  跳過 {filename}（已有）")
             continue
         local_path = hf_hub_download(
@@ -73,12 +87,13 @@ else:
     dest_m1 = _ROOT / "db/m1"
     dest_m1.mkdir(parents=True, exist_ok=True)
     # 找出 HF Hub 上最新的月份（當月資料每天都在更新，需重新下載）
-    latest = max(Path(f).stem for f in m1_files)  # e.g. "2026_7"
+    latest = max(_normalize_month_stem(Path(f).stem) for f in m1_files)  # e.g. "2026_07"
     for hf_path in sorted(m1_files):
-        filename = Path(hf_path).name   # e.g. 2026_6.parquet
+        stem = _normalize_month_stem(Path(hf_path).stem)
+        filename = f"{stem}.parquet"   # 本機一律用補零檔名，例如 2026_06.parquet
         dest = dest_m1 / filename
         # 已有且不是當月 → 跳過
-        if dest.exists() and Path(hf_path).stem != latest:
+        if dest.exists() and stem != latest:
             print(f"  跳過 {filename}（已有）")
             continue
         local_path = hf_hub_download(

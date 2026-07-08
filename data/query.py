@@ -22,7 +22,9 @@ _ROOT = Path(__file__).parent.parent
 def load_m1() -> pd.DataFrame:
     """載入 db/m1/ 全部歷史分K（訓練資料，~2787 支，按月分檔）"""
     df = ds.dataset(str(_ROOT / "db/m1"), format="parquet").to_table().to_pandas()
-    df["date"] = pd.to_datetime(df["date"])
+    # 按月分檔的 parquet 中 date 欄位型別可能不一致（string / timestamp 混雜），
+    # 用 format="mixed" 讓 pandas 逐筆判斷格式，避免鎖死單一格式時遇到例外格式就整批炸掉
+    df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
@@ -30,7 +32,8 @@ def load_m1() -> pd.DataFrame:
 def load_day() -> pd.DataFrame:
     """載入 db/fugle_day/ 全部日K（模型特徵用，按月分檔）"""
     df = ds.dataset(str(_ROOT / "db/fugle_day"), format="parquet").to_table().to_pandas()
-    df["date"] = pd.to_datetime(df["date"])
+    # 同上：按月分檔可能混雜不同型別的 date 欄位，用 format="mixed" 容忍
+    df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 

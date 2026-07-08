@@ -38,9 +38,11 @@ _FLAG_PATH = _ROOT / "db/fugle_day_flags/day_flag.parquet"
 
 
 def _day_file_path(date: str) -> Path:
-    """依資料日期決定存入哪個月份檔"""
+    """依資料日期決定存入哪個月份檔（月份補零，需與 push_day_to_hf.py 的
+    pd.Period.astype(str) 命名一致，否則同一個月會在本機/HF Hub 各自產生
+    一個檔名不同的分檔，觸發 schema 衝突）"""
     ts = pd.Timestamp(date)
-    return _ROOT / f"db/fugle_day/{ts.year}_{ts.month}.parquet"
+    return _ROOT / f"db/fugle_day/{ts.year}_{ts.month:02d}.parquet"
 
 
 def _last_stored_date() -> str | None:

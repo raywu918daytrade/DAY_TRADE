@@ -37,7 +37,10 @@ _FLAG_PATH = _ROOT / "db/m1_flags/m1_flag.parquet"
 
 
 def _m1_file_path(date: pd.Timestamp) -> Path:
-    return _ROOT / f"db/m1/{date.year}_{date.month}.parquet"
+    """月份補零，需與 push_m1_to_hf.py 的 pd.Period.astype(str) 命名一致，
+    否則同一個月會在本機/HF Hub 各自產生一個檔名不同的分檔，觸發 schema 衝突
+    （db/fugle_day/ 已經因此撞過一次，見 2026_7.parquet vs 2026_07.parquet）"""
+    return _ROOT / f"db/m1/{date.year}_{date.month:02d}.parquet"
 
 
 def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
