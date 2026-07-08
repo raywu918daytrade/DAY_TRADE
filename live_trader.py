@@ -338,10 +338,19 @@ def _force_close_eod():
 
 
 def _get_stocks():
-    """每次重連都取最新當沖標的；非盤中無清單時回退到所有可交易股票"""
+    """每次重連都取最新當沖標的；非盤中無清單時回退到所有可交易股票
+
+    固定加入 0050：它本身不是當沖候選股，但 rally 策略的 idx_* 特徵
+    （大盤 1分K 相對強弱）需要它當天的即時分K，若當沖候選清單剛好沒選到
+    0050，db/m1_live/ 就不會有它的資料，predict_live() 算 idx_* 特徵時
+    會直接 KeyError。
+    """
     from data.fugle_tickers import fugle_stocks
 
-    return list(_day_trade_stocks) if _day_trade_stocks else fugle_stocks()
+    stocks = list(_day_trade_stocks) if _day_trade_stocks else fugle_stocks()
+    if "0050" not in stocks:
+        stocks.append("0050")
+    return stocks
 
 
 def _on_rate_limited():
