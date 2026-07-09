@@ -1,0 +1,116 @@
+"""
+模型驗證報表 — 信心度分析、召回率分析、特徵重要性
+
+比照 strategy/rally/validate.py 的做法，但只有一個 LGBM 模型，不需要
+多模型 × 時段交叉報表。
+"""
+
+import sys
+from pathlib import Path
+
+if str(Path(__file__).parent.parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+import pandas as pd
+
+from strategy.macd.features import FEATURES, load_features
+from strategy.macd.train import load_model_lgbm
+
+_CONFIDENCE_BINS = [0.0, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 1.01]
+_CONFIDENCE_LABELS = [
+    "<0.30",
+    "0.30-0.35",
+    "0.35-0.40",
+    "0.40-0.45",
+    "0.45-0.50",
+    "0.50-0.55",
+    "0.55-0.60",
+    "0.60-0.70",
+    "≥0.70",
+]
+
+
+def _load_test_df(
+    model,
+    test_days: int = 10,
+    start_date: str = "",
+    end_date: str = "",
+) -> pd.DataFrame:
+    df = load_features()
+    df = df.dropna(subset=FEATURES + ["target"])
+
+    if start_date:
+        df = df[df["date"] >= pd.Timestamp(start_date)].copy()
+    if end_date:
+        df = df[df["date"] <= pd.Timestamp(end_date)].copy()
+
+    cutoff = df["date"].max() - pd.Timedelta(days=test_days)
+    test_df = df[df["date"] > cutoff].copy()
+    print(f"  測試區間: {test_df['date'].min().strftime('%Y-%m-%d')} ~ {test_df['date'].max().strftime('%Y-%m-%d')}")
+
+    test_df["proba"] = model.predict_proba(test_df[FEATURES])[:, 1]
+    return test_df
+
+
+def confidence_report(
+    model=None,
+    test_days: int = 10,
+    start_date: str = "",
+    end_date: str = "",
+):
+    """依信心度區間顯示樣本數與勝率。"""
+    if model is None:
+        model = load_model_lgbm()
+
+    test_df = _load_test_df(model, test_days, start_date, end_date)
+    test_df["bucket"] = pd.cut(test_df["proba"], bins=_CONFIDENCE_BINS, labels=_CONFIDENCE_LABELS, right=False)
+
+    report = (
+        test_df.groupby("bucket", observed=True)
+        .agg(樣本數=("target", "count"), 勝率=("target", "mean"))
+        .assign(勝率=lambda x: (x["勝率"] * 100).round(1).astype(str) + "%")
+    )
+    print("\n── 信心度分析（測試集）──")
+    print(report.to_string())
+    return report
+
+
+def coverage_report(
+    model=None,
+    test_days: int = 10,
+    start_date: str = "",
+    end_date: str = "",
+):
+    """召回率分析：在不同門檻下的精確率與召回率。"""
+    if model is None:
+        model = load_model_lgbm()
+
+    test_df = _load_test_df(model, test_days, start_date, end_date)
+
+    total_pos = test_df["target"].sum()
+    total_neg = (test_df["target"] == 0).sum()
+
+    print("\n── 召回率分析（測試集）──")
+    print(f"  實際漲（label=1）: {total_pos:,} 筆")
+    print(f"  實際跌（label=0）: {total_neg:,} 筆")
+    print()
+    print(f"  {'門檻':>6}  {'訊號數':>7}  {'精確率':>7}  {'召回率':>7}  {'F1':>6}")
+    print("  " + "-" * 45)
+
+    for thr in [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
+        flagged = test_df["proba"] >= thr
+        tp = (flagged & (test_df["target"] == 1)).sum()
+        precision = tp / flagged.sum() if flagged.sum() > 0 else 0
+        recall = tp / total_pos if total_pos > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        print(f"  {thr:.2f}  {flagged.sum():>7,}  {precision*100:>6.1f}%  {recall*100:>6.1f}%  {f1:.3f}")
+
+
+def feature_importance(model=None):
+    """顯示 LightGBM 特徵重要性。"""
+    if model is None:
+        model = load_model_lgbm()
+
+    print("\n── 特徵重要性 ──")
+    for name, imp in sorted(zip(FEATURES, model.feature_importances_), key=lambda x: -x[1]):
+        print(f"  {name:26s}  {imp:.4f}")
