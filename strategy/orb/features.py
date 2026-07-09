@@ -1,5 +1,5 @@
 """
-特徵工程與資料標籤 — 只用開盤區間突破（ORB, Opening Range Breakout）衍生特徵
+特徵工程與資料標籤 — 開盤區間突破（ORB, Opening Range Breakout）+ 3分K/5分K 中期動能確認
 
 用 db/m1/ 歷史分K，每日每股取開盤前 OPENING_RANGE_MINUTES 分鐘的最高/最低點
 當作當天的關鍵區間（不跨日）。區間形成期間本身（前 OPENING_RANGE_MINUTES
@@ -20,7 +20,7 @@ import pandas as pd
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from data.query import load_m1
+from data.query import load_m1, load_m3, load_m5
 from strategy.orb.config import HOLD_BARS, OPENING_RANGE_MINUTES, SL_PCT, TP_PCT
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -108,12 +108,31 @@ FEATURES = [
     "dist_to_or_low",  # close 距區間下緣的相對距離
     "broke_above",  # close > 區間上緣（0/1）
     "broke_below",  # close < 區間下緣（0/1）
-    "breakout_up_signal",  # 當根K棒首次向上突破（0/1，開倉訊號本體）
+    "breakout_up_signal",  #    當根K棒首次向上突破（0/1，開倉訊號本體）
     "breakout_down_signal",  # 當根K棒首次向下突破（0/1）
     "bars_since_breakout_up",  # 距首次向上突破幾根K棒（今日未發生過=999）
     "bars_since_breakout_down",  # 距首次向下突破幾根K棒
     "vol_ratio_vs_or",  # 當根量 / 開盤區間期間均量（量能確認突破）
     "minutes_since_or_end",  # 距開盤區間結束幾分鐘
+    # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷（比照 rally 做法）──
+    "m3_high",
+    "m3_low",
+    "m3_close",
+    "m3_ret",  # 3分鐘K報酬率（K棒間變化%）
+    "m3_high_lag1",
+    "m3_low_lag1",
+    "m3_close_lag1",
+    "m3_open_lag2",
+    "m3_high_lag2",
+    "m3_low_lag2",
+    "m5_open",
+    "m5_high",
+    "m5_low",
+    "m5_ret",  # 5分鐘K報酬率（K棒間變化%）
+    "m5_open_lag1",
+    "m5_high_lag1",
+    "m5_low_lag1",
+    "m5_close_lag1",
 ]
 
 
@@ -143,6 +162,53 @@ def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame
     m1["hour"] = m1["date"].dt.hour
     m1["minute"] = m1["date"].dt.minute
     m1["minutes_since_open"] = (m1["hour"] - 9) * 60 + m1["minute"]
+
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+
+    # 當日開盤價（第一根 open），用於 3分K/5分K 正規化
+    day_open = g_day["open"].transform("first").replace(0, np.nan)
+
+    # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷 ─────────────
+    # db/m3、db/m5 是批次預算（scripts/build_m3_m5.py 從 db/m1/ 算好存檔，
+    # 用的是 strategy/rally/features.py 的 compute_m3()/compute_m5()），
+    # 只有訓練用的完整歷史 m1 才會跟它對得上。
+    m3 = load_m3()
+    m5 = load_m5()
+    m3["date"] = pd.to_datetime(m3["date"])
+    m5["date"] = pd.to_datetime(m5["date"])
+
+    m3_feat = m3[["stock_id", "date"]].copy()
+    m3_feat["m3_open"] = m3["open"] / day_open
+    m3_feat["m3_high"] = m3["high"] / day_open
+    m3_feat["m3_low"] = m3["low"] / day_open
+    m3_feat["m3_close"] = m1["close"] / day_open
+
+    m5_feat = m5[["stock_id", "date"]].copy()
+    m5_feat["m5_open"] = m5["open"] / day_open
+    m5_feat["m5_high"] = m5["high"] / day_open
+    m5_feat["m5_low"] = m5["low"] / day_open
+    m5_feat["m5_close"] = m1["close"] / day_open
+
+    m1 = m1.merge(m3_feat, on=["stock_id", "date"], how="left", suffixes=("", "_y3"))
+    m1 = m1.merge(m5_feat, on=["stock_id", "date"], how="left", suffixes=("", "_y5"))
+
+    g_m3 = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    m1["m3_high_lag1"] = g_m3["m3_high"].shift(3)
+    m1["m3_low_lag1"] = g_m3["m3_low"].shift(3)
+    m1["m3_close_lag1"] = g_m3["m3_close"].shift(3)
+    m1["m3_open_lag2"] = g_m3["m3_open"].shift(6)
+    m1["m3_high_lag2"] = g_m3["m3_high"].shift(6)
+    m1["m3_low_lag2"] = g_m3["m3_low"].shift(6)
+    m1["m3_ret"] = g_m3["m3_close"].pct_change(3)
+
+    g_m5 = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    m1["m5_open_lag1"] = g_m5["m5_open"].shift(5)
+    m1["m5_high_lag1"] = g_m5["m5_high"].shift(5)
+    m1["m5_low_lag1"] = g_m5["m5_low"].shift(5)
+    m1["m5_close_lag1"] = g_m5["m5_close"].shift(5)
+    m1["m5_ret"] = g_m5["m5_close"].pct_change(5)
+
+    m1 = m1.drop(columns=["m3_open", "m5_close"])
 
     g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
 
