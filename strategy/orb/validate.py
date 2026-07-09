@@ -13,8 +13,8 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 import pandas as pd
 
-from strategy.macd.features import FEATURES, load_features
-from strategy.macd.train import load_model_lgbm
+from strategy.orb.features import FEATURES, load_features
+from strategy.orb.train import load_model_lgbm
 
 _CONFIDENCE_BINS = [0.0, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 1.01]
 _CONFIDENCE_LABELS = [

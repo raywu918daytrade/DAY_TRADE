@@ -20,9 +20,9 @@ from pathlib import Path
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from strategy.macd.config import HOLD_BARS, MACD_FAST, MACD_SIGNAL, MACD_SLOW, SL_PCT, TP_PCT  # noqa: F401
-from strategy.macd.train import train_lgbm
-from strategy.macd.validate import confidence_report, coverage_report, feature_importance
+from strategy.orb.config import HOLD_BARS, MACD_FAST, MACD_SIGNAL, MACD_SLOW, SL_PCT, TP_PCT  # noqa: F401
+from strategy.orb.train import train_lgbm
+from strategy.orb.validate import confidence_report, coverage_report, feature_importance
 
 
 def main(

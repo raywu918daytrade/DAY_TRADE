@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from strategy.macd.features import FEATURES, load_features
+from strategy.orb.features import FEATURES, load_features
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH_LGBM = _ROOT / "models/m1_macd_lgbm.pkl"

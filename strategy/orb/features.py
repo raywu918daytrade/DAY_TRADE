@@ -18,7 +18,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.query import load_m1
-from strategy.macd.config import HOLD_BARS, MACD_FAST, MACD_SIGNAL, MACD_SLOW, SL_PCT, TP_PCT
+from strategy.orb.config import HOLD_BARS, MACD_FAST, MACD_SIGNAL, MACD_SLOW, SL_PCT, TP_PCT
 
 _ROOT = Path(__file__).parent.parent.parent
 _M1_DIR = _ROOT / "db/m1"
