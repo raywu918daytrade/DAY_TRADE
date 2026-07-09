@@ -1,8 +1,8 @@
 """
-模型驗證報表 — 信心度分析、召回率分析、特徵重要性
+模型驗證報表 — 信心度分析、召回率分析、時段交叉報表、特徵重要性
 
 比照 strategy/rally/validate.py 的做法，但只有一個 LGBM 模型，不需要
-多模型 × 時段交叉報表。
+多模型比較。
 """
 
 import sys
@@ -104,6 +104,41 @@ def coverage_report(
         recall = tp / total_pos if total_pos > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
         print(f"  {thr:.2f}  {flagged.sum():>7,}  {precision*100:>6.1f}%  {recall*100:>6.1f}%  {f1:.3f}")
+
+
+def hour_confidence_report(
+    model=None,
+    test_days: int = 10,
+    start_date: str = "",
+    end_date: str = "",
+):
+    """依時段（9~13點）× 信心度區間 交叉列出樣本數、勝率、累積召回率。"""
+    if model is None:
+        model = load_model_lgbm()
+
+    test_df = _load_test_df(model, test_days, start_date, end_date)
+    test_df["信心度"] = pd.cut(test_df["proba"], bins=_CONFIDENCE_BINS, labels=_CONFIDENCE_LABELS, right=False)
+
+    for h in [9, 10, 11, 12, 13]:
+        sub = test_df[test_df["hour"] == h]
+        if sub.empty:
+            continue
+        report = sub.groupby("信心度", observed=True).agg(樣本數=("target", "count"), 勝率=("target", "mean"))
+        report = report[report["樣本數"] > 0]
+        if report.empty:
+            continue
+
+        # 召回率：≥該區間下界的門檻能抓到這個時段內多少比例的實際上漲（累積算法，跟 rally 一致）
+        total_pos = sub["target"].sum()
+        recalls = {}
+        for lo, label in zip(_CONFIDENCE_BINS[:-1], _CONFIDENCE_LABELS):
+            tp_cum = sub.loc[sub["proba"] >= lo, "target"].sum()
+            recalls[label] = tp_cum / total_pos if total_pos else float("nan")
+        report["召回率"] = [recalls.get(idx, float("nan")) for idx in report.index]
+        report["召回率"] = (report["召回率"] * 100).round(1).astype(str) + "%"
+        report["勝率"] = (report["勝率"] * 100).round(1).astype(str) + "%"
+        print(f"\n  -- {h} 點（實際上漲 {total_pos:,} 筆）--")
+        print("  " + report.to_string().replace("\n", "\n  "))
 
 
 def feature_importance(model=None):

@@ -1,16 +1,16 @@
 """
-當沖策略 — MACD 特徵 + LightGBM 模型（CLI 進入點）
+當沖策略 — ORB（開盤區間突破）特徵 + LightGBM 模型（CLI 進入點）
 
 實際邏輯拆到同資料夾底下：
-    config.py     交易相關設定（TP/SL/HOLD_BARS、MACD 參數）
-    features.py   MACD 特徵工程、triple barrier 標籤、FEATURES 清單、load_features() cache
+    config.py     交易相關設定（TP/SL/HOLD_BARS、開盤區間分鐘數）
+    features.py   ORB 特徵工程、triple barrier 標籤、FEATURES 清單、load_features() cache
     train.py      LightGBM 訓練與模型載入
-    validate.py   信心度分析、召回率分析、特徵重要性
+    validate.py   信心度分析、召回率分析、時段交叉報表、特徵重要性
 
 == Main 模式 ==
 
 train_lgbm   訓練模型
-validate     信心度分析 + 召回率分析 + 特徵重要性
+validate     信心度分析 + 召回率分析 + 時段(9~13點)交叉報表 + 特徵重要性
 """
 
 import argparse
@@ -20,9 +20,9 @@ from pathlib import Path
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from strategy.orb.config import HOLD_BARS, MACD_FAST, MACD_SIGNAL, MACD_SLOW, SL_PCT, TP_PCT  # noqa: F401
+from strategy.orb.config import HOLD_BARS, OPENING_RANGE_MINUTES, SL_PCT, TP_PCT  # noqa: F401
 from strategy.orb.train import train_lgbm
-from strategy.orb.validate import confidence_report, coverage_report, feature_importance
+from strategy.orb.validate import confidence_report, coverage_report, feature_importance, hour_confidence_report
 
 
 def main(
@@ -32,15 +32,15 @@ def main(
     end_date: str = "",
 ):
     """
-    當沖策略 MACD + LightGBM 主程式。
+    當沖策略 ORB + LightGBM 主程式。
 
     支援兩種用法：
       1. 直接傳參數：main(mode="train_lgbm")
-      2. CLI 執行：python strategy/macd/entry.py train_lgbm
+      2. CLI 執行：python strategy/orb/entry.py train_lgbm
     """
     if not mode:
         parser = argparse.ArgumentParser(
-            description="當沖策略 — MACD 特徵 + LightGBM",
+            description="當沖策略 — ORB 特徵 + LightGBM",
         )
         parser.add_argument("mode", choices=["train_lgbm", "validate"], help="執行模式")
         parser.add_argument("--test_days", type=int, default=10, help="測試集天數")
@@ -60,6 +60,8 @@ def main(
         print()
         coverage_report(test_days=test_days, start_date=start_date, end_date=end_date)
         print()
+        hour_confidence_report(test_days=test_days, start_date=start_date, end_date=end_date)
+        print()
         feature_importance()
 
     else:
@@ -67,7 +69,7 @@ def main(
 
 
 if __name__ == "__main__":
-    mode = "validate"
+    mode = "train_lgbm"
     test_days = 10
     start_date = ""
     end_date = ""

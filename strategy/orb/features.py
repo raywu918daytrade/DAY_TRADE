@@ -1,8 +1,11 @@
 """
-特徵工程與資料標籤 — 只用 MACD(12,26,9) 衍生特徵
+特徵工程與資料標籤 — 只用開盤區間突破（ORB, Opening Range Breakout）衍生特徵
 
-用 db/m1/ 歷史分K，每日每股逐日重算 MACD（不跨日，理由同 rally 的 m1_atr：
-日內動能指標，隔天開盤重新累積，不該延續昨天收盤前的動能狀態）。
+用 db/m1/ 歷史分K，每日每股取開盤前 OPENING_RANGE_MINUTES 分鐘的最高/最低點
+當作當天的關鍵區間（不跨日）。區間形成期間本身（前 OPENING_RANGE_MINUTES
+分鐘）的樣本會整批排除——那幾分鐘區間還沒收斂，此時去看「距上緣距離」
+這類特徵等於用當天最終的區間高低點回頭算，會把「區間形成期間之後才知道」
+的值洩漏回形成期間本身；且真實交易時，區間沒收斂也不可能有突破訊號。
 標籤沿用 rally 的 triple barrier 定義：未來 HOLD_BARS 根分K內
   +TP_PCT 停利先碰到 → target = 1（漲）
   -SL_PCT 停損先碰到 → target = 0（跌）
@@ -18,11 +21,11 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.query import load_m1
-from strategy.orb.config import HOLD_BARS, MACD_FAST, MACD_SIGNAL, MACD_SLOW, SL_PCT, TP_PCT
+from strategy.orb.config import HOLD_BARS, OPENING_RANGE_MINUTES, SL_PCT, TP_PCT
 
 _ROOT = Path(__file__).parent.parent.parent
 _M1_DIR = _ROOT / "db/m1"
-_CACHE_PATH = _ROOT / "cache/m1_macd_features.parquet"
+_CACHE_PATH = _ROOT / "cache/m1_orb_features.parquet"
 
 
 # ── Cache 管理 ───────────────────────────────────────────────────────────────
@@ -44,7 +47,7 @@ def load_features(force_rebuild: bool = False) -> pd.DataFrame:
     """載入特徵（自動使用 / 重建 cache）。"""
     if not force_rebuild and _cache_is_fresh():
         cached = pd.read_parquet(_CACHE_PATH)
-        missing = [c for c in FEATURES if c not in cached.columns]
+        missing = [c for c in FEATURES + ["hour"] if c not in cached.columns]
         if not missing:
             print("  讀取 cache 特徵...")
             return cached
@@ -54,7 +57,7 @@ def load_features(force_rebuild: bool = False) -> pd.DataFrame:
     m1 = load_m1()
     df = make_features(m1, compute_labels=True)
     _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    meta_cols = ["stock_id", "date", "target"]
+    meta_cols = ["stock_id", "date", "hour", "target"]
     cache_cols = [c for c in df.columns if c in set(FEATURES) | set(meta_cols)]
     df[cache_cols].to_parquet(_CACHE_PATH)
     print(f"  cache 已存至 {_CACHE_PATH}（{len(df):,} 筆）")
@@ -94,32 +97,24 @@ def _make_barrier_labels(m1: pd.DataFrame) -> pd.Series:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. MACD 特徵工程
+# 2. ORB（開盤區間突破）特徵工程
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 FEATURES = [
-    "macd_line",
-    "macd_signal",
-    "macd_hist",
-    "macd_hist_slope",  # histogram 一階變化（1根前）
-    "macd_hist_slope_3",  # histogram 3根前變化（動能持續性）
-    "macd_above_signal",  # macd_line > macd_signal（0/1）
-    "macd_above_zero",  # macd_line > 0（0/1，是否站上零軸）
-    "golden_cross",  # 當根K棒 macd_line 上穿 macd_signal（0/1）
-    "dead_cross",  # 當根K棒 macd_line 下穿 macd_signal（0/1）
-    "bars_since_golden_cross",  # 距最近一次金叉幾根K棒（今日未發生過=999）
-    "bars_since_dead_cross",  # 距最近一次死叉幾根K棒（今日未發生過=999）
-    "macd_divergence",  # 背離分數：過去10根動能變化 - 過去10根價格變化
+    "or_range_pct",  # 開盤區間高度 / 區間下緣（區間本身寬不寬）
+    "close_pos_in_range",  # close 在區間內相對位置（<0跌破下緣，0~1區間內，>1突破上緣）
+    "dist_to_or_high",  # close 距區間上緣的相對距離
+    "dist_to_or_low",  # close 距區間下緣的相對距離
+    "broke_above",  # close > 區間上緣（0/1）
+    "broke_below",  # close < 區間下緣（0/1）
+    "breakout_up_signal",  # 當根K棒首次向上突破（0/1，開倉訊號本體）
+    "breakout_down_signal",  # 當根K棒首次向下突破（0/1）
+    "bars_since_breakout_up",  # 距首次向上突破幾根K棒（今日未發生過=999）
+    "bars_since_breakout_down",  # 距首次向下突破幾根K棒
+    "vol_ratio_vs_or",  # 當根量 / 開盤區間期間均量（量能確認突破）
+    "minutes_since_or_end",  # 距開盤區間結束幾分鐘
 ]
-
-
-def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
-    """把 groupby(...).rolling(...)/ewm(...) 產生的多層 index 結果攤平回原始 df 對齊。"""
-    n_key_levels = s.index.nlevels - 1
-    if n_key_levels:
-        s = s.reset_index(level=list(range(n_key_levels)), drop=True)
-    return s.reindex(index)
 
 
 def _bars_since(m1: pd.DataFrame, flag_col: str) -> pd.Series:
@@ -134,51 +129,55 @@ def _bars_since(m1: pd.DataFrame, flag_col: str) -> pd.Series:
 
 def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame:
     """
-    只算 MACD(12,26,9) 衍生特徵 + triple barrier 標籤。
+    只算 ORB（開盤區間突破）衍生特徵 + triple barrier 標籤。
 
     回傳欄位：FEATURES 全部 + target（若 compute_labels=True）。
+    區間形成期間（前 OPENING_RANGE_MINUTES 分鐘）本身的樣本會被整批排除
+    （FEATURES 全部設為 NaN，靠呼叫端 dropna(subset=FEATURES) 篩掉）。
     """
     m1 = m1.copy()
     m1["date"] = pd.to_datetime(m1["date"])
     m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
     m1["day_date"] = m1["date"].dt.date
 
+    m1["hour"] = m1["date"].dt.hour
+    m1["minute"] = m1["date"].dt.minute
+    m1["minutes_since_open"] = (m1["hour"] - 9) * 60 + m1["minute"]
+
     g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
 
-    # 用當日開盤正規化收盤價，MACD line/histogram 天生就是「相對 day_open」
-    # 的比例值，跨股票可比（比照 rally 的做法）。
-    day_open = g_day["open"].transform("first").replace(0, np.nan)
-    m1["_m1_close"] = m1["close"] / day_open
+    # ── 開盤區間高低點（用前 OPENING_RANGE_MINUTES 分鐘的 high/low） ─────────
+    in_or = m1["minutes_since_open"] < OPENING_RANGE_MINUTES
+    m1["_or_high_raw"] = m1["high"].where(in_or)
+    m1["_or_low_raw"] = m1["low"].where(in_or)
+    m1["_or_vol_raw"] = m1["volume"].where(in_or)
+    or_high = g_day["_or_high_raw"].transform("max")
+    or_low = g_day["_or_low_raw"].transform("min")
+    or_vol_mean = g_day["_or_vol_raw"].transform("mean")
 
-    ema_fast = _degroup(g_day["_m1_close"].ewm(span=MACD_FAST, adjust=False).mean(), m1.index)
-    ema_slow = _degroup(g_day["_m1_close"].ewm(span=MACD_SLOW, adjust=False).mean(), m1.index)
-    m1["macd_line"] = ema_fast - ema_slow
+    or_range = (or_high - or_low).replace(0, np.nan)
+    m1["or_range_pct"] = or_range / or_low.replace(0, np.nan)
+    m1["close_pos_in_range"] = (m1["close"] - or_low) / or_range
+    m1["dist_to_or_high"] = (m1["close"] - or_high) / or_high.replace(0, np.nan)
+    m1["dist_to_or_low"] = (m1["close"] - or_low) / or_low.replace(0, np.nan)
+    m1["broke_above"] = (m1["close"] > or_high).astype(int)
+    m1["broke_below"] = (m1["close"] < or_low).astype(int)
 
-    g_macd = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    m1["macd_signal"] = _degroup(g_macd["macd_line"].ewm(span=MACD_SIGNAL, adjust=False).mean(), m1.index)
-    m1["macd_hist"] = m1["macd_line"] - m1["macd_signal"]
+    prev_close = g_day["close"].shift(1)
+    m1["breakout_up_signal"] = ((prev_close <= or_high) & (m1["close"] > or_high)).astype(int)
+    m1["breakout_down_signal"] = ((prev_close >= or_low) & (m1["close"] < or_low)).astype(int)
 
-    g_macd2 = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    m1["macd_hist_slope"] = m1["macd_hist"] - g_macd2["macd_hist"].shift(1)
-    m1["macd_hist_slope_3"] = m1["macd_hist"] - g_macd2["macd_hist"].shift(3)
+    m1["bars_since_breakout_up"] = _bars_since(m1, "breakout_up_signal")
+    m1["bars_since_breakout_down"] = _bars_since(m1, "breakout_down_signal")
 
-    m1["macd_above_signal"] = (m1["macd_line"] > m1["macd_signal"]).astype(int)
-    m1["macd_above_zero"] = (m1["macd_line"] > 0).astype(int)
+    m1["vol_ratio_vs_or"] = m1["volume"] / or_vol_mean.replace(0, np.nan)
+    m1["minutes_since_or_end"] = m1["minutes_since_open"] - OPENING_RANGE_MINUTES
 
-    prev_line = g_macd2["macd_line"].shift(1)
-    prev_signal = g_macd2["macd_signal"].shift(1)
-    m1["golden_cross"] = ((prev_line <= prev_signal) & (m1["macd_line"] > m1["macd_signal"])).astype(int)
-    m1["dead_cross"] = ((prev_line >= prev_signal) & (m1["macd_line"] < m1["macd_signal"])).astype(int)
+    # 區間形成期間本身不是可交易的樣本，整批排除（見檔頭說明）
+    for col in FEATURES:
+        m1.loc[in_or, col] = np.nan
 
-    m1["bars_since_golden_cross"] = _bars_since(m1, "golden_cross")
-    m1["bars_since_dead_cross"] = _bars_since(m1, "dead_cross")
-
-    g_macd3 = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    macd_chg_10 = m1["macd_hist"] - g_macd3["macd_hist"].shift(10)
-    price_chg_10 = m1["_m1_close"] - g_macd3["_m1_close"].shift(10)
-    m1["macd_divergence"] = macd_chg_10 - price_chg_10
-
-    m1 = m1.drop(columns=["_m1_close"])
+    m1 = m1.drop(columns=["_or_high_raw", "_or_low_raw", "_or_vol_raw"])
 
     if compute_labels:
         m1["target"] = _make_barrier_labels(m1)

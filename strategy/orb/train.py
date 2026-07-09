@@ -1,5 +1,5 @@
 """
-模型訓練 — LightGBM（只用 MACD 特徵）
+模型訓練 — LightGBM（只用 ORB 特徵）
 """
 
 import sys
@@ -15,7 +15,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 from strategy.orb.features import FEATURES, load_features
 
 _ROOT = Path(__file__).parent.parent.parent
-_MODEL_PATH_LGBM = _ROOT / "models/m1_macd_lgbm.pkl"
+_MODEL_PATH_LGBM = _ROOT / "models/m1_orb_lgbm.pkl"
 
 
 def train_lgbm(
@@ -24,7 +24,7 @@ def train_lgbm(
     end_date: str = "",
 ):
     """
-    訓練 LightGBM 模型（只用 MACD 特徵）。
+    訓練 LightGBM 模型（只用 ORB 特徵）。
 
     Parameters
     ----------
