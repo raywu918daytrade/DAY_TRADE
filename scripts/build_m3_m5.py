@@ -16,13 +16,14 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from data.query import load_m1
+from strategy.rally.features import compute_m3 as _compute_m3
+from strategy.rally.features import compute_m5 as _compute_m5
 
 _M1_DIR = _ROOT / "db/m1"
 _M3_DIR = _ROOT / "db/m3"
@@ -40,30 +41,6 @@ def _needs_update(target_dir: Path, month_key: str, m1_mtime: float) -> bool:
     if not target.exists():
         return True
     return target.stat().st_mtime < m1_mtime
-
-
-def _compute_m3(df: pd.DataFrame) -> pd.DataFrame:
-    """from 1-min data, compute rolling-3 OHLCV with volume sum."""
-    g = df.groupby(["stock_id", "day_date"], group_keys=False)
-    out = df[["stock_id", "date"]].copy()
-    out["open"] = g["open"].transform(lambda x: x.shift(2))
-    out["high"] = g["high"].transform(lambda x: x.rolling(3).max())
-    out["low"] = g["low"].transform(lambda x: x.rolling(3).min())
-    out["close"] = df["close"].values
-    out["volume"] = g["volume"].transform(lambda x: x.rolling(3).sum())
-    return out
-
-
-def _compute_m5(df: pd.DataFrame) -> pd.DataFrame:
-    """from 1-min data, compute rolling-5 OHLCV with volume sum."""
-    g = df.groupby(["stock_id", "day_date"], group_keys=False)
-    out = df[["stock_id", "date"]].copy()
-    out["open"] = g["open"].transform(lambda x: x.shift(4))
-    out["high"] = g["high"].transform(lambda x: x.rolling(5).max())
-    out["low"] = g["low"].transform(lambda x: x.rolling(5).min())
-    out["close"] = df["close"].values
-    out["volume"] = g["volume"].transform(lambda x: x.rolling(5).sum())
-    return out
 
 
 def _save_monthly(df: pd.DataFrame, target_dir: Path, prefix: str):

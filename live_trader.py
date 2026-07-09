@@ -50,8 +50,22 @@ from api import (
     tw_naive_to_epoch,
     update_positions_price,
 )
-from strategy.base.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
+import importlib
 import os
+
+# 策略模組切換：改 .env 的 STRATEGY_MODULE 就能換策略，不用改這支檔案。
+# 每個策略模組（例如 strategy/rally/live.py）都要暴露同一組介面：
+# load_model() / predict_live(...) / SESSION_START / SESSION_END
+# strategy/base/date_trade_model.py 已刪除（2026-07-09，特徵整合進
+# strategy/rally），預設值改成 rally；沒設 STRATEGY_MODULE 的環境（例如
+# 還沒同步這次改動的 Render 部署）務必記得在 .env 補上這個變數。
+STRATEGY_MODULE = os.environ.get("STRATEGY_MODULE", "strategy.rally.live")
+_strategy = importlib.import_module(STRATEGY_MODULE)
+SESSION_END = _strategy.SESSION_END
+SESSION_START = _strategy.SESSION_START
+load_model = _strategy.load_model
+predict_live = _strategy.predict_live
+print(f"[策略] 使用 {STRATEGY_MODULE}", flush=True)
 
 from data.fugle_tickers import update_tickers
 from data.m1_rest import M1RestPoller

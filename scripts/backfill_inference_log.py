@@ -106,7 +106,7 @@ def main():
 
     from data.data_manager import load_d1
     from data.fugle_tickers import update_tickers
-    from strategy.base.date_trade_model import SESSION_END, SESSION_START, load_model, predict_live
+    from strategy.rally.live import SESSION_END, SESSION_START, load_model, predict_live
 
     # 1. 當沖候選清單（名稱查詢也用這份）
     print("取得當沖候選清單...")

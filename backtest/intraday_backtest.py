@@ -26,6 +26,7 @@ def intraday_backtest(
     tp_pct: float = 0.03,       # 固定停利 3%
     hold_bars: int = 30,        # 最多持有幾根分K
     force_exit_time: str = "13:25",  # 強制出場時間（收盤前）
+    first_entry_time: str = "09:01",  # 最早進場時間
     last_entry_time: str = "10:00",  # 最晚進場時間（早盤動能窗口）
     init_cash: float = 1_000_000,
     fee_rate: float = 0.001425,  # 手續費（買賣各）
@@ -43,6 +44,7 @@ def intraday_backtest(
     portfolio_records: list = []
 
     force_exit_t  = pd.Timestamp(force_exit_time).time()
+    first_entry_t = pd.Timestamp(first_entry_time).time()
     last_entry_t  = pd.Timestamp(last_entry_time).time()
 
     for i, dt in enumerate(price.index):
@@ -77,6 +79,7 @@ def intraday_backtest(
                     "stock_id": sid,
                     "entry_dt": pos["entry_dt"],
                     "entry_price": pos["entry_price"],
+                    "entry_proba": pos.get("entry_proba"),
                     "exit_dt": dt,
                     "exit_price": exit_price,
                     "exit_reason": reason,
@@ -86,8 +89,8 @@ def intraday_backtest(
                 })
                 del positions[sid]
 
-        # ── 進場（超過最晚進場時間不開新倉）─────────────────────────────────
-        if not is_force_exit and dt.time() <= last_entry_t:
+        # ── 進場（限制在 first_entry_time ~ last_entry_time 區間內）──────────
+        if not is_force_exit and first_entry_t <= dt.time() <= last_entry_t:
             slots = max_positions - len(positions)
             if slots > 0:
                 row = entries.loc[dt]
@@ -106,6 +109,11 @@ def intraday_backtest(
                         break
                     shares = cost * (1 - fee_rate) / p
                     cash -= cost
+                    entry_proba = (
+                        df_proba.loc[dt, sid]
+                        if df_proba is not None and dt in df_proba.index and sid in df_proba.columns
+                        else None
+                    )
                     positions[sid] = {
                         "shares": shares,
                         "entry_price": p,
@@ -114,6 +122,7 @@ def intraday_backtest(
                         "cost": cost,
                         "sl": p * (1 - sl_pct),
                         "tp": p * (1 + tp_pct),
+                        "entry_proba": entry_proba,
                     }
 
         # ── 每根資產快照 ──────────────────────────────────────────────────────
@@ -131,7 +140,7 @@ def intraday_backtest(
 
     portfolio_df = pd.DataFrame(portfolio_records).set_index("dt")
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(columns=[
-        "stock_id", "entry_dt", "entry_price", "exit_dt", "exit_price",
+        "stock_id", "entry_dt", "entry_price", "entry_proba", "exit_dt", "exit_price",
         "exit_reason", "bars_held", "pnl", "pnl_pct",
     ])
     return portfolio_df, trades_df

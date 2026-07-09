@@ -124,7 +124,7 @@ def main():
     date_str = args.date
     print(f"驗證日期：{date_str}")
 
-    from strategy.base.date_trade_model import HOLD_BARS, SL_PCT, TP_PCT
+    from strategy.rally.config import HOLD_BARS, SL_PCT, TP_PCT
 
     signals = _load_signals(date_str)
     print(f"共 {len(signals)} 筆訊號要驗證（{signals['stock_id'].nunique()} 支股票）")

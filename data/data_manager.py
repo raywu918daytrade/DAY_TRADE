@@ -83,13 +83,17 @@ def _load_d1_from_hf(stocks: set) -> tuple[pd.DataFrame, set]:
     if not top:
         return pd.DataFrame(), set()
 
-    # 第 2 次：只讀過濾後股票的完整資料
-    tables = [pq.read_table(p, filters=[("stock_id", "in", list(top))]) for p in paths]
+    # 第 2 次：只讀過濾後股票的完整資料。額外帶上 0050——它不是當沖候選股
+    # （update_tickers() 用 type=EQUITY 過濾，ETF 本來就不會進 _day_trade_stocks），
+    # 但 rally 策略的 idx_day_* 特徵（大盤日K相對強弱）需要它，回傳的候選股集合
+    # top 仍然不含 0050，不會被當成可下單標的。
+    read_ids = top | {"0050"}
+    tables = [pq.read_table(p, filters=[("stock_id", "in", list(read_ids))]) for p in paths]
     df = pa.concat_tables(tables).to_pandas()
     del tables
     df["date"] = pd.to_datetime(df["date"])
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
-    print(f"  [D1] {len(df):,} 筆，{df['stock_id'].nunique():,} 支（均量過濾後）", flush=True)
+    print(f"  [D1] {len(df):,} 筆，{df['stock_id'].nunique():,} 支（均量過濾後 + 0050）", flush=True)
     return df, top
 
 
@@ -101,9 +105,10 @@ def _load_d1_local(stocks: set) -> tuple[pd.DataFrame, set]:
     full = load_day()
     print(f"  [D1] 本機全量：{len(full):,} 筆，開始均量過濾...", flush=True)
     top = set(_volume_filter(stocks, full[["stock_id", "date", "volume"]]))
-    df = full[full["stock_id"].isin(top)].copy()
+    # 額外帶上 0050，理由同 _load_d1_from_hf；top（候選股集合）仍不含 0050
+    df = full[full["stock_id"].isin(top | {"0050"})].copy()
     del full
-    print(f"  [D1] {len(df):,} 筆，{df['stock_id'].nunique():,} 支（均量過濾後）", flush=True)
+    print(f"  [D1] {len(df):,} 筆，{df['stock_id'].nunique():,} 支（均量過濾後 + 0050）", flush=True)
     return df, top
 
 

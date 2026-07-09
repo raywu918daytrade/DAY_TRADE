@@ -67,6 +67,7 @@ def run_backtest(
     tp_pct: float = 0.03,
     hold_bars: int = 30,
     force_exit_time: str = "13:25",
+    first_entry_time: str = "09:01",
     last_entry_time: str = "10:00",
     init_cash: float = 1_000_000,
 ):
@@ -97,6 +98,7 @@ def run_backtest(
         tp_pct=tp_pct,
         hold_bars=hold_bars,
         force_exit_time=force_exit_time,
+        first_entry_time=first_entry_time,
         last_entry_time=last_entry_time,
         init_cash=init_cash,
     )
@@ -128,6 +130,7 @@ def print_trades(trades_df: pd.DataFrame):
         "stock_id",
         "entry_dt",
         "entry_price",
+        "entry_proba",
         "exit_dt",
         "exit_price",
         "exit_reason",
@@ -185,11 +188,12 @@ def optimize_optuna(df_proba: pd.DataFrame, n_trials: int = 50):
 # ── 執行入口 ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from strategy.base.date_trade_model import predict
+    from strategy.rally.predict import predict
+    from strategy.rally.train import load_model_xgb
 
-    df_proba = predict()  # 載入已訓練模型並產生預測機率
+    df_proba = predict(model=load_model_xgb())  # 用 rally/XGB 模型產生預測機率
     portfolio_df, trades_df = run_backtest(
         df_proba,
-        threshold=0.60,
+        threshold=0.70,
     )
     print_trades(trades_df)
