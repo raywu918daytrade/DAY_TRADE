@@ -17,6 +17,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import pandas as pd
 from sklearn.metrics import accuracy_score, roc_auc_score
 
+from strategy.orb.config import DEFAULT_TEST_DAYS
 from strategy.orb.features import FEATURES, load_features, to_model_input
 from strategy.orb.train import _MODEL_PATH_LGBM, _MODEL_PATH_XGB, load_model_lgbm, load_model_xgb
 
@@ -48,9 +49,34 @@ _CONFIDENCE_LABELS = [
 ]
 
 
+def _warn_if_train_test_overlap(model, test_df: pd.DataFrame) -> None:
+    """
+    檢查驗證用的測試區間，是不是跟這個模型實際訓練時的切點重疊。
+
+    train.py 的 train_lgbm()/train_xgb() 會把訓練切點存在 model._orb_train_cutoff
+    上；如果驗證時傳的 test_days 跟訓練時不一樣，測試集可能有一部分其實是
+    模型訓練時看過的資料，算出來的 AUC/勝率會虛高、不能信（2026-07-10
+    實測過：訓練用 test_days=5、驗證卻用 test_days=10，AUC 從 0.65 假漲到
+    0.73，兩批資料重疊了快一半）。舊模型（加這個機制之前存的）沒有這個
+    屬性，跳過檢查，不報錯。
+    """
+    train_cutoff = getattr(model, "_orb_train_cutoff", None)
+    if train_cutoff is None:
+        return
+    test_start = test_df["date"].min()
+    if test_start <= train_cutoff:
+        print(
+            f"  ⚠️  警告：測試區間起點（{test_start.strftime('%Y-%m-%d')}）"
+            f"沒有晚於這個模型的訓練切點（{train_cutoff.strftime('%Y-%m-%d')}）——"
+            f"目前這份「測試集」有一部分是模型訓練時已經看過的資料，"
+            f"算出來的指標會虛高，不能信。請用跟訓練時一致的 test_days，"
+            f"或用這個 test_days 重新訓練一次。"
+        )
+
+
 def _load_test_df(
     model,
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ) -> pd.DataFrame:
@@ -65,6 +91,7 @@ def _load_test_df(
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     test_df = df[df["date"] > cutoff].copy()
     print(f"  測試區間: {test_df['date'].min().strftime('%Y-%m-%d')} ~ {test_df['date'].max().strftime('%Y-%m-%d')}")
+    _warn_if_train_test_overlap(model, test_df)
 
     test_df["proba"] = model.predict_proba(to_model_input(test_df))[:, 1]
     return test_df
@@ -72,7 +99,7 @@ def _load_test_df(
 
 def confidence_report(
     model=None,
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ):
@@ -95,7 +122,7 @@ def confidence_report(
 
 def coverage_report(
     model=None,
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ):
@@ -112,8 +139,8 @@ def coverage_report(
     print(f"  實際漲（label=1）: {total_pos:,} 筆")
     print(f"  實際跌（label=0）: {total_neg:,} 筆")
     print()
-    print(f"  {'門檻':>6}  {'訊號數':>7}  {'精確率':>7}  {'召回率':>7}  {'F1':>6}")
-    print("  " + "-" * 45)
+    print(f"  {'門檻':>6}  {'訊號數':>7}  {'抓到':>7}  {'實際漲':>8}  {'精確率':>7}  {'召回率':>7}  {'F1':>6}")
+    print("  " + "-" * 65)
 
     for thr in [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
         flagged = test_df["proba"] >= thr
@@ -121,12 +148,15 @@ def coverage_report(
         precision = tp / flagged.sum() if flagged.sum() > 0 else 0
         recall = tp / total_pos if total_pos > 0 else 0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        print(f"  {thr:.2f}  {flagged.sum():>7,}  {precision*100:>6.1f}%  {recall*100:>6.1f}%  {f1:.3f}")
+        print(
+            f"  {thr:.2f}  {flagged.sum():>7,}  {tp:>7,}  {total_pos:>8,}  "
+            f"{precision*100:>6.1f}%  {recall*100:>6.1f}%  {f1:.3f}"
+        )
 
 
 def hour_confidence_report(
     model=None,
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ):
@@ -160,7 +190,7 @@ def hour_confidence_report(
 
 
 def compare_report(
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ):
@@ -176,6 +206,8 @@ def compare_report(
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     test_df = df[df["date"] > cutoff].copy()
     print(f"  測試區間: {test_df['date'].min().strftime('%Y-%m-%d')} ~ {test_df['date'].max().strftime('%Y-%m-%d')}")
+    for name, model in models.items():
+        _warn_if_train_test_overlap(model, test_df)
 
     print("\n── LGBM vs XGB（同一份測試集）──")
     print(f"  {'模型':>6}  {'Accuracy':>9}  {'AUC':>7}")

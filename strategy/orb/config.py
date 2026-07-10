@@ -16,3 +16,12 @@ HOLD_BARS = 30
 OPENING_RANGE_MINUTES = 15  # 1分K版：開盤前15分鐘（9:00~9:15）
 OPENING_RANGE_M3_MINUTES = 9  # 3分K版：開盤前9分鐘（前3根3分K，9:00~9:09）
 OPENING_RANGE_M5_MINUTES = 20  # 5分K版：開盤前20分鐘（前4根5分K，9:00~9:20）
+
+# ── 訓練/驗證共用的測試集天數 ─────────────────────────────────────────────
+# train.py/validate.py/predict.py/entry.py 的 test_days 參數統一預設讀這裡，
+# 不要各自寫死 10——train_lgbm() 跟 confidence_report() 這類驗證函式如果各自
+# 預設不同的 test_days，訓練切點跟驗證切點會對不齊，測試集會偷看到訓練時
+# 看過的資料，指標虛高卻不知道（2026-07-10 實測過這個 bug，AUC 從 0.65
+# 假漲到 0.73）。validate.py 另外有 _warn_if_train_test_overlap() 會在真的
+# 傳了不一致的 test_days 時印警告，這裡的統一預設是從源頭降低發生機率。
+DEFAULT_TEST_DAYS = 10

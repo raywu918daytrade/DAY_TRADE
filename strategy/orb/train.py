@@ -12,6 +12,7 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from strategy.orb.config import DEFAULT_TEST_DAYS
 from strategy.orb.features import FEATURES, load_features, to_model_input
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -20,7 +21,7 @@ _MODEL_PATH_XGB = _ROOT / "models/m1_orb_xgb.pkl"
 
 
 def _prepare_train_test(
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ):
@@ -55,7 +56,7 @@ def _prepare_train_test(
 
 
 def train_lgbm(
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ):
@@ -64,6 +65,14 @@ def train_lgbm(
 
     train_df, test_df = _prepare_train_test(test_days, start_date, end_date)
     X_train, X_test = to_model_input(train_df), to_model_input(test_df)
+
+    # target 不平衡（漲約35% vs 跌約65%），scale_pos_weight 校準機率分佈，
+    # 讓 0.5 這個門檻對應到的召回率/精確率取捨點跟著調整（不會提升 AUC，
+    # 只是重新校準機率，等同於用不同方式選門檻，但不用手動改門檻數字）。
+    n_pos = (train_df["target"] == 1).sum()
+    n_neg = (train_df["target"] == 0).sum()
+    scale_pos_weight = n_neg / n_pos
+    print(f"  scale_pos_weight: {scale_pos_weight:.3f}（正樣本{n_pos:,} / 負樣本{n_neg:,}）")
 
     model = lgb.LGBMClassifier(
         n_estimators=300,
@@ -76,8 +85,14 @@ def train_lgbm(
         random_state=42,
         n_jobs=-1,
         verbosity=-1,
+        scale_pos_weight=scale_pos_weight,
     )
     model.fit(X_train, train_df["target"])
+    # 記錄實際訓練切點，讓 validate.py 之後能檢查「驗證用的 test_days 是否
+    # 跟訓練時不一致」——不一致會讓部分「測試集」其實是訓練時看過的資料，
+    # 驗證指標虛高（2026-07-10 發現：訓練用 test_days=5、驗證卻傳 test_days=10，
+    # AUC從0.65假摔／假漲到0.73，兩批資料重疊了快一半才是真正原因）。
+    model._orb_train_cutoff = train_df["date"].max()
 
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)[:, 1]
@@ -91,7 +106,7 @@ def train_lgbm(
 
 
 def train_xgb(
-    test_days: int = 10,
+    test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
 ):
@@ -100,6 +115,12 @@ def train_xgb(
 
     train_df, test_df = _prepare_train_test(test_days, start_date, end_date)
     X_train, X_test = to_model_input(train_df), to_model_input(test_df)
+
+    # 同 train_lgbm() 的 scale_pos_weight 校準邏輯
+    n_pos = (train_df["target"] == 1).sum()
+    n_neg = (train_df["target"] == 0).sum()
+    scale_pos_weight = n_neg / n_pos
+    print(f"  scale_pos_weight: {scale_pos_weight:.3f}（正樣本{n_pos:,} / 負樣本{n_neg:,}）")
 
     model = XGBClassifier(
         n_estimators=300,
@@ -114,8 +135,11 @@ def train_xgb(
         eval_metric="logloss",
         verbosity=0,
         enable_categorical=True,  # hour 是 category dtype（見 features.to_model_input）
+        scale_pos_weight=scale_pos_weight,
     )
     model.fit(X_train, train_df["target"])
+    # 記錄實際訓練切點，理由同 train_lgbm()
+    model._orb_train_cutoff = train_df["date"].max()
 
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)[:, 1]

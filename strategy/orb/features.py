@@ -167,6 +167,7 @@ FEATURES = [
     "m1_atr",  # 1分鐘K ATR(14) 相對波動（/ 當日開盤，比照 rally 的 m1_atr）
     "adx",  # ADX(14) 趨勢強度（用 talib 算，Wilder平滑手刻容易出錯）
     "vwap_dev",  # close 相對當日累積VWAP的偏離（比照 rally 的 vwap_dev）
+    "atr_hour_surprise",  # 當根TR / 這支股票在這個小時過去10天的歷史平均TR
     # ── 個股過去5日「開盤1/3/5分鐘成交量佔當日總量比例」lag特徵，無未來洩漏 ──
     "open_vol_m1_1",
     "open_vol_m1_2",
@@ -266,6 +267,74 @@ def _adx_group(g: pd.DataFrame) -> pd.Series:
     return pd.Series(adx, index=g.index)
 
 
+def _hourly_tr_summary(m1: pd.DataFrame) -> pd.DataFrame:
+    """
+    每 (stock_id, day_date, hour) 的平均 True Range（未做lag/rolling）。
+    m1 需已有 day_date/hour/_tr 欄位。給 make_features() 的 hourly_tr_history
+    參數、build_history_tables() 用。
+    """
+    out = m1.groupby(["stock_id", "day_date", "hour"], as_index=False)["_tr"].mean()
+    return out.rename(columns={"_tr": "_hourly_tr"})
+
+
+def _open_vol_ratios(m1: pd.DataFrame) -> pd.DataFrame:
+    """
+    每 (stock_id, day_date) 的「開盤1/3/5分鐘成交量佔當日總量比例」原始值
+    （未做lag位移）。m1 需已有 day_date 欄位、依 stock_id/date 排序。
+    給 make_features() 的 open_vol_history 參數、build_history_tables() 用。
+    """
+    group_keys = [m1["stock_id"], m1["day_date"]]
+    bar_pos = m1.groupby(["stock_id", "day_date"], group_keys=False).cumcount()
+    cum_vol_today = m1.groupby(["stock_id", "day_date"], group_keys=False)["volume"].transform("cumsum")
+    day_total_vol = m1.groupby(["stock_id", "day_date"], group_keys=False)["volume"].transform("sum")
+
+    summary = pd.DataFrame(
+        {
+            "stock_id": m1["stock_id"],
+            "day_date": m1["day_date"],
+            "_open_m1": m1["volume"].where(bar_pos == 0).groupby(group_keys, group_keys=False).transform("max"),
+            "_open_m3": cum_vol_today.where(bar_pos == 2).groupby(group_keys, group_keys=False).transform("max"),
+            "_open_m5": cum_vol_today.where(bar_pos == 4).groupby(group_keys, group_keys=False).transform("max"),
+            "_day_total_vol": day_total_vol,
+        }
+    )
+    summary = summary.dropna(subset=["_open_m1", "_open_m3", "_open_m5"]).drop_duplicates(["stock_id", "day_date"])
+    total = summary["_day_total_vol"].replace(0, np.nan)
+    summary["_r_m1"] = summary["_open_m1"] / total
+    summary["_r_m3"] = summary["_open_m3"] / total
+    summary["_r_m5"] = summary["_open_m5"] / total
+    return summary[["stock_id", "day_date", "_r_m1", "_r_m3", "_r_m5"]]
+
+
+def build_history_tables(m1: pd.DataFrame) -> tuple:
+    """
+    給 predict_live() 用：從歷史 db/m1/（load_m1() 的完整結果）算出
+    open_vol_history、hourly_tr_history 這兩張表，讓 atr_hour_surprise、
+    open_vol_m1~m5_1~5 這幾個「需要過去N天歷史」的特徵在即時推論時也能算——
+    m1_live 只有當天一天的資料，自己算不出「過去」，這兩個特徵在 make_features()
+    裡原本是直接從傳入的 m1 算，訓練時 m1 是完整歷史沒問題，即時推論時
+    m1（m1_live）只有今天，這兩個特徵會整批變 NaN（2026-07-10 用真實
+    db/m1_live/ 資料測 predict_live() 才發現，訓練路徑測不出來）。
+
+    呼叫端應該快取這兩張表（例如開盤前算一次），不要每分鐘重算一次——這裡面
+    的 groupby 是對全歷史 db/m1/ 跑的，效能考量跟 day 的快取方式一樣。
+    """
+    m1 = m1.copy()
+    m1["date"] = pd.to_datetime(m1["date"])
+    m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
+    m1["day_date"] = m1["date"].dt.date
+    m1["hour"] = m1["date"].dt.hour
+
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    prev_close = g_day["close"].shift(1).fillna(m1["open"])
+    m1["_tr"] = np.maximum(
+        np.maximum((m1["high"] - m1["low"]).abs(), (m1["high"] - prev_close).abs()),
+        (m1["low"] - prev_close).abs(),
+    )
+
+    return _open_vol_ratios(m1), _hourly_tr_summary(m1)
+
+
 def _bars_since(m1: pd.DataFrame, flag: pd.Series) -> pd.Series:
     """距最近一次 flag==1 幾根K棒（同一天內），今日尚未發生過則回傳 999。"""
     group_cols = [m1["stock_id"], m1["day_date"]]
@@ -312,10 +381,64 @@ def _orb_block(m1: pd.DataFrame, window_minutes: int, suffix: str) -> tuple:
     return feats, in_or
 
 
-def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame:
+def compute_m3(m1: pd.DataFrame) -> pd.DataFrame:
+    """
+    從 1 分K 現算 rolling-3 OHLCV（量用 sum）。跟 strategy/rally/features.py
+    的 compute_m3() 是同一份邏輯，複製過來維持 orb/ 自成一個獨立模組
+    （不跨 strategy 資料夾互相 import，理由見 [[feedback_isolate_experiments]]
+    同一套「模組互相獨立」原則）。
+
+    輸入需先有 stock_id / date / day_date 欄位並依 stock_id、date 排序。
+    predict_live() 對當天的 m1_live 現算用——db/m3/ 是批次產物，不含「今天」
+    的資料，即時推論不能拿它 merge，否則 m3_* 全部變 NaN。
+    """
+    g = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    out = m1[["stock_id", "date"]].copy()
+    out["open"] = g["open"].shift(2)
+    out["high"] = _degroup(g["high"].rolling(3).max(), m1.index)
+    out["low"] = _degroup(g["low"].rolling(3).min(), m1.index)
+    out["close"] = m1["close"].values
+    out["volume"] = _degroup(g["volume"].rolling(3).sum(), m1.index)
+    return out
+
+
+def compute_m5(m1: pd.DataFrame) -> pd.DataFrame:
+    """從 1 分K 現算 rolling-5 OHLCV（量用 sum）。用法同 compute_m3()。"""
+    g = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    out = m1[["stock_id", "date"]].copy()
+    out["open"] = g["open"].shift(4)
+    out["high"] = _degroup(g["high"].rolling(5).max(), m1.index)
+    out["low"] = _degroup(g["low"].rolling(5).min(), m1.index)
+    out["close"] = m1["close"].values
+    out["volume"] = _degroup(g["volume"].rolling(5).sum(), m1.index)
+    return out
+
+
+def make_features(
+    m1: pd.DataFrame,
+    m3: pd.DataFrame | None = None,
+    m5: pd.DataFrame | None = None,
+    day: pd.DataFrame | None = None,
+    open_vol_history: pd.DataFrame | None = None,
+    hourly_tr_history: pd.DataFrame | None = None,
+    compute_labels: bool = True,
+) -> pd.DataFrame:
     """
     算三組獨立開盤區間突破特徵（1分K/3分K/5分K版，窗口長度不同）
     + 3分K/5分K 中期動能確認 + triple barrier 標籤。
+
+    m3/m5/day 留空時分別 fallback 去讀 db/m3、db/m5、db/fugle_day 批次資料
+    （訓練走這條路徑）；predict_live() 對當天 m1_live 現算 m3_live/m5_live
+    後要明確傳進來，不能依賴 fallback——批次資料不含「今天」，會讓 m3_*/m5_*
+    整批變 NaN（見 compute_m3()/compute_m5() 的說明）。
+
+    open_vol_history/hourly_tr_history：atr_hour_surprise、open_vol_m1~m5_1~5
+    這兩組特徵需要「過去N天」的歷史（不是只有今天），訓練時 m1 本來就是完整
+    歷史，這兩個參數留空即可（fallback 用 m1 自己算）；predict_live() 傳進來
+    的 m1 是 m1_live（只有今天一天），這兩個參數必須用 build_history_tables()
+    對歷史 db/m1/ 算好、明確傳進來，否則這兩組特徵會整批變 NaN（2026-07-10
+    用真實 db/m1_live/ 資料測 predict_live() 才發現，訓練路徑測不出來，因為
+    訓練的 m1 剛好本身就是歷史資料）。
 
     回傳欄位：FEATURES 全部 + target（若 compute_labels=True）。
     每組區間形成期間本身的樣本，該組欄位會被設為 NaN；三組窗口長度不同
@@ -365,14 +488,44 @@ def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame
     _vwap = m1["_cum_pv"] / m1["_cum_vol"].replace(0, np.nan)
     m1["vwap_dev"] = (m1["close"] - _vwap) / _vwap.replace(0, np.nan)
 
-    m1 = m1.drop(columns=["_tr", "_cum_vol", "_pv", "_cum_pv"])
+    # 波動意外程度：當根TR / 這支股票在「這個小時」過去幾天的歷史平均TR。
+    # 不是跟自己全天平均比（那是 m1_atr），是跟同一個股票、同一個小時的
+    # 歷史水準比——同樣是1分K的TR，9點天生就比12點大，直接比較會把
+    # 「這個時段本來就該動」跟「這個時段不該動卻在動」混在一起，後者才是
+    # 比較有意義的訊號（例如平常清淡的午盤突然放量，比開盤的波動更值得注意）。
+    # 用過去10天同一小時的TR平均當基準，shift(1)避免看到今天自己這小時的值。
+    # hourly_tr_history 有傳進來的話（predict_live()）要跟「今天自己」的
+    # hourly summary 合併，不然 shift(1) 在只有今天一天的資料裡永遠是 NaN。
+    hourly_summary = _hourly_tr_summary(m1)
+    if hourly_tr_history is not None:
+        hourly_summary = pd.concat([hourly_tr_history, hourly_summary], ignore_index=True)
+        hourly_summary = hourly_summary.drop_duplicates(["stock_id", "day_date", "hour"], keep="last")
+    hourly_summary = hourly_summary.sort_values(["stock_id", "hour", "day_date"])
+    _hourly_group_keys = [hourly_summary["stock_id"], hourly_summary["hour"]]
+    _hourly_tr_shift1 = hourly_summary.groupby(["stock_id", "hour"], group_keys=False)["_hourly_tr"].shift(1)
+    hourly_summary["_hourly_tr_baseline"] = _degroup(
+        _hourly_tr_shift1.groupby(_hourly_group_keys, group_keys=False).rolling(10, min_periods=5).mean(),
+        hourly_summary.index,
+    )
+    m1 = m1.merge(
+        hourly_summary[["stock_id", "day_date", "hour", "_hourly_tr_baseline"]],
+        on=["stock_id", "day_date", "hour"],
+        how="left",
+    )
+    m1["atr_hour_surprise"] = m1["_tr"] / m1["_hourly_tr_baseline"].replace(0, np.nan)
+
+    m1 = m1.drop(columns=["_tr", "_cum_vol", "_pv", "_cum_pv", "_hourly_tr_baseline"])
 
     # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷 ─────────────
     # db/m3、db/m5 是批次預算（scripts/build_m3_m5.py 從 db/m1/ 算好存檔，
     # 用的是 strategy/rally/features.py 的 compute_m3()/compute_m5()），
-    # 只有訓練用的完整歷史 m1 才會跟它對得上。
-    m3 = load_m3()
-    m5 = load_m5()
+    # 只有訓練用的完整歷史 m1 才會跟它對得上，即時推論要呼叫端傳 m3/m5 進來。
+    if m3 is None:
+        m3 = load_m3()
+    if m5 is None:
+        m5 = load_m5()
+    m3 = m3.copy()
+    m5 = m5.copy()
     m3["date"] = pd.to_datetime(m3["date"])
     m5["date"] = pd.to_datetime(m5["date"])
 
@@ -429,32 +582,13 @@ def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame
     # ── 個股過去5日「開盤1/3/5分鐘成交量佔當日總量比例」lag特徵 ─────────────
     # 用比例（佔當日總量%），不是原始量，才能跨股票比較。逐日算出比例後，
     # 用跟 day_ret_1~5 一樣的 shift(lag) 做法把過去5天的值帶到今天這一列，
-    # 不會看到「今天自己」的開盤量佔比。
-    _group_keys = [m1["stock_id"], m1["day_date"]]
-    _bar_pos = m1.groupby(["stock_id", "day_date"], group_keys=False).cumcount()
-    _cum_vol_today = m1.groupby(["stock_id", "day_date"], group_keys=False)["volume"].transform("cumsum")
-    _day_total_vol = m1.groupby(["stock_id", "day_date"], group_keys=False)["volume"].transform("sum")
-
-    # 每個 (stock_id, day_date) 分組裡，開盤第1/3/5根的值只落在該分組其中一列，
-    # 其他列是 NaN；用 transform("max") 把那個唯一的非NaN值廣播回同組每一列，
-    # 之後才能同一列上同時拿到三個指標、drop_duplicates 取一天一列。
-    open_vol_summary = pd.DataFrame(
-        {
-            "stock_id": m1["stock_id"],
-            "day_date": m1["day_date"],
-            "_open_m1": m1["volume"].where(_bar_pos == 0).groupby(_group_keys, group_keys=False).transform("max"),
-            "_open_m3": _cum_vol_today.where(_bar_pos == 2).groupby(_group_keys, group_keys=False).transform("max"),
-            "_open_m5": _cum_vol_today.where(_bar_pos == 4).groupby(_group_keys, group_keys=False).transform("max"),
-            "_day_total_vol": _day_total_vol,
-        }
-    )
-    open_vol_summary = open_vol_summary.dropna(
-        subset=["_open_m1", "_open_m3", "_open_m5"]
-    ).drop_duplicates(["stock_id", "day_date"])
-    _total = open_vol_summary["_day_total_vol"].replace(0, np.nan)
-    open_vol_summary["_r_m1"] = open_vol_summary["_open_m1"] / _total
-    open_vol_summary["_r_m3"] = open_vol_summary["_open_m3"] / _total
-    open_vol_summary["_r_m5"] = open_vol_summary["_open_m5"] / _total
+    # 不會看到「今天自己」的開盤量佔比。open_vol_history 有傳進來的話
+    # （predict_live()）要跟「今天自己」的比例合併，不然 shift(1) 在只有
+    # 今天一天的資料裡永遠是 NaN。
+    open_vol_summary = _open_vol_ratios(m1)
+    if open_vol_history is not None:
+        open_vol_summary = pd.concat([open_vol_history, open_vol_summary], ignore_index=True)
+        open_vol_summary = open_vol_summary.drop_duplicates(["stock_id", "day_date"], keep="last")
     open_vol_summary = open_vol_summary.sort_values(["stock_id", "day_date"])
 
     osg = open_vol_summary.groupby("stock_id", group_keys=False)
@@ -470,7 +604,9 @@ def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame
     )
 
     # ── 個股日K 背景特徵（過去5天報酬率、ATR、5/10/20日均線乖離）─────────────
-    day = load_day()
+    if day is None:
+        day = load_day()
+    day = day.copy()
     day["date"] = pd.to_datetime(day["date"])
     day["day_date"] = day["date"].dt.date
 
