@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from strategy.orb.features import FEATURES, load_features
+from strategy.orb.features import FEATURES, load_features, to_model_input
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH_LGBM = _ROOT / "models/m1_orb_lgbm.pkl"
@@ -63,6 +63,7 @@ def train_lgbm(
     import lightgbm as lgb
 
     train_df, test_df = _prepare_train_test(test_days, start_date, end_date)
+    X_train, X_test = to_model_input(train_df), to_model_input(test_df)
 
     model = lgb.LGBMClassifier(
         n_estimators=300,
@@ -76,10 +77,10 @@ def train_lgbm(
         n_jobs=-1,
         verbosity=-1,
     )
-    model.fit(train_df[FEATURES], train_df["target"])
+    model.fit(X_train, train_df["target"])
 
-    y_pred = model.predict(test_df[FEATURES])
-    y_prob = model.predict_proba(test_df[FEATURES])[:, 1]
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
     print(f"\nAccuracy : {accuracy_score(test_df['target'], y_pred):.4f}")
     print(f"AUC      : {roc_auc_score(test_df['target'], y_prob):.4f}")
 
@@ -98,6 +99,7 @@ def train_xgb(
     from xgboost import XGBClassifier
 
     train_df, test_df = _prepare_train_test(test_days, start_date, end_date)
+    X_train, X_test = to_model_input(train_df), to_model_input(test_df)
 
     model = XGBClassifier(
         n_estimators=300,
@@ -111,11 +113,12 @@ def train_xgb(
         n_jobs=-1,
         eval_metric="logloss",
         verbosity=0,
+        enable_categorical=True,  # hour 是 category dtype（見 features.to_model_input）
     )
-    model.fit(train_df[FEATURES], train_df["target"])
+    model.fit(X_train, train_df["target"])
 
-    y_pred = model.predict(test_df[FEATURES])
-    y_prob = model.predict_proba(test_df[FEATURES])[:, 1]
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
     print(f"\nAccuracy : {accuracy_score(test_df['target'], y_pred):.4f}")
     print(f"AUC      : {roc_auc_score(test_df['target'], y_prob):.4f}")
 

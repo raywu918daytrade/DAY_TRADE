@@ -23,7 +23,7 @@ import pandas as pd
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from data.query import load_m1, load_m3, load_m5
+from data.query import load_day, load_m1, load_m3, load_m5
 from strategy.orb.config import (
     HOLD_BARS,
     OPENING_RANGE_M3_MINUTES,
@@ -35,6 +35,7 @@ from strategy.orb.config import (
 
 _ROOT = Path(__file__).parent.parent.parent
 _M1_DIR = _ROOT / "db/m1"
+_DAY_DIR = _ROOT / "db/fugle_day"
 _CACHE_PATH = _ROOT / "cache/m1_orb_features.parquet"
 
 
@@ -47,10 +48,19 @@ def _m1_mtime() -> float:
     return max(mtimes) if mtimes else 0
 
 
+def _day_mtime() -> float:
+    """db/fugle_day/ 中最新檔案的修改時間戳。"""
+    if not _DAY_DIR.exists():
+        return 0
+    mtimes = [f.stat().st_mtime for f in _DAY_DIR.iterdir() if f.suffix == ".parquet"]
+    return max(mtimes) if mtimes else 0
+
+
 def _cache_is_fresh() -> bool:
     if not _CACHE_PATH.exists():
         return False
-    return _CACHE_PATH.stat().st_mtime >= _m1_mtime()
+    cache_mtime = _CACHE_PATH.stat().st_mtime
+    return cache_mtime >= _m1_mtime() and cache_mtime >= _day_mtime()
 
 
 def load_features(force_rebuild: bool = False) -> pd.DataFrame:
@@ -157,7 +167,76 @@ FEATURES = [
     "m1_atr",  # 1分鐘K ATR(14) 相對波動（/ 當日開盤，比照 rally 的 m1_atr）
     "adx",  # ADX(14) 趨勢強度（用 talib 算，Wilder平滑手刻容易出錯）
     "vwap_dev",  # close 相對當日累積VWAP的偏離（比照 rally 的 vwap_dev）
+    # ── 個股過去5日「開盤1/3/5分鐘成交量佔當日總量比例」lag特徵，無未來洩漏 ──
+    "open_vol_m1_1",
+    "open_vol_m1_2",
+    "open_vol_m1_3",
+    "open_vol_m1_4",
+    "open_vol_m1_5",
+    "open_vol_m3_1",
+    "open_vol_m3_2",
+    "open_vol_m3_3",
+    "open_vol_m3_4",
+    "open_vol_m3_5",
+    "open_vol_m5_1",
+    "open_vol_m5_2",
+    "open_vol_m5_3",
+    "open_vol_m5_4",
+    "open_vol_m5_5",
+    # ── 個股日K 背景特徵（過去5天報酬率、ATR、5/10/20日均線乖離，無未來洩漏）──
+    "day_ret_1",
+    "day_ret_2",
+    "day_ret_3",
+    "day_ret_4",
+    "day_ret_5",
+    "day_atr",  # 個股日K ATR(14) 相對波動（前一日，/ 當日開盤）
+    "ma_dev_5",  # 昨收 vs 昨5日均線乖離
+    "ma_dev_10",  # 昨收 vs 昨10日均線乖離
+    "ma_dev_20",  # 昨收 vs 昨20日均線乖離
+    "close_vs_close_lag1",  # 目前價格 vs 過去1~5天各自收盤價的漲跌幅（逐分鐘更新）
+    "close_vs_close_lag2",
+    "close_vs_close_lag3",
+    "close_vs_close_lag4",
+    "close_vs_close_lag5",
+    # ── 大盤（0050）背景特徵（比照 rally 做法，廣播至所有個股）──────────────
+    "idx_day_ret_1",
+    "idx_day_ret_2",
+    "idx_day_ret_3",
+    "idx_day_ret_4",
+    "idx_day_ret_5",
+    "idx_day_atr",  # 0050 日K ATR(14) 相對波動（前一日，/ 當日開盤）
+    "idx_ret_1",  # 0050 前1分報酬率
+    "idx_vs_open",  # 0050 收盤 / 0050 當日開盤（大盤相對開盤漲跌幅）
+    "idx_atr",  # 0050 1分K ATR(14) 相對波動（/ 0050 當日開盤）
+    "idx_up",  # 0050 收盤 > 開盤（0/1，大盤是否站上開盤）
+    "hour",  # 時段（9~13），類別型——盤中行為常是開收盤忙、中午淡的非單調型態
 ]
+# 2026-07-10 試過加 group（類股分類，db/info/info.parquet，49類）當類別特徵，
+# LGBM/XGB 的測試集 AUC 都變差（LGBM 0.6460→0.6246、XGB 0.5977→0.5815），
+# 儘管 LGBM 特徵重要性排名第1——高基數類別特徵過擬合的典型徵兆（不少類股
+# 訓練樣本數很少，樹學到訓練期間的巧合，測試期不成立），已經拿掉，不要
+# 再加回來，除非之後有辦法解決過擬合（例如調 min_data_per_group/cat_smooth）。
+
+# hour 只有5個值（9~13），且盤中行為是U型（開收盤忙、中午淡）不是單調遞增/遞減，
+# 當類別型讓樹模型能一刀分出任意子集組合（例如{9,13} vs {10,11,12}），
+# 不用像數值型那樣繞兩刀去逼近。呼叫端要用 to_model_input()，不要直接
+# df[FEATURES]，否則 hour 會被當一般數值餵進去，這個設計就白做了。
+CATEGORICAL_FEATURES = ["hour"]
+
+
+def to_model_input(df: pd.DataFrame) -> pd.DataFrame:
+    """把 FEATURES 欄位轉成餵給模型用的格式（CATEGORICAL_FEATURES 轉 category dtype）。
+
+    train.py 的 fit()/predict() 跟 validate.py 的 predict_proba() 都要用這支，
+    確保訓練跟推論看到的 dtype 一致——LightGBM/XGBoost 都是靠欄位 dtype 是不是
+    pandas 'category' 來判斷要不要當類別特徵處理，train/predict 兩邊沒對齊
+    的話，同一個模型可能一邊當類別、一邊當數值，結果不一致或直接報錯。
+    """
+    X = df[FEATURES].copy()
+    for col in CATEGORICAL_FEATURES:
+        if col in X.columns:
+            X[col] = X[col].astype("category")
+    return X
 
 
 def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
@@ -346,6 +425,176 @@ def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame
     for col, series in m5_orb_feats.items():
         m1[col] = series
     m1.loc[in_or_m5, list(m5_orb_feats.keys())] = np.nan
+
+    # ── 個股過去5日「開盤1/3/5分鐘成交量佔當日總量比例」lag特徵 ─────────────
+    # 用比例（佔當日總量%），不是原始量，才能跨股票比較。逐日算出比例後，
+    # 用跟 day_ret_1~5 一樣的 shift(lag) 做法把過去5天的值帶到今天這一列，
+    # 不會看到「今天自己」的開盤量佔比。
+    _group_keys = [m1["stock_id"], m1["day_date"]]
+    _bar_pos = m1.groupby(["stock_id", "day_date"], group_keys=False).cumcount()
+    _cum_vol_today = m1.groupby(["stock_id", "day_date"], group_keys=False)["volume"].transform("cumsum")
+    _day_total_vol = m1.groupby(["stock_id", "day_date"], group_keys=False)["volume"].transform("sum")
+
+    # 每個 (stock_id, day_date) 分組裡，開盤第1/3/5根的值只落在該分組其中一列，
+    # 其他列是 NaN；用 transform("max") 把那個唯一的非NaN值廣播回同組每一列，
+    # 之後才能同一列上同時拿到三個指標、drop_duplicates 取一天一列。
+    open_vol_summary = pd.DataFrame(
+        {
+            "stock_id": m1["stock_id"],
+            "day_date": m1["day_date"],
+            "_open_m1": m1["volume"].where(_bar_pos == 0).groupby(_group_keys, group_keys=False).transform("max"),
+            "_open_m3": _cum_vol_today.where(_bar_pos == 2).groupby(_group_keys, group_keys=False).transform("max"),
+            "_open_m5": _cum_vol_today.where(_bar_pos == 4).groupby(_group_keys, group_keys=False).transform("max"),
+            "_day_total_vol": _day_total_vol,
+        }
+    )
+    open_vol_summary = open_vol_summary.dropna(
+        subset=["_open_m1", "_open_m3", "_open_m5"]
+    ).drop_duplicates(["stock_id", "day_date"])
+    _total = open_vol_summary["_day_total_vol"].replace(0, np.nan)
+    open_vol_summary["_r_m1"] = open_vol_summary["_open_m1"] / _total
+    open_vol_summary["_r_m3"] = open_vol_summary["_open_m3"] / _total
+    open_vol_summary["_r_m5"] = open_vol_summary["_open_m5"] / _total
+    open_vol_summary = open_vol_summary.sort_values(["stock_id", "day_date"])
+
+    osg = open_vol_summary.groupby("stock_id", group_keys=False)
+    open_vol_cols = []
+    for metric, raw_col in [("open_vol_m1", "_r_m1"), ("open_vol_m3", "_r_m3"), ("open_vol_m5", "_r_m5")]:
+        for lag in range(1, 6):
+            col = f"{metric}_{lag}"
+            open_vol_summary[col] = osg[raw_col].shift(lag)
+            open_vol_cols.append(col)
+
+    m1 = m1.merge(
+        open_vol_summary[["stock_id", "day_date"] + open_vol_cols], on=["stock_id", "day_date"], how="left"
+    )
+
+    # ── 個股日K 背景特徵（過去5天報酬率、ATR、5/10/20日均線乖離）─────────────
+    day = load_day()
+    day["date"] = pd.to_datetime(day["date"])
+    day["day_date"] = day["date"].dt.date
+
+    dg = day.groupby("stock_id")
+    day["_ret1"] = dg["close"].pct_change(1)
+    dg2 = day.groupby("stock_id", group_keys=False)
+    day_ret_cols = []
+    for lag in range(1, 6):
+        cr = f"day_ret_{lag}"
+        # shift(lag) 不是 shift(lag-1)：理由同 idx_day_ret_N（CLAUDE.md 提過的
+        # day_ret_N 未來資料洩漏 bug，D這一列要存「D-1（或更早）已經收盤、確定
+        # 知道」的報酬率，不能讓D自己全天才知道的報酬率露出來）。
+        day[cr] = dg2["_ret1"].shift(lag)
+        day_ret_cols.append(cr)
+    day = day.drop(columns=["_ret1"])
+
+    # ATR(14)：True Range 要前一日收盤才算得出來（day2起才有第一個TR），
+    # rolling(14, min_periods=14) 再等14個有效TR值才有第一個ATR14（day15起），
+    # 「昨天的ATR14」用在今天要再 shift(1)——這支股票至少要16天歷史日K，
+    # day_atr 才不是 NaN（同做法見 rally 的 day_atr）。
+    dg = day.groupby("stock_id")
+    day["_prev_close"] = dg["close"].shift(1)
+    day["_day_tr"] = np.maximum(
+        np.maximum((day["high"] - day["low"]).abs(), (day["high"] - day["_prev_close"]).abs()),
+        (day["low"] - day["_prev_close"]).abs(),
+    )
+    dg = day.groupby("stock_id")
+    day["_atr14"] = _degroup(dg["_day_tr"].rolling(14, min_periods=14).mean(), day.index)
+    day["day_atr"] = day["_atr14"].shift(1) / day["open"].replace(0, np.nan)
+    day = day.drop(columns=["_prev_close", "_day_tr", "_atr14"])
+
+    # 5/10/20日均線乖離：昨收 vs（算到昨天為止的）N日均線，> 0 代表昨天站上均線。
+    # 跟 rally 的 pos_20d 同做法：先算「當日版」乖離，再整個 shift(1) 到下一天，
+    # 避免用到「今天自己」的收盤價。
+    dg = day.groupby("stock_id")
+    ma_cols = []
+    for n in [5, 10, 20]:
+        ma_n = _degroup(dg["close"].rolling(n, min_periods=n).mean(), day.index)
+        col = f"ma_dev_{n}"
+        _dev_raw = day["close"] / ma_n.replace(0, np.nan) - 1
+        day[col] = _dev_raw.groupby(day["stock_id"], group_keys=False).shift(1)
+        ma_cols.append(col)
+
+    # 過去1~5天各自的收盤價（原始價格，只當合併用的暫存基準，merge完就丟掉）
+    dg = day.groupby("stock_id")
+    close_lag_ref_cols = []
+    for lag in range(1, 6):
+        col = f"_close_lag{lag}_ref"
+        day[col] = dg["close"].shift(lag)
+        close_lag_ref_cols.append(col)
+
+    day_feat_cols = ["stock_id", "day_date"] + day_ret_cols + ["day_atr"] + ma_cols + close_lag_ref_cols
+    m1 = m1.merge(day[day_feat_cols], on=["stock_id", "day_date"], how="left")
+
+    # 目前價格 vs 過去1~5天各自收盤價的漲跌幅：逐分鐘更新，代表「今天到目前
+    # 為止相對過去N天收盤的累積漲跌幅」——台股漲跌停、當日整體表現都是以
+    # 昨收為基準，今天若突破昨收（由負轉正）是重要的技術位階；再往前比對
+    # D-2~D-5，可以看出這波漲跌是只對昨天有意義、還是對過去幾天都成立
+    # （例如 lag1~lag3 都轉正代表站上近3天的價格，比只看lag1更強的訊號）。
+    # broke_above/broke_below 那套離散訊號在ORB驗證過幾乎沒用，這裡直接給
+    # 連續值讓樹自己在0附近找分割點。
+    close_vs_close_cols = []
+    for lag in range(1, 6):
+        col = f"close_vs_close_lag{lag}"
+        m1[col] = m1["close"] / m1[f"_close_lag{lag}_ref"].replace(0, np.nan) - 1
+        close_vs_close_cols.append(col)
+    m1 = m1.drop(columns=close_lag_ref_cols)
+
+    # ── 大盤（0050）背景特徵（比照 rally 做法，廣播至所有個股）─────────────
+    idx_day = day[day["stock_id"] == "0050"].copy()
+    if not idx_day.empty:
+        idx_dg = idx_day.groupby("stock_id")
+        idx_day["_idx_ret1"] = idx_dg["close"].pct_change(1)
+        idx_dg2 = idx_day.groupby("stock_id", group_keys=False)
+        idx_day_ret_cols = []
+        for lag in range(1, 6):
+            cr = f"idx_day_ret_{lag}"
+            # shift(lag) 不是 shift(lag-1)：D這一列存的是「D自己收盤vs D-1收盤」的報酬率，
+            # D自己全天報酬率要收盤才知道，intraday當下不該看得到（同 CLAUDE.md 提過的
+            # day_ret_N 未來資料洩漏 bug，這裡直接用修正後的寫法）。
+            idx_day[cr] = idx_dg2["_idx_ret1"].shift(lag)
+            idx_day_ret_cols.append(cr)
+        idx_day = idx_day.drop(columns=["_idx_ret1"])
+        idx_dg = idx_day.groupby("stock_id")
+        idx_day["_idx_prev_close"] = idx_dg["close"].shift(1)
+        idx_day["_idx_day_tr"] = np.maximum(
+            np.maximum(
+                (idx_day["high"] - idx_day["low"]).abs(), (idx_day["high"] - idx_day["_idx_prev_close"]).abs()
+            ),
+            (idx_day["low"] - idx_day["_idx_prev_close"]).abs(),
+        )
+        idx_dg = idx_day.groupby("stock_id")
+        idx_day["_idx_atr14"] = _degroup(idx_dg["_idx_day_tr"].rolling(14, min_periods=14).mean(), idx_day.index)
+        idx_day["idx_day_atr"] = idx_day["_idx_atr14"].shift(1) / idx_day["open"].replace(0, np.nan)
+        idx_day_feat_cols = ["day_date"] + idx_day_ret_cols + ["idx_day_atr"]
+        m1 = m1.merge(idx_day[idx_day_feat_cols], on=["day_date"], how="left")
+
+    # 欄位一律先建立（預設 NaN）：0050 若某天缺資料，這裡不該讓 FEATURES 缺欄位
+    for _col in ["idx_ret_1", "idx_vs_open", "idx_atr", "idx_up"]:
+        m1[_col] = np.nan
+
+    idx_m1 = m1[m1["stock_id"] == "0050"].copy()
+    if not idx_m1.empty:
+        idx_g_day = idx_m1.groupby("day_date", group_keys=False)
+        idx_day_open = idx_g_day["open"].transform("first").replace(0, np.nan)
+        idx_ret_1 = idx_g_day["close"].pct_change(1)
+        m1.loc[idx_m1.index, "idx_ret_1"] = idx_ret_1.values
+        m1.loc[idx_m1.index, "idx_vs_open"] = (idx_m1["close"] / idx_day_open).values
+        idx_prev_close = idx_g_day["close"].shift(1).fillna(idx_m1["open"])
+        idx_m1["_idx_tr"] = np.maximum(
+            np.maximum((idx_m1["high"] - idx_m1["low"]).abs(), (idx_m1["high"] - idx_prev_close).abs()),
+            (idx_m1["low"] - idx_prev_close).abs(),
+        )
+        idx_g_day2 = idx_m1.groupby("day_date", group_keys=False)
+        m1.loc[idx_m1.index, "idx_atr"] = (
+            _degroup(idx_g_day2["_idx_tr"].rolling(14, min_periods=14).mean(), idx_m1.index) / idx_day_open
+        ).values
+        m1.loc[idx_m1.index, "idx_up"] = (idx_m1["close"] > idx_day_open).astype(int).values
+
+        # 廣播 0050 特徵至所有個股（以完整時間戳 date 為 key，逐分鐘對齊）
+        idx_feat_cols = ["date", "idx_ret_1", "idx_vs_open", "idx_atr", "idx_up"]
+        idx_feat = m1.loc[idx_m1.index, idx_feat_cols].drop_duplicates("date")
+        m1 = m1.drop(columns=["idx_ret_1", "idx_vs_open", "idx_atr", "idx_up"], errors="ignore")
+        m1 = m1.merge(idx_feat, on=["date"], how="left")
 
     if compute_labels:
         m1["target"] = _make_barrier_labels(m1)
