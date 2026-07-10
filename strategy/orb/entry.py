@@ -5,14 +5,14 @@
     config.py     交易相關設定（TP/SL/HOLD_BARS、開盤區間分鐘數）
     features.py   ORB 特徵工程、triple barrier 標籤、FEATURES 清單、load_features() cache
     train.py      LightGBM / XGBoost 訓練與模型載入
-    validate.py   信心度分析、召回率分析、時段交叉報表、特徵重要性、LGBM vs XGB 比較
+    validate.py   信心度分析、召回率分析、分鐘區間交叉報表、特徵重要性、LGBM vs XGB 比較
     predict.py    predict()（批次機率矩陣，回測用）、predict_live()（即時推論入口）
 
 == Main 模式 ==
 
 train_lgbm   訓練 LightGBM 模型
 train_xgb    訓練 XGBoost 模型
-validate     信心度分析 + 召回率分析 + 時段(9~13點)交叉報表 + 特徵重要性（LGBM、XGB 已訓練的都跑）
+validate     信心度分析 + 召回率分析 + 突破後分鐘區間交叉報表 + 特徵重要性（LGBM、XGB 已訓練的都跑）
 compare      LGBM vs XGB 同一份測試集 Accuracy/AUC 對照（兩個模型都要先訓練過）
 predict      印批次機率矩陣（predict()）的形狀跟最後一個時間點的排行榜，用來肉眼檢查
 """
@@ -33,7 +33,7 @@ from strategy.orb.validate import (
     confidence_report,
     coverage_report,
     feature_importance,
-    hour_confidence_report,
+    minute_confidence_report,
 )
 
 
@@ -79,7 +79,7 @@ def main(
             print()
             coverage_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
             print()
-            hour_confidence_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
+            minute_confidence_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
             print()
             feature_importance(model=model)
 

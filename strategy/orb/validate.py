@@ -190,6 +190,55 @@ def hour_confidence_report(
         print("  " + report.to_string().replace("\n", "\n  "))
 
 
+def minute_confidence_report(
+    model=None,
+    test_days: int = DEFAULT_TEST_DAYS,
+    start_date: str = "",
+    end_date: str = "",
+):
+    """
+    依「距開盤區間結束多久才突破」（minutes_to_breakout，5分鐘一組）×
+    信心度區間 交叉列出樣本數、勝率、累積召回率。
+
+    hour_confidence_report() 現在幾乎沒用了——候選都集中在9:10~9:30搜尋
+    窗口內，hour 是常數（永遠是9），分不出時段差異；minutes_to_breakout
+    才是實際會變化、而且是重要性數一數二的特徵，改用這個分組更有意義。
+    """
+    if model is None:
+        model = load_model_lgbm()
+
+    test_df = _load_test_df(model, test_days, start_date, end_date)
+    test_df["信心度"] = pd.cut(test_df["proba"], bins=_CONFIDENCE_BINS, labels=_CONFIDENCE_LABELS, right=False)
+
+    max_minute = int(test_df["minutes_to_breakout"].max()) + 1 if len(test_df) else 0
+    minute_bins = list(range(0, max_minute + 5, 5))
+    minute_labels = [f"{lo}-{lo+5}分" for lo in minute_bins[:-1]]
+    test_df["_minute_bucket"] = pd.cut(
+        test_df["minutes_to_breakout"], bins=minute_bins, labels=minute_labels, right=False
+    )
+
+    for label in minute_labels:
+        sub = test_df[test_df["_minute_bucket"] == label]
+        if sub.empty:
+            continue
+        report = sub.groupby("信心度", observed=True).agg(樣本數=("target", "count"), 勝率=("target", "mean"))
+        report = report[report["樣本數"] > 0]
+        if report.empty:
+            continue
+
+        # 召回率：≥該區間下界的門檻能抓到這個分鐘區間內多少比例的實際上漲（累積算法，跟 rally 一致）
+        total_pos = sub["target"].sum()
+        recalls = {}
+        for lo, lbl in zip(_CONFIDENCE_BINS[:-1], _CONFIDENCE_LABELS):
+            tp_cum = sub.loc[sub["proba"] >= lo, "target"].sum()
+            recalls[lbl] = tp_cum / total_pos if total_pos else float("nan")
+        report["召回率"] = [recalls.get(idx, float("nan")) for idx in report.index]
+        report["召回率"] = (report["召回率"] * 100).round(1).astype(str) + "%"
+        report["勝率"] = (report["勝率"] * 100).round(1).astype(str) + "%"
+        print(f"\n  -- 突破後{label}鐘（實際上漲 {total_pos:,} 筆）--")
+        print("  " + report.to_string().replace("\n", "\n  "))
+
+
 def compare_report(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
