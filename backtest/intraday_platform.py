@@ -38,15 +38,21 @@ def gen_entries(
     top_n: int = 5,
     min_volume: pd.DataFrame = None,
     min_vol_threshold: int = 500,
+    vol_window: int = 20,
 ) -> pd.DataFrame:
     """
     每分鐘從預測機率 >= threshold 的股票中，取機率最高的 top_n 支作為進場候選。
-    若提供 min_volume，額外過濾20根均量低於 min_vol_threshold 的股票。
+    若提供 min_volume，額外過濾 vol_window 根均量低於 min_vol_threshold 的股票。
+
+    vol_window 預設 20（原本的行為，rally 用這個），策略如果集中在開盤前
+    vol_window 分鐘內進場（例如 orb），rolling(vol_window) 在暖機期間會是
+    NaN、把候選整批濾掉，要把 vol_window 調小（例如 orb 傳 10，見
+    strategy/orb/run_backtest.py），不要直接改這裡的預設值影響到其他策略。
     """
     entries = df_proba >= threshold
 
     if min_volume is not None:
-        avg_vol = min_volume.rolling(20).mean()
+        avg_vol = min_volume.rolling(vol_window).mean()
         entries = entries & (avg_vol >= min_vol_threshold)
 
     # 超過 top_n 時，只保留機率最高的幾支
@@ -70,6 +76,8 @@ def run_backtest(
     first_entry_time: str = "09:01",
     last_entry_time: str = "10:00",
     init_cash: float = 1_000_000,
+    min_vol_threshold: int = 500,
+    vol_window: int = 20,
 ):
     t0 = time()
 
@@ -80,7 +88,14 @@ def run_backtest(
     volume = m1.pivot(index="date", columns="stock_id", values="volume")
 
     print("產生進場訊號...")
-    entries = gen_entries(df_proba, threshold=threshold, top_n=top_n, min_volume=volume)
+    entries = gen_entries(
+        df_proba,
+        threshold=threshold,
+        top_n=top_n,
+        min_volume=volume,
+        min_vol_threshold=min_vol_threshold,
+        vol_window=vol_window,
+    )
 
     # 對齊欄位
     common_stocks = price.columns.intersection(entries.columns)
