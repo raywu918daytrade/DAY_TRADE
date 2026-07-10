@@ -12,8 +12,8 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from strategy.orb.config import DEFAULT_TEST_DAYS
-from strategy.orb.features import FEATURES, load_features, to_model_input
+from strategy.orb.config import DEFAULT_TEST_DAYS, MIN_VOL_MA20
+from strategy.orb.features import FEATURES, apply_liquidity_filter, load_features, to_model_input
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH_LGBM = _ROOT / "models/m1_orb_lgbm.pkl"
@@ -31,6 +31,10 @@ def _prepare_train_test(
     df = df.dropna(subset=FEATURES + ["target"])
     print(f"  使用特徵數: {len(FEATURES)}")
     print(f"  全天有效樣本: {len(df):,} 筆")
+
+    n_before = len(df)
+    df = apply_liquidity_filter(df)
+    print(f"  流動性篩選（20日均量 ≥ {MIN_VOL_MA20:,}股）: {n_before:,} → {len(df):,} 筆")
 
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()

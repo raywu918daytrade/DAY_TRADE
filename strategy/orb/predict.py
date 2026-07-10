@@ -17,6 +17,7 @@ from data.query import load_day, load_m1, load_m1_live
 from strategy.orb.config import DEFAULT_TEST_DAYS
 from strategy.orb.features import (
     FEATURES,
+    apply_liquidity_filter,
     build_history_tables,
     compute_m3,
     compute_m5,
@@ -46,6 +47,7 @@ def predict(
 
     df = load_features()
     df = df.dropna(subset=FEATURES)
+    df = apply_liquidity_filter(df)
 
     if test_only:
         cutoff = df["date"].max() - pd.Timedelta(days=test_days)
@@ -155,6 +157,7 @@ def predict_live(
         return []
 
     valid = current.dropna(subset=FEATURES)
+    valid = apply_liquidity_filter(valid)
     if valid.empty:
         return []
 

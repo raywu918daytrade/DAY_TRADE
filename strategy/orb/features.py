@@ -26,6 +26,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 from data.query import load_day, load_m1, load_m3, load_m5
 from strategy.orb.config import (
     HOLD_BARS,
+    MIN_VOL_MA20,
     OPENING_RANGE_M3_MINUTES,
     OPENING_RANGE_M5_MINUTES,
     OPENING_RANGE_MINUTES,
@@ -67,7 +68,7 @@ def load_features(force_rebuild: bool = False) -> pd.DataFrame:
     """載入特徵（自動使用 / 重建 cache）。"""
     if not force_rebuild and _cache_is_fresh():
         cached = pd.read_parquet(_CACHE_PATH)
-        missing = [c for c in FEATURES + ["hour"] if c not in cached.columns]
+        missing = [c for c in FEATURES + ["hour", "vol_ma20"] if c not in cached.columns]
         if not missing:
             print("  讀取 cache 特徵...")
             return cached
@@ -77,7 +78,7 @@ def load_features(force_rebuild: bool = False) -> pd.DataFrame:
     m1 = load_m1()
     df = make_features(m1, compute_labels=True)
     _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    meta_cols = ["stock_id", "date", "hour", "target"]
+    meta_cols = ["stock_id", "date", "hour", "target", "vol_ma20"]
     cache_cols = [c for c in df.columns if c in set(FEATURES) | set(meta_cols)]
     df[cache_cols].to_parquet(_CACHE_PATH)
     print(f"  cache 已存至 {_CACHE_PATH}（{len(df):,} 筆）")
@@ -238,6 +239,22 @@ def to_model_input(df: pd.DataFrame) -> pd.DataFrame:
         if col in X.columns:
             X[col] = X[col].astype("category")
     return X
+
+
+def apply_liquidity_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    只留 20日均量（見 vol_ma20）≥ MIN_VOL_MA20 的樣本。
+
+    冷門股1分K容易被單筆大單推動，雜訊比例偏高（2026-07-10 討論懷疑是 AUC
+    一直卡住的原因之一）。train.py（訓練）、validate.py（驗證）、predict.py
+    （批次/即時推論）都要用這支，確保訓練/驗證/推論看到同一個股票池——只在
+    訓練時篩、驗證時沒篩（或反過來），會讓驗證出來的指標對不上訓練時的母體。
+
+    vol_ma20 是用「昨天為止」算的（見 make_features()），股票上市不到20天
+    或當天缺日K資料時會是 NaN，一併篩掉（沒有足夠歷史判斷流動性，保守起見
+    不留）。
+    """
+    return df[df["vol_ma20"] >= MIN_VOL_MA20].copy()
 
 
 def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
@@ -650,6 +667,13 @@ def make_features(
         day[col] = _dev_raw.groupby(day["stock_id"], group_keys=False).shift(1)
         ma_cols.append(col)
 
+    # 20日均量（股數，昨天為止）：給 train.py 篩選流動性用（例如只留20日均量
+    # ≥1000張的股票），過濾冷門股的1分K雜訊。跟 ma_dev 同做法：先算「當日版」
+    # （包含今天自己成交量，收盤才知道），再整個 shift(1) 到下一天。
+    dg = day.groupby("stock_id")
+    _vol_ma20_raw = _degroup(dg["volume"].rolling(20, min_periods=20).mean(), day.index)
+    day["vol_ma20"] = _vol_ma20_raw.groupby(day["stock_id"], group_keys=False).shift(1)
+
     # 過去1~5天各自的收盤價（原始價格，只當合併用的暫存基準，merge完就丟掉）
     dg = day.groupby("stock_id")
     close_lag_ref_cols = []
@@ -658,7 +682,9 @@ def make_features(
         day[col] = dg["close"].shift(lag)
         close_lag_ref_cols.append(col)
 
-    day_feat_cols = ["stock_id", "day_date"] + day_ret_cols + ["day_atr"] + ma_cols + close_lag_ref_cols
+    day_feat_cols = (
+        ["stock_id", "day_date"] + day_ret_cols + ["day_atr", "vol_ma20"] + ma_cols + close_lag_ref_cols
+    )
     m1 = m1.merge(day[day_feat_cols], on=["stock_id", "day_date"], how="left")
 
     # 目前價格 vs 過去1~5天各自收盤價的漲跌幅：逐分鐘更新，代表「今天到目前

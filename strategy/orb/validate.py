@@ -18,7 +18,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 from strategy.orb.config import DEFAULT_TEST_DAYS
-from strategy.orb.features import FEATURES, load_features, to_model_input
+from strategy.orb.features import FEATURES, apply_liquidity_filter, load_features, to_model_input
 from strategy.orb.train import _MODEL_PATH_LGBM, _MODEL_PATH_XGB, load_model_lgbm, load_model_xgb
 
 
@@ -82,6 +82,7 @@ def _load_test_df(
 ) -> pd.DataFrame:
     df = load_features()
     df = df.dropna(subset=FEATURES + ["target"])
+    df = apply_liquidity_filter(df)
 
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()
@@ -199,6 +200,7 @@ def compare_report(
 
     df = load_features()
     df = df.dropna(subset=FEATURES + ["target"])
+    df = apply_liquidity_filter(df)
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()
     if end_date:
