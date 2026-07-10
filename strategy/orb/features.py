@@ -152,7 +152,39 @@ FEATURES = [
     "m5_high_lag1",
     "m5_low_lag1",
     "m5_close_lag1",
+    # ── 量能/波動/趨勢強度（1分K，逐日重算不跨日）──────────────────────
+    "vol_surge",  # 當根量 / 過去20根（不含當根）均量，跟自己近期比，不是跟開盤區間比
+    "m1_atr",  # 1分鐘K ATR(14) 相對波動（/ 當日開盤，比照 rally 的 m1_atr）
+    "adx",  # ADX(14) 趨勢強度（用 talib 算，Wilder平滑手刻容易出錯）
+    "vwap_dev",  # close 相對當日累積VWAP的偏離（比照 rally 的 vwap_dev）
 ]
+
+
+def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
+    """把 groupby(...).rolling(...) 產生的多層 index 結果攤平回原始 df 對齊。"""
+    n_key_levels = s.index.nlevels - 1
+    if n_key_levels:
+        s = s.reset_index(level=list(range(n_key_levels)), drop=True)
+    return s.reindex(index)
+
+
+_ADX_PERIOD = 14
+
+
+def _adx_group(g: pd.DataFrame) -> pd.Series:
+    """單一 stock_id×day_date 分組的 ADX(14)，逐日重算不跨日（理由同 m1_atr）。
+
+    Wilder 平滑遞迴公式手刻容易出錯，用已裝好的 talib 算，比較可靠。
+    """
+    import talib
+
+    high = g["high"].to_numpy(dtype=float)
+    low = g["low"].to_numpy(dtype=float)
+    close = g["close"].to_numpy(dtype=float)
+    if len(high) < _ADX_PERIOD * 2:
+        return pd.Series(np.full(len(high), np.nan), index=g.index)
+    adx = talib.ADX(high, low, close, timeperiod=_ADX_PERIOD)
+    return pd.Series(adx, index=g.index)
 
 
 def _bars_since(m1: pd.DataFrame, flag: pd.Series) -> pd.Series:
@@ -224,6 +256,37 @@ def make_features(m1: pd.DataFrame, compute_labels: bool = True) -> pd.DataFrame
 
     # 當日開盤價（第一根 open），用於 3分K/5分K 正規化
     day_open = g_day["open"].transform("first").replace(0, np.nan)
+
+    # ── 量能突增 / 1分鐘ATR / ADX / VWAP偏離（逐日重算，不跨日）────────────
+    # 量能突增：當根量 / 過去20根（不含當根）均量，跟自己近期比，不是跟開盤區間比
+    # （vol_ratio_vs_or 系列是跟開盤區間期間比，這裡是另一個獨立的角度）。
+    _vol_shift1 = g_day["volume"].shift(1)
+    vol_ma_recent = _degroup(
+        _vol_shift1.groupby([m1["stock_id"], m1["day_date"]], group_keys=False).rolling(20, min_periods=20).mean(),
+        m1.index,
+    )
+    m1["vol_surge"] = m1["volume"] / vol_ma_recent.replace(0, np.nan)
+
+    # 1分鐘K ATR(14)：True Range 逐日重算，rolling mean 近似（跟 rally 的 m1_atr 同做法）
+    _prev_close = g_day["close"].shift(1).fillna(m1["open"])
+    m1["_tr"] = np.maximum(
+        np.maximum((m1["high"] - m1["low"]).abs(), (m1["high"] - _prev_close).abs()),
+        (m1["low"] - _prev_close).abs(),
+    )
+    g_tr = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    m1["m1_atr"] = _degroup(g_tr["_tr"].rolling(14, min_periods=14).mean(), m1.index) / day_open
+
+    # ADX(14)：逐日逐股用 talib 算（見 _adx_group）
+    m1["adx"] = m1.groupby(["stock_id", "day_date"], group_keys=False).apply(_adx_group, include_groups=False)
+
+    # VWAP 偏離：close 相對當日累積VWAP的偏離（跟 rally 的 vwap_dev 同做法）
+    m1["_cum_vol"] = g_day["volume"].transform("cumsum")
+    m1["_pv"] = m1["close"] * m1["volume"]
+    m1["_cum_pv"] = g_day["_pv"].transform("cumsum")
+    _vwap = m1["_cum_pv"] / m1["_cum_vol"].replace(0, np.nan)
+    m1["vwap_dev"] = (m1["close"] - _vwap) / _vwap.replace(0, np.nan)
+
+    m1 = m1.drop(columns=["_tr", "_cum_vol", "_pv", "_cum_pv"])
 
     # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷 ─────────────
     # db/m3、db/m5 是批次預算（scripts/build_m3_m5.py 從 db/m1/ 算好存檔，
