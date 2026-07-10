@@ -17,7 +17,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import pandas as pd
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from strategy.orb.features import FEATURES, load_features
+from strategy.orb.features import FEATURES, load_features, to_model_input
 from strategy.orb.train import _MODEL_PATH_LGBM, _MODEL_PATH_XGB, load_model_lgbm, load_model_xgb
 
 
@@ -66,7 +66,7 @@ def _load_test_df(
     test_df = df[df["date"] > cutoff].copy()
     print(f"  測試區間: {test_df['date'].min().strftime('%Y-%m-%d')} ~ {test_df['date'].max().strftime('%Y-%m-%d')}")
 
-    test_df["proba"] = model.predict_proba(test_df[FEATURES])[:, 1]
+    test_df["proba"] = model.predict_proba(to_model_input(test_df))[:, 1]
     return test_df
 
 
@@ -180,9 +180,10 @@ def compare_report(
     print("\n── LGBM vs XGB（同一份測試集）──")
     print(f"  {'模型':>6}  {'Accuracy':>9}  {'AUC':>7}")
     print("  " + "-" * 28)
+    X_test = to_model_input(test_df)
     for name, model in models.items():
-        y_pred = model.predict(test_df[FEATURES])
-        y_prob = model.predict_proba(test_df[FEATURES])[:, 1]
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
         acc = accuracy_score(test_df["target"], y_pred)
         auc = roc_auc_score(test_df["target"], y_prob)
         print(f"  {name}  {acc:>9.4f}  {auc:>7.4f}")
