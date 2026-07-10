@@ -1,14 +1,21 @@
 """
 特徵工程與資料標籤 — 開盤區間突破（ORB, Opening Range Breakout）+ 3分K/5分K 中期動能確認
 
-三組獨立的開盤區間突破特徵（見 config.py 的 OPENING_RANGE_MINUTES /
-OPENING_RANGE_M3_MINUTES / OPENING_RANGE_M5_MINUTES），窗口長度故意不同
-（9/15/20分鐘）——高低點本質是「這段時間內所有價格的極值」，同一段時間窗口
-不管用幾分鐘一根去分組算出來的極值都一樣，窗口長度不同才是真的在比較不同
-時間尺度的區間。每組區間形成期間本身（例如 15分K版的前15分鐘）的樣本會
-整批排除——那幾分鐘區間還沒收斂，此時去看「距上緣距離」這類特徵等於用
-當天最終的區間高低點回頭算，會把「區間形成期間之後才知道」的值洩漏回
-形成期間本身；且真實交易時，區間沒收斂也不可能有突破訊號。
+2026-07-11 改版：不再是「每分鐘都是一筆樣本」，改成「每次真正的突破事件才是
+一筆樣本」——9:00~OPENING_RANGE_MINUTES（預設9:10）建立開盤區間，
+OPENING_RANGE_MINUTES~BREAKOUT_SEARCH_MINUTES（預設9:10~9:30）內，收盤價
+從「區間內/以下」重新站上區間上緣的那一刻算一筆候選，同一天可能觸發好幾次
+（突破、拉回、再突破），當天完全沒有突破就沒有這支股票的樣本（不當負樣本）。
+改版理由分兩階段：
+  1. 舊版每分鐘都是獨立樣本，同一天200多根K棒彼此高度相關（幾乎同樣的
+     區間距離），把「有沒有突破」這個訊號稀釋掉了（純1分K突破訊號特徵
+     重要性只有3%）。
+  2. 一開始改成「一天只留第一次突破」又太嚴格——「一天只交易一次」是
+     交易執行層該決定的規則，不該在特徵/樣本產生階段就先幫模型篩掉後面
+     的突破事件；模型只該負責替每一次真正的突破事件評分，之後回測/實單
+     要不要只挑一天裡最高信心度那筆，是另一層的決定。
+背景特徵（3/5分K動能、量能/波動/趨勢、開盤量歷史、個股日K、大盤背景）仍然
+逐分鐘算，只是最後只在候選那幾列被選出來。
 標籤沿用 rally 的 triple barrier 定義：未來 HOLD_BARS 根分K內
   +TP_PCT 停利先碰到 → target = 1（漲）
   -SL_PCT 停損先碰到 → target = 0（跌）
@@ -25,10 +32,9 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 from data.query import load_day, load_m1, load_m3, load_m5
 from strategy.orb.config import (
+    BREAKOUT_SEARCH_MINUTES,
     HOLD_BARS,
     MIN_VOL_MA20,
-    OPENING_RANGE_M3_MINUTES,
-    OPENING_RANGE_M5_MINUTES,
     OPENING_RANGE_MINUTES,
     SL_PCT,
     TP_PCT,
@@ -122,28 +128,19 @@ def _make_barrier_labels(m1: pd.DataFrame) -> pd.Series:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _orb_cols(suffix: str) -> list:
-    """一組開盤區間突破特徵的欄位名稱清單（見 _orb_block()）。"""
-    return [
-        f"or_range_pct{suffix}",
-        f"close_pos_in_range{suffix}",
-        f"dist_to_or_high{suffix}",
-        f"dist_to_or_low{suffix}",
-        f"broke_above{suffix}",
-        f"broke_below{suffix}",
-        f"breakout_up_signal{suffix}",
-        f"breakout_down_signal{suffix}",
-        f"bars_since_breakout_up{suffix}",
-        f"bars_since_breakout_down{suffix}",
-        f"vol_ratio_vs_or{suffix}",
-    ]
-
-
 FEATURES = [
-    *_orb_cols(""),  # 1分K版開盤區間（15分鐘），見 config.OPENING_RANGE_MINUTES
-    "minutes_since_or_end",  # 距1分K版開盤區間結束幾分鐘
-    *_orb_cols("_m3"),  # 3分K版開盤區間（9分鐘），見 config.OPENING_RANGE_M3_MINUTES
-    *_orb_cols("_m5"),  # 5分K版開盤區間（20分鐘），見 config.OPENING_RANGE_M5_MINUTES
+    # ── 開盤區間突破（單一候選：見檔頭說明）──────────────────────────────
+    "or_range_pct",  # 開盤區間高度 / 區間下緣（區間本身寬不寬）
+    "close_pos_in_range",  # 突破當下 close 在區間內相對位置（>1，數值越大代表衝越多）
+    "dist_to_or_high",  # 突破當下 close 距區間上緣的相對距離（用區間上緣當基準）
+    "dist_to_or_low",  # 突破當下 close 距區間下緣的相對距離
+    "breakout_depth",  # 突破幅度，用「區間寬度」當基準（不是價位），(close-or_high)/(or_high-or_low)
+    "vol_ratio_vs_or",  # 突破當根量 / 開盤區間期間均量（量能確認）
+    "breakout_volume_ratio",  # 突破當根量 / 突破前5分鐘均量（跟自己近期比，不是跟開盤區間比）
+    "breakout_close_location",  # 突破那根K棒收在高點附近還是留長上影，(close-low)/(high-low)
+    "minutes_to_breakout",  # 距開盤區間結束多久才突破，越快突破可能動能越強
+    "gap_pct",  # 今日開盤相對昨收的跳空幅度
+    "or_range_atr_ratio",  # 開盤區間寬度 / 個股日ATR（區間相對這支股票平常波動算寬還窄）
     # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷（比照 rally 做法）──
     "m3_high",
     "m3_low",
@@ -164,11 +161,13 @@ FEATURES = [
     "m5_low_lag1",
     "m5_close_lag1",
     # ── 量能/波動/趨勢強度（1分K，逐日重算不跨日）──────────────────────
-    "vol_surge",  # 當根量 / 過去20根（不含當根）均量，跟自己近期比，不是跟開盤區間比
-    "m1_atr",  # 1分鐘K ATR(14) 相對波動（/ 當日開盤，比照 rally 的 m1_atr）
-    "adx",  # ADX(14) 趨勢強度（用 talib 算，Wilder平滑手刻容易出錯）
-    "vwap_dev",  # close 相對當日累積VWAP的偏離（比照 rally 的 vwap_dev）
-    "atr_hour_surprise",  # 當根TR / 這支股票在這個小時過去10天的歷史平均TR
+    # 2026-07-11：vol_surge(需20根)/m1_atr(需14根)/adx(需28根，雙重平滑)
+    # 已拿掉——改成單一候選（9:10~9:30搜尋窗口，只有20根K棒）之後，這幾個
+    # 特徵天生的暖機期跟搜尋窗口互斥，dropna 幾乎把樣本濾光（adx缺值98.5%、
+    # vol_surge缺值89.1%、m1_atr缺值63.6%），跟窗口設計衝突，不是bug。
+    "vwap_dev",  # close 相對當日累積VWAP的偏離（比照 rally 的 vwap_dev，累積型不受暖機期影響）
+    "atr_hour_surprise",  # 當根TR / 這支股票在這個小時過去10天的歷史平均TR（只需2根當根TR，不受影響）
+    "atr7",  # 1分鐘K ATR(7) 相對波動（/ 當日開盤，只需7根K棒，不撞暖機期）
     # ── 個股過去5日「開盤1/3/5分鐘成交量佔當日總量比例」lag特徵，無未來洩漏 ──
     "open_vol_m1_1",
     "open_vol_m1_2",
@@ -209,9 +208,8 @@ FEATURES = [
     "idx_day_atr",  # 0050 日K ATR(14) 相對波動（前一日，/ 當日開盤）
     "idx_ret_1",  # 0050 前1分報酬率
     "idx_vs_open",  # 0050 收盤 / 0050 當日開盤（大盤相對開盤漲跌幅）
-    "idx_atr",  # 0050 1分K ATR(14) 相對波動（/ 0050 當日開盤）
+    # idx_atr（0050 1分K ATR(14)）2026-07-11 拿掉，理由同上面 m1_atr（需14根，跟搜尋窗口互斥）
     "idx_up",  # 0050 收盤 > 開盤（0/1，大盤是否站上開盤）
-    "hour",  # 時段（9~13），類別型——盤中行為常是開收盤忙、中午淡的非單調型態
 ]
 # 2026-07-10 試過加 group（類股分類，db/info/info.parquet，49類）當類別特徵，
 # LGBM/XGB 的測試集 AUC 都變差（LGBM 0.6460→0.6246、XGB 0.5977→0.5815），
@@ -219,11 +217,11 @@ FEATURES = [
 # 訓練樣本數很少，樹學到訓練期間的巧合，測試期不成立），已經拿掉，不要
 # 再加回來，除非之後有辦法解決過擬合（例如調 min_data_per_group/cat_smooth）。
 
-# hour 只有5個值（9~13），且盤中行為是U型（開收盤忙、中午淡）不是單調遞增/遞減，
-# 當類別型讓樹模型能一刀分出任意子集組合（例如{9,13} vs {10,11,12}），
-# 不用像數值型那樣繞兩刀去逼近。呼叫端要用 to_model_input()，不要直接
-# df[FEATURES]，否則 hour 會被當一般數值餵進去，這個設計就白做了。
-CATEGORICAL_FEATURES = ["hour"]
+# hour（時段）2026-07-11 從 FEATURES 拿掉：候選現在都集中在9:10~9:30
+# 搜尋窗口內，hour 是常數（永遠是9），完全沒有資訊量（實測特徵重要性=0）。
+# hour 欄位本身還留著（meta_cols 保留，hour_confidence_report() 分時段
+# 報表用得到，雖然現在只會有9點那一組），只是不再餵給模型。
+CATEGORICAL_FEATURES: list = []
 
 
 def to_model_input(df: pd.DataFrame) -> pd.DataFrame:
@@ -245,10 +243,11 @@ def apply_liquidity_filter(df: pd.DataFrame) -> pd.DataFrame:
     """
     只留 20日均量（見 vol_ma20）≥ MIN_VOL_MA20 的樣本。
 
-    冷門股1分K容易被單筆大單推動，雜訊比例偏高（2026-07-10 討論懷疑是 AUC
-    一直卡住的原因之一）。train.py（訓練）、validate.py（驗證）、predict.py
-    （批次/即時推論）都要用這支，確保訓練/驗證/推論看到同一個股票池——只在
-    訓練時篩、驗證時沒篩（或反過來），會讓驗證出來的指標對不上訓練時的母體。
+    冷門股1分K容易被單筆大單推動，雜訊比例偏高，2026-07-10 測過1000張/5000張
+    兩個門檻，AUC都在雜訊範圍內浮動，沒有明確證據支持這是主因（見 config.py
+    的 MIN_VOL_MA20 說明），但保留這個篩選作為額外的流動性把關。train.py
+    （訓練）、validate.py（驗證）、predict.py（批次/即時推論）都要用這支，
+    確保訓練/驗證/推論看到同一個股票池。
 
     vol_ma20 是用「昨天為止」算的（見 make_features()），股票上市不到20天
     或當天缺日K資料時會是 NaN，一併篩掉（沒有足夠歷史判斷流動性，保守起見
@@ -263,25 +262,6 @@ def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
     if n_key_levels:
         s = s.reset_index(level=list(range(n_key_levels)), drop=True)
     return s.reindex(index)
-
-
-_ADX_PERIOD = 14
-
-
-def _adx_group(g: pd.DataFrame) -> pd.Series:
-    """單一 stock_id×day_date 分組的 ADX(14)，逐日重算不跨日（理由同 m1_atr）。
-
-    Wilder 平滑遞迴公式手刻容易出錯，用已裝好的 talib 算，比較可靠。
-    """
-    import talib
-
-    high = g["high"].to_numpy(dtype=float)
-    low = g["low"].to_numpy(dtype=float)
-    close = g["close"].to_numpy(dtype=float)
-    if len(high) < _ADX_PERIOD * 2:
-        return pd.Series(np.full(len(high), np.nan), index=g.index)
-    adx = talib.ADX(high, low, close, timeperiod=_ADX_PERIOD)
-    return pd.Series(adx, index=g.index)
 
 
 def _hourly_tr_summary(m1: pd.DataFrame) -> pd.DataFrame:
@@ -328,10 +308,7 @@ def build_history_tables(m1: pd.DataFrame) -> tuple:
     給 predict_live() 用：從歷史 db/m1/（load_m1() 的完整結果）算出
     open_vol_history、hourly_tr_history 這兩張表，讓 atr_hour_surprise、
     open_vol_m1~m5_1~5 這幾個「需要過去N天歷史」的特徵在即時推論時也能算——
-    m1_live 只有當天一天的資料，自己算不出「過去」，這兩個特徵在 make_features()
-    裡原本是直接從傳入的 m1 算，訓練時 m1 是完整歷史沒問題，即時推論時
-    m1（m1_live）只有今天，這兩個特徵會整批變 NaN（2026-07-10 用真實
-    db/m1_live/ 資料測 predict_live() 才發現，訓練路徑測不出來）。
+    m1_live 只有當天一天的資料，自己算不出「過去」。
 
     呼叫端應該快取這兩張表（例如開盤前算一次），不要每分鐘重算一次——這裡面
     的 groupby 是對全歷史 db/m1/ 跑的，效能考量跟 day 的快取方式一樣。
@@ -350,52 +327,6 @@ def build_history_tables(m1: pd.DataFrame) -> tuple:
     )
 
     return _open_vol_ratios(m1), _hourly_tr_summary(m1)
-
-
-def _bars_since(m1: pd.DataFrame, flag: pd.Series) -> pd.Series:
-    """距最近一次 flag==1 幾根K棒（同一天內），今日尚未發生過則回傳 999。"""
-    group_cols = [m1["stock_id"], m1["day_date"]]
-    pos = m1.groupby(["stock_id", "day_date"], group_keys=False).cumcount()
-    last_true_pos = pos.where(flag == 1)
-    last_true_pos = last_true_pos.groupby(group_cols, group_keys=False).ffill()
-    bars = (pos - last_true_pos).fillna(999)
-    return bars
-
-
-def _orb_block(m1: pd.DataFrame, window_minutes: int, suffix: str) -> tuple:
-    """
-    算一組開盤區間突破特徵，區間長度 window_minutes 分鐘，欄位名稱加 suffix。
-
-    回傳 ({欄位名: Series}, in_or遮罩)——in_or 用來把這組欄位在區間形成期間
-    本身設為 NaN（見檔頭「區間形成期間」說明），呼叫端負責 assign 回 m1
-    並套用遮罩。
-    """
-    group_keys = [m1["stock_id"], m1["day_date"]]
-    in_or = m1["minutes_since_open"] < window_minutes
-
-    or_high = m1["high"].where(in_or).groupby(group_keys, group_keys=False).transform("max")
-    or_low = m1["low"].where(in_or).groupby(group_keys, group_keys=False).transform("min")
-    or_vol_mean = m1["volume"].where(in_or).groupby(group_keys, group_keys=False).transform("mean")
-    or_range = (or_high - or_low).replace(0, np.nan)
-
-    feats = {}
-    feats[f"or_range_pct{suffix}"] = or_range / or_low.replace(0, np.nan)
-    feats[f"close_pos_in_range{suffix}"] = (m1["close"] - or_low) / or_range
-    feats[f"dist_to_or_high{suffix}"] = (m1["close"] - or_high) / or_high.replace(0, np.nan)
-    feats[f"dist_to_or_low{suffix}"] = (m1["close"] - or_low) / or_low.replace(0, np.nan)
-    feats[f"broke_above{suffix}"] = (m1["close"] > or_high).astype(int)
-    feats[f"broke_below{suffix}"] = (m1["close"] < or_low).astype(int)
-
-    prev_close = m1.groupby(["stock_id", "day_date"], group_keys=False)["close"].shift(1)
-    up_signal = ((prev_close <= or_high) & (m1["close"] > or_high)).astype(int)
-    down_signal = ((prev_close >= or_low) & (m1["close"] < or_low)).astype(int)
-    feats[f"breakout_up_signal{suffix}"] = up_signal
-    feats[f"breakout_down_signal{suffix}"] = down_signal
-    feats[f"bars_since_breakout_up{suffix}"] = _bars_since(m1, up_signal)
-    feats[f"bars_since_breakout_down{suffix}"] = _bars_since(m1, down_signal)
-    feats[f"vol_ratio_vs_or{suffix}"] = m1["volume"] / or_vol_mean.replace(0, np.nan)
-
-    return feats, in_or
 
 
 def compute_m3(m1: pd.DataFrame) -> pd.DataFrame:
@@ -441,8 +372,8 @@ def make_features(
     compute_labels: bool = True,
 ) -> pd.DataFrame:
     """
-    算三組獨立開盤區間突破特徵（1分K/3分K/5分K版，窗口長度不同）
-    + 3分K/5分K 中期動能確認 + triple barrier 標籤。
+    開盤區間突破（每次突破事件一筆候選，見檔頭說明）+ 3分K/5分K 中期動能確認 +
+    背景特徵 + triple barrier 標籤。
 
     m3/m5/day 留空時分別 fallback 去讀 db/m3、db/m5、db/fugle_day 批次資料
     （訓練走這條路徑）；predict_live() 對當天 m1_live 現算 m3_live/m5_live
@@ -453,14 +384,15 @@ def make_features(
     這兩組特徵需要「過去N天」的歷史（不是只有今天），訓練時 m1 本來就是完整
     歷史，這兩個參數留空即可（fallback 用 m1 自己算）；predict_live() 傳進來
     的 m1 是 m1_live（只有今天一天），這兩個參數必須用 build_history_tables()
-    對歷史 db/m1/ 算好、明確傳進來，否則這兩組特徵會整批變 NaN（2026-07-10
-    用真實 db/m1_live/ 資料測 predict_live() 才發現，訓練路徑測不出來，因為
-    訓練的 m1 剛好本身就是歷史資料）。
+    對歷史 db/m1/ 算好、明確傳進來，否則這兩組特徵會整批變 NaN。
 
-    回傳欄位：FEATURES 全部 + target（若 compute_labels=True）。
-    每組區間形成期間本身的樣本，該組欄位會被設為 NaN；三組窗口長度不同
-    （9/15/20分鐘），所以最終能交易的起點是三組裡最長的那個（20分鐘），
-    靠呼叫端 dropna(subset=FEATURES) 篩掉尚未全部備齊的樣本。
+    回傳欄位：FEATURES 全部 + target（若 compute_labels=True）。每個
+    (stock_id, day_date) 可能有 0~多列——OPENING_RANGE_MINUTES~
+    BREAKOUT_SEARCH_MINUTES 內，每次收盤價從區間內/以下重新站上開盤區間
+    上緣都算一筆候選，當天完全沒有突破就沒有這支股票的樣本（不當負樣本，
+    見檔頭說明）。一天只交易一次是執行層的規則，不在這裡處理。
+    predict_live() 用當天累積到目前為止的 m1_live 呼叫這支函式，會自然只在
+    「這一分鐘剛好觸發一次突破事件」時回傳這支股票的候選列。
     """
     m1 = m1.copy()
     m1["date"] = pd.to_datetime(m1["date"])
@@ -476,27 +408,70 @@ def make_features(
     # 當日開盤價（第一根 open），用於 3分K/5分K 正規化
     day_open = g_day["open"].transform("first").replace(0, np.nan)
 
-    # ── 量能突增 / 1分鐘ATR / ADX / VWAP偏離（逐日重算，不跨日）────────────
-    # 量能突增：當根量 / 過去20根（不含當根）均量，跟自己近期比，不是跟開盤區間比
-    # （vol_ratio_vs_or 系列是跟開盤區間期間比，這裡是另一個獨立的角度）。
+    # ── 開盤區間突破（每次突破事件一筆候選，見檔頭說明）───────────────────
+    # 9:00~OPENING_RANGE_MINUTES 建區間，OPENING_RANGE_MINUTES~
+    # BREAKOUT_SEARCH_MINUTES 內每次收盤價重新站上區間上緣都算一次突破事件。
+    # 這裡先對全部列算好特徵，實際「只留突破事件那幾列」的篩選放在函式
+    # 最後（要等 target 也算完才篩，篩選邏輯本身不需要 target）。
+    _od_keys = [m1["stock_id"], m1["day_date"]]
+    _in_or = m1["minutes_since_open"] < OPENING_RANGE_MINUTES
+    _or_high = m1["high"].where(_in_or).groupby(_od_keys, group_keys=False).transform("max")
+    _or_low = m1["low"].where(_in_or).groupby(_od_keys, group_keys=False).transform("min")
+    _or_vol_mean = m1["volume"].where(_in_or).groupby(_od_keys, group_keys=False).transform("mean")
+    _or_range = (_or_high - _or_low).replace(0, np.nan)
+
+    m1["or_range_pct"] = _or_range / _or_low.replace(0, np.nan)
+    m1["close_pos_in_range"] = (m1["close"] - _or_low) / _or_range
+    m1["dist_to_or_high"] = (m1["close"] - _or_high) / _or_high.replace(0, np.nan)
+    m1["dist_to_or_low"] = (m1["close"] - _or_low) / _or_low.replace(0, np.nan)
+    m1["vol_ratio_vs_or"] = m1["volume"] / _or_vol_mean.replace(0, np.nan)
+    m1["minutes_to_breakout"] = m1["minutes_since_open"] - OPENING_RANGE_MINUTES
+
+    # 突破幅度，用「區間寬度」當基準（不是價位本身）：同樣是突破0.5%，
+    # 窄區間（例如寬度只有0.3%）代表衝出去1.6倍區間寬，比寬區間（例如寬度2%）
+    # 衝出0.25倍區間寬更有意義，dist_to_or_high 只看價位百分比看不出這個差異。
+    m1["breakout_depth"] = (m1["close"] - _or_high) / _or_range
+
+    # 突破那根K棒收在高點附近還是留長上影：收在高點附近代表買盤持續進場，
+    # 留長上影代表上面有賣壓、隨即被打回，是常見的假突破過濾條件。
+    m1["breakout_close_location"] = (m1["close"] - m1["low"]) / (m1["high"] - m1["low"]).replace(0, np.nan)
+
+    # 突破當根量 / 突破前5分鐘均量：跟自己「剛剛」的量比，不是跟開盤區間
+    # （vol_ratio_vs_or）比——開盤區間期間往往量本來就大，這裡看的是「已經
+    # 過了開盤區間、量能是不是又額外放大」。OPENING_RANGE_MINUTES=10 保證
+    # 搜尋窗口一開始（第10分鐘）前面就有至少10根K棒可用，不會有暖機期問題。
     _vol_shift1 = g_day["volume"].shift(1)
-    vol_ma_recent = _degroup(
-        _vol_shift1.groupby([m1["stock_id"], m1["day_date"]], group_keys=False).rolling(20, min_periods=20).mean(),
+    _vol_recent5 = _degroup(
+        _vol_shift1.groupby([m1["stock_id"], m1["day_date"]], group_keys=False).rolling(5, min_periods=3).mean(),
         m1.index,
     )
-    m1["vol_surge"] = m1["volume"] / vol_ma_recent.replace(0, np.nan)
+    m1["breakout_volume_ratio"] = m1["volume"] / _vol_recent5.replace(0, np.nan)
 
-    # 1分鐘K ATR(14)：True Range 逐日重算，rolling mean 近似（跟 rally 的 m1_atr 同做法）
+    # 突破事件：收盤價從「區間內/以下」重新站上區間上緣的那一刻（不是「目前
+    # 是不是站在上緣」）——用 prev_close <= or_high AND close > or_high 判斷，
+    # 同一天可能觸發好幾次（突破、拉回、再突破），每次都是獨立的候選，不
+    # 限制一天只留第一次（見 config.py 開頭的說明：一天只交易一次是執行層
+    # 的決定，不該在這裡先幫模型篩掉後面的突破事件）。
+    _search_window = (m1["minutes_since_open"] >= OPENING_RANGE_MINUTES) & (
+        m1["minutes_since_open"] < BREAKOUT_SEARCH_MINUTES
+    )
+    _prev_close_for_breakout = g_day["close"].shift(1)
+    m1["_is_breakout"] = (
+        _search_window & (m1["close"] > _or_high) & (_prev_close_for_breakout <= _or_high)
+    )
+
+    # ── True Range / ATR(7) / VWAP偏離（逐日重算，不跨日）───────────────────
+    # 2026-07-11：vol_surge(需20根)/m1_atr(需14根)/adx(需28根) 拿掉了，因為跟
+    # 9:10~9:30 只有20根K棒的搜尋窗口互斥（見 FEATURES 清單說明）。ATR(7) 只
+    # 需要7根K棒，OPENING_RANGE_MINUTES=10 保證搜尋窗口一開始（第10分鐘）
+    # 前面就有至少10根K棒，不會撞到暖機期問題，改用7天期。
     _prev_close = g_day["close"].shift(1).fillna(m1["open"])
     m1["_tr"] = np.maximum(
         np.maximum((m1["high"] - m1["low"]).abs(), (m1["high"] - _prev_close).abs()),
         (m1["low"] - _prev_close).abs(),
     )
     g_tr = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    m1["m1_atr"] = _degroup(g_tr["_tr"].rolling(14, min_periods=14).mean(), m1.index) / day_open
-
-    # ADX(14)：逐日逐股用 talib 算（見 _adx_group）
-    m1["adx"] = m1.groupby(["stock_id", "day_date"], group_keys=False).apply(_adx_group, include_groups=False)
+    m1["atr7"] = _degroup(g_tr["_tr"].rolling(7, min_periods=7).mean(), m1.index) / day_open
 
     # VWAP 偏離：close 相對當日累積VWAP的偏離（跟 rally 的 vwap_dev 同做法）
     m1["_cum_vol"] = g_day["volume"].transform("cumsum")
@@ -578,23 +553,6 @@ def make_features(
     m1["m5_ret"] = g_m5["m5_close"].pct_change(5)
 
     m1 = m1.drop(columns=["m3_open", "m5_close"])
-
-    # ── 三組獨立的開盤區間突破特徵（窗口長度不同，見 config.py 說明）───────
-    m1_orb_feats, in_or_1m = _orb_block(m1, OPENING_RANGE_MINUTES, "")
-    for col, series in m1_orb_feats.items():
-        m1[col] = series
-    m1["minutes_since_or_end"] = m1["minutes_since_open"] - OPENING_RANGE_MINUTES
-    m1.loc[in_or_1m, list(m1_orb_feats.keys()) + ["minutes_since_or_end"]] = np.nan
-
-    m3_orb_feats, in_or_m3 = _orb_block(m1, OPENING_RANGE_M3_MINUTES, "_m3")
-    for col, series in m3_orb_feats.items():
-        m1[col] = series
-    m1.loc[in_or_m3, list(m3_orb_feats.keys())] = np.nan
-
-    m5_orb_feats, in_or_m5 = _orb_block(m1, OPENING_RANGE_M5_MINUTES, "_m5")
-    for col, series in m5_orb_feats.items():
-        m1[col] = series
-    m1.loc[in_or_m5, list(m5_orb_feats.keys())] = np.nan
 
     # ── 個股過去5日「開盤1/3/5分鐘成交量佔當日總量比例」lag特徵 ─────────────
     # 用比例（佔當日總量%），不是原始量，才能跨股票比較。逐日算出比例後，
@@ -692,14 +650,24 @@ def make_features(
     # 昨收為基準，今天若突破昨收（由負轉正）是重要的技術位階；再往前比對
     # D-2~D-5，可以看出這波漲跌是只對昨天有意義、還是對過去幾天都成立
     # （例如 lag1~lag3 都轉正代表站上近3天的價格，比只看lag1更強的訊號）。
-    # broke_above/broke_below 那套離散訊號在ORB驗證過幾乎沒用，這裡直接給
-    # 連續值讓樹自己在0附近找分割點。
     close_vs_close_cols = []
     for lag in range(1, 6):
         col = f"close_vs_close_lag{lag}"
         m1[col] = m1["close"] / m1[f"_close_lag{lag}_ref"].replace(0, np.nan) - 1
         close_vs_close_cols.append(col)
+
+    # 今日開盤相對昨收的跳空幅度：跟 close_vs_close_lag1（逐分鐘更新的目前
+    # 價格vs昨收）不同，這個只看「開盤那一刻」的跳空，是固定值，跟 rally
+    # 既有的 gap 特徵同做法。
+    m1["gap_pct"] = day_open / m1["_close_lag1_ref"].replace(0, np.nan) - 1
     m1 = m1.drop(columns=close_lag_ref_cols)
+
+    # 開盤區間寬度 / 個股日ATR：兩者都先除以 day_open 正規化成同單位再相除，
+    # 代表「今天的開盤區間，相對這支股票平常的日內波動算寬還是窄」——同樣
+    # 是1%的區間寬度，波動大的股票（日ATR本來就大）代表區間收得很窄
+    # （盤整訊號強），波動小的股票可能只是正常波動，兩者意義不同，
+    # or_range_pct（除以or_low）看不出這個差異。
+    m1["or_range_atr_ratio"] = (_or_range / day_open) / m1["day_atr"].replace(0, np.nan)
 
     # ── 大盤（0050）背景特徵（比照 rally 做法，廣播至所有個股）─────────────
     idx_day = day[day["stock_id"] == "0050"].copy()
@@ -731,7 +699,8 @@ def make_features(
         m1 = m1.merge(idx_day[idx_day_feat_cols], on=["day_date"], how="left")
 
     # 欄位一律先建立（預設 NaN）：0050 若某天缺資料，這裡不該讓 FEATURES 缺欄位
-    for _col in ["idx_ret_1", "idx_vs_open", "idx_atr", "idx_up"]:
+    # idx_atr（0050 1分K ATR(14)）2026-07-11 拿掉了，理由同 m1_atr（需14根）
+    for _col in ["idx_ret_1", "idx_vs_open", "idx_up"]:
         m1[_col] = np.nan
 
     idx_m1 = m1[m1["stock_id"] == "0050"].copy()
@@ -741,26 +710,22 @@ def make_features(
         idx_ret_1 = idx_g_day["close"].pct_change(1)
         m1.loc[idx_m1.index, "idx_ret_1"] = idx_ret_1.values
         m1.loc[idx_m1.index, "idx_vs_open"] = (idx_m1["close"] / idx_day_open).values
-        idx_prev_close = idx_g_day["close"].shift(1).fillna(idx_m1["open"])
-        idx_m1["_idx_tr"] = np.maximum(
-            np.maximum((idx_m1["high"] - idx_m1["low"]).abs(), (idx_m1["high"] - idx_prev_close).abs()),
-            (idx_m1["low"] - idx_prev_close).abs(),
-        )
-        idx_g_day2 = idx_m1.groupby("day_date", group_keys=False)
-        m1.loc[idx_m1.index, "idx_atr"] = (
-            _degroup(idx_g_day2["_idx_tr"].rolling(14, min_periods=14).mean(), idx_m1.index) / idx_day_open
-        ).values
         m1.loc[idx_m1.index, "idx_up"] = (idx_m1["close"] > idx_day_open).astype(int).values
 
         # 廣播 0050 特徵至所有個股（以完整時間戳 date 為 key，逐分鐘對齊）
-        idx_feat_cols = ["date", "idx_ret_1", "idx_vs_open", "idx_atr", "idx_up"]
+        idx_feat_cols = ["date", "idx_ret_1", "idx_vs_open", "idx_up"]
         idx_feat = m1.loc[idx_m1.index, idx_feat_cols].drop_duplicates("date")
-        m1 = m1.drop(columns=["idx_ret_1", "idx_vs_open", "idx_atr", "idx_up"], errors="ignore")
+        m1 = m1.drop(columns=["idx_ret_1", "idx_vs_open", "idx_up"], errors="ignore")
         m1 = m1.merge(idx_feat, on=["date"], how="left")
 
     if compute_labels:
         m1["target"] = _make_barrier_labels(m1)
         m1 = m1[m1["target"].notna()].copy()
         m1["target"] = m1["target"].astype(int)
+
+    # ── 篩選成候選：只留真正的突破事件，同一天可能有好幾筆（見檔頭說明）──
+    m1 = m1[m1["_is_breakout"]].copy()
+    m1 = m1.sort_values(["stock_id", "day_date", "date"])
+    m1 = m1.drop(columns=["_is_breakout"])
 
     return m1
