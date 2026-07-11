@@ -155,6 +155,40 @@ def coverage_report(
         )
 
 
+def confusion_matrix_report(
+    model=None,
+    test_days: int = DEFAULT_TEST_DAYS,
+    start_date: str = "",
+    end_date: str = "",
+    thresholds: list | None = None,
+):
+    """不同信心度門檻下的混淆矩陣（TP/FP/FN/TN），比 coverage_report() 的
+    精確率/召回率表更直觀，可以同時看到「漏掉多少」跟「猜錯多少」。"""
+    if model is None:
+        model = load_model_lgbm()
+
+    test_df = _load_test_df(model, test_days, start_date, end_date)
+
+    if thresholds is None:
+        thresholds = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+
+    print("\n── 混淆矩陣（測試集，依門檻）──")
+    print(f"  {'門檻':>6}  {'TP':>5}  {'FP':>5}  {'FN':>5}  {'TN':>5}  {'精確率':>7}  {'召回率':>7}")
+    print("  " + "-" * 55)
+    for thr in thresholds:
+        pred = test_df["proba"] >= thr
+        actual = test_df["target"] == 1
+        tp = (pred & actual).sum()
+        fp = (pred & ~actual).sum()
+        fn = (~pred & actual).sum()
+        tn = (~pred & ~actual).sum()
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        print(
+            f"  {thr:.2f}  {tp:>5}  {fp:>5}  {fn:>5}  {tn:>5}  {precision*100:>6.1f}%  {recall*100:>6.1f}%"
+        )
+
+
 def hour_confidence_report(
     model=None,
     test_days: int = DEFAULT_TEST_DAYS,

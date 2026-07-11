@@ -31,6 +31,7 @@ from strategy.orb.validate import (
     available_models,
     compare_report,
     confidence_report,
+    confusion_matrix_report,
     coverage_report,
     feature_importance,
     minute_confidence_report,
@@ -78,6 +79,8 @@ def main(
             confidence_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
             print()
             coverage_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
+            print()
+            confusion_matrix_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
             print()
             minute_confidence_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
             print()

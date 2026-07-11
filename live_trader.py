@@ -377,9 +377,25 @@ def _on_rate_limited():
         pass
 
 
+_M1_COLLECTOR = os.environ.get("M1_COLLECTOR", "rest")  # rest（預設）| fubon_ws
+
+
 def _start_collector():
-    """M1RestPoller 收集器執行緒，異常時更新 collector 狀態供 /health 回傳。"""
-    collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks, on_rate_limited=_on_rate_limited)
+    """分K收集器背景執行緒，異常時更新 collector 狀態供 /health 回傳。
+
+    M1_COLLECTOR=fubon_ws：改用富邦 WebSocket（fubon/marketdata_ws.py），需要
+    .env 設好 FUBON_ID/PASSWORD/CERT，且開盤前先跑過 `python -m fubon.subscribe_list`
+    產生訂閱清單。帳號權限、candles payload 格式目前都還沒用真連線驗證過，
+    正式環境先別切過去，等驗證過再改 .env。
+    預設 rest：跟現在一樣用 M1RestPoller（Fugle REST）。
+    """
+    if _M1_COLLECTOR == "fubon_ws":
+        from fubon.marketdata_ws import FubonM1Collector
+
+        collector = FubonM1Collector(on_minute=on_minute)
+    else:
+        collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks, on_rate_limited=_on_rate_limited)
+
     try:
         set_collector_status("running")
         collector.start()

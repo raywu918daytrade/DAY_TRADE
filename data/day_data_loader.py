@@ -59,6 +59,7 @@ def _last_stored_date() -> str | None:
 def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
     """先寫暫存檔再 rename，避免寫入過程被中斷導致 parquet 檔損毀"""
     import tempfile
+
     dir_path = os.path.dirname(file_path)
     os.makedirs(dir_path, exist_ok=True)
     # 用系統 tmp 目錄避免 Dropbox 干擾 rename
@@ -76,8 +77,13 @@ def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
 def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     """單次請求（區間 < 1 年）"""
     headers = {"X-API-KEY": token}
-    params = {"from": from_date, "to": to_date,
-              "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"}
+    params = {
+        "from": from_date,
+        "to": to_date,
+        "fields": "open,high,low,close,volume",
+        "sort": "asc",
+        "adjusted": "true",
+    }
     r = requests.get(f"{_BASE_URL}/historical/candles/{stock_id}", params=params, headers=headers, timeout=10)
     if r.status_code == 429:
         time.sleep(float(r.headers.get("Retry-After", 60)) + 1)
