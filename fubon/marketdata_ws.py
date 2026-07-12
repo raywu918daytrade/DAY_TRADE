@@ -7,6 +7,12 @@ data/m1_rest.py，方便共用 data/query.py 的 load_m1_live()）。
 db/fubon_subscribe/subscribe_list.parquet（開盤前先跑一次
 `python -m fubon.subscribe_list` 產生），這裡只負責讀檔訂閱，不重算排序。
 
+補資料（backfill）：WebSocket 只會推「連線之後」的分K，如果不是一開盤就連線
+（例如中途 9:05 才啟動），連線前那段會整段缺資料。start() 會在開 WebSocket
+連線之前，先用富邦 REST intraday/candles/{symbol}（rate limit 300次/分鐘，
+這裡節流得保守一點）把當天到目前為止的分K全部補進 db/m1_live/，補完才開始
+連線收即時資料，確保「WebSocket 連上後才推論」時當天資料是完整的。
+
 ⚠️ 帳號目前還在等富邦開通 API 使用權限，candles 訊息的實際欄位／推送頻率
 （每筆成交都推、還是分鐘收盤才推一次）尚未用真實連線驗證過。等權限開通、
 第一次連線務必先看 log 確認 payload 長相，必要時調整 _parse_candle()。
@@ -19,6 +25,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -26,6 +33,7 @@ import orjson
 import pandas as pd
 from dotenv import load_dotenv
 
+from data.m1_rest import _atomic_save, _parse_rest_bars
 from fubon import trade_api
 from fubon.subscribe_list import load_subscribe_batches
 
@@ -40,26 +48,62 @@ load_dotenv(_ROOT / ".env")
 _TW = timezone(timedelta(hours=8))
 _LIVE_DIR = _ROOT / "db/m1_live"
 _FLUSH_INTERVAL = float(os.environ.get("FUBON_WS_FLUSH_INTERVAL", "5"))
+# 富邦 intraday/candles rate limit 300次/分鐘（官方文件），節流到 ~240次/分鐘留緩衝。
+# 這個間隔控制的是「發出下一個 request」的頻率，不是單一 worker 的間隔——
+# 多執行緒下大家共用同一個節流時鐘，各自的網路等待時間可以互相重疊
+# （寫法對齊 data/m1_rest.py::_fetch_all 的 _throttled_fetch）。
+_BACKFILL_INTERVAL = float(os.environ.get("FUBON_REST_INTERVAL", "0.25"))
+_BACKFILL_WORKERS = int(os.environ.get("FUBON_BACKFILL_WORKERS", "10"))
 
 
 def _live_path(date_str: str) -> Path:
     return _LIVE_DIR / f"{date_str}.parquet"
 
 
-def _atomic_save(df: pd.DataFrame, file_path: Path):
-    """存檔邏輯對齊 data/m1_rest.py：merge 舊檔 + dedup（stock_id, date）keep last。"""
-    os.makedirs(file_path.parent, exist_ok=True)
-    if file_path.exists():
-        old = pd.read_parquet(file_path)
-        df = pd.concat([old, df], ignore_index=True)
-    df.sort_values(["date", "stock_id"], inplace=True)
-    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype("float32")
-    df["volume"] = df["volume"].astype("int64")
-    tmp = str(file_path) + ".tmp"
-    df.to_parquet(tmp, index=False, compression="zstd")
-    os.replace(tmp, file_path)
+def _backfill_intraday(sdk, symbols: list[str], date_str: str):
+    """連線前先用 REST 補齊當天已經產生、但 WebSocket 連上前收不到的分K。
+    多執行緒併發抓取，全域節流頻率控制在 ~1/_BACKFILL_INTERVAL 次/秒，
+    避免逐支序列等待網路延遲拖慢整體時間。
+    """
+    print(f"[backfill] 開始補 {len(symbols)} 支 {date_str} 的分K（連線前資料，"
+          f"{_BACKFILL_WORKERS} 併發）...", flush=True)
+    t0 = time.time()
+    frames: list[pd.DataFrame] = []
+    frames_lock = threading.Lock()
+    throttle = threading.Semaphore(_BACKFILL_WORKERS)
+    rate_lock = threading.Lock()
+    last_req = [0.0]
+    done = [0]
+
+    def fetch_one(sid: str):
+        with throttle:
+            with rate_lock:
+                wait = _BACKFILL_INTERVAL - (time.time() - last_req[0])
+                if wait > 0:
+                    time.sleep(wait)
+                last_req[0] = time.time()
+            try:
+                bars = trade_api.intraday_candles(sdk, sid)
+                df = _parse_rest_bars(sid, bars, date_str)
+                if not df.empty:
+                    with frames_lock:
+                        frames.append(df)
+            except Exception as e:
+                print(f"[backfill] {sid} 失敗: {e}", flush=True)
+        with frames_lock:
+            done[0] += 1
+            if done[0] % 100 == 0 or done[0] == len(symbols):
+                print(f"[backfill] 進度 {done[0]}/{len(symbols)}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=_BACKFILL_WORKERS) as ex:
+        list(ex.map(fetch_one, symbols))
+
+    if frames:
+        _atomic_save(pd.concat(frames, ignore_index=True), _live_path(date_str))
+    elapsed = time.time() - t0
+    msg = f"[backfill] 完成，{len(frames)}/{len(symbols)} 支有資料（{elapsed:.1f}s）"
+    print(msg, flush=True)
+    _log_sys(f"富邦 backfill 完成 {date_str}：{len(frames)}/{len(symbols)} 支（{elapsed:.1f}s）")
 
 
 def _parse_candle(raw: bytes | str) -> dict | None:
@@ -109,11 +153,16 @@ class FubonM1Collector:
         print(f"登入成功：{[a.name for a in accounts]}", flush=True)
 
         trade_api.init_market_data(self._sdk)  # candles channel 只支援 Normal mode（預設值）
-        token = trade_api.realtime_token(self._sdk)
 
         batches = load_subscribe_batches()
         if not batches:
             raise RuntimeError("訂閱清單是空的，請先跑 python -m fubon.subscribe_list")
+
+        date_str = datetime.now(_TW).strftime("%Y-%m-%d")
+        all_symbols = [sid for batch in batches for sid in batch]
+        _backfill_intraday(self._sdk, all_symbols, date_str)
+
+        token = trade_api.realtime_token(self._sdk)
 
         total = 0
         for i, batch in enumerate(batches, 1):

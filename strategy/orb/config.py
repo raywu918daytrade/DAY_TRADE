@@ -48,3 +48,17 @@ DEFAULT_TEST_DAYS = 10
 # 事件訊號本身就弱（跟成交量高低關係不大，見 FEATURES 重要性分析：純1分K
 # 突破訊號只佔3%重要性）。先改回1000張（濾得少、保留較多樣本）。
 MIN_VOL_MA20 = 1_000_000
+
+# ── 即時交易 session 邊界（live.py 對外介面用，live_trader.py 靠這兩個值判斷
+# 何時該呼叫 predict_live()） ─────────────────────────────────────────────
+# SESSION_START=9:00 要涵蓋 OPENING_RANGE_MINUTES 建立開盤區間所需的K棒；
+# SESSION_END 直接對齊 BREAKOUT_SEARCH_MINUTES（9:00+30分=9:30）——過了這個
+# 搜尋窗口，make_features() 內部本來就不會再產生任何候選（見 features.py
+# 的 _is_breakout 過濾），這裡提前停止開新倉，避免每分鐘還在白跑一次完整
+# 特徵計算 pipeline。既有持倉的 SL/TP 監控不受這裡影響，live_trader.py
+# 過了 SESSION_END 仍會持續呼叫 reconcile([]) 監控到收盤。
+# 用 BREAKOUT_SEARCH_MINUTES 算，不要另外寫死數字——避免跟搜尋窗口本身的
+# 設定各自改、兜不起來（同樣的教訓見 DEFAULT_TEST_DAYS 的說明）。
+SESSION_START = (9, 0)
+_session_end_minute = BREAKOUT_SEARCH_MINUTES
+SESSION_END = (9 + _session_end_minute // 60, _session_end_minute % 60)

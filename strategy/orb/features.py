@@ -168,6 +168,7 @@ FEATURES = [
     "vwap_dev",  # close 相對當日累積VWAP的偏離（比照 rally 的 vwap_dev，累積型不受暖機期影響）
     "atr_hour_surprise",  # 當根TR / 這支股票在這個小時過去10天的歷史平均TR（只需2根當根TR，不受影響）
     "atr7",  # 1分鐘K ATR(7) 相對波動（/ 當日開盤，只需7根K棒，不撞暖機期）
+    "efficiency_ratio_7",  # Kaufman效率係數(7根K棒)，[0,1]，越接近1代表這段上漲越乾淨、雜訊越少
     # ── 個股過去5日「開盤1/3/5分鐘成交量佔當日總量比例」lag特徵，無未來洩漏 ──
     "open_vol_m1_1",
     "open_vol_m1_2",
@@ -472,6 +473,20 @@ def make_features(
     )
     g_tr = m1.groupby(["stock_id", "day_date"], group_keys=False)
     m1["atr7"] = _degroup(g_tr["_tr"].rolling(7, min_periods=7).mean(), m1.index) / day_open
+
+    # 效率係數（Kaufman Efficiency Ratio，7根K棒窗口，跟 atr7 用同樣的窗口
+    # 長度，一樣不會撞暖機期）：分子是「淨移動距離」，分母是「這7根裡逐根
+    # 走的路程總和」，[0,1]有界。ER接近1代表這段上漲一路噴上去、沒什麼雜訊
+    # （像一根長紅棒吃掉前面好幾根K的效果）；接近0代表來回震盪、原地磨。
+    # 比單純比較「這根range/前幾根平均range」更能抓到「乾不乾淨」這件事，
+    # 跟只看淨位移的 m3_ret/m5_ret 是互補而非重複的角度（2026-07-13 討論）。
+    _close_diff_abs = g_day["close"].diff().abs()
+    _path_len_7 = _degroup(
+        _close_diff_abs.groupby([m1["stock_id"], m1["day_date"]], group_keys=False).rolling(7, min_periods=7).sum(),
+        m1.index,
+    )
+    _net_move_7 = (m1["close"] - g_day["close"].shift(7)).abs()
+    m1["efficiency_ratio_7"] = _net_move_7 / _path_len_7.replace(0, np.nan)
 
     # VWAP 偏離：close 相對當日累積VWAP的偏離（跟 rally 的 vwap_dev 同做法）
     m1["_cum_vol"] = g_day["volume"].transform("cumsum")

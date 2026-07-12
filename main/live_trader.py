@@ -3,20 +3,28 @@
 
 架構：
     主執行緒  → uvicorn（FastAPI + SSE）
-    背景執行緒 → M1RestPoller（Fugle REST API，每分鐘 poll）
-    背景執行緒 → _daily_refresh（每天 06:00 更新當沖標的 + 日K）
+    背景執行緒 → 分K收集器（main/collector.py，REST 或富邦 WebSocket）
+    背景執行緒 → _daily_refresh（每天 06:00 更新當沖標的 + 日K，08:45 重算策略盤前快取）
     背景執行緒 → _force_close_eod（每天 13:25 強制平倉，當沖不過夜）
+
+模組分工（這支檔案只管流程編排：呼叫順序、on_minute、排程）：
+    main/config.py          → .env 讀出來的設定常數
+    main/state.py           → AppState：跨執行緒共用的執行期狀態
+    main/strategy_loader.py → 動態載入策略模組（切換模型／策略）
+    main/premarket.py       → 盤前資料準備（當沖候選清單、日K、策略快取）
+    main/backfill.py        → 開機補載推論（填 SSE monitoring，不用等下一分鐘）
+    main/collector.py       → 分K收集器（REST／富邦 WebSocket 切換）
 
 資料取用時段：
     盤前（<09:01）  : 日K 從 HF Hub / 本地載入；分K 從既有 parquet 讀取（昨日 backfill）
-    盤中（09:01~13:00）: Fugle REST /intraday/candles 每分鐘 poll，寫入 db/m1_live/
-    盤後（>13:00）  : Fugle REST /historical/candles 補齊完整今日分K，再 sleep 到隔日
+    盤中（09:01~13:00）: 分K收集器每分鐘 poll/推送，寫入 db/m1_live/
+    盤後（>13:00）  : REST /historical/candles 補齊完整今日分K，再 sleep 到隔日
 
 流程：
     on_minute → predict_live → push_monitoring → SSE monitoring event
                              → push_signals    → API /signals/today
                              → push_candles    → API /chart/{id}/candles
-                             → reconcile       → 永豐 / paper 下單
+                             → reconcile       → 永豐 / paper / 富邦 下單
 """
 
 import builtins as _builtins
@@ -46,64 +54,45 @@ from api import (
     push_inference_log,
     push_monitoring,
     push_signals,
-    set_collector_status,
     tw_naive_to_epoch,
     update_positions_price,
 )
-import importlib
-import os
 
-# 策略模組切換：改 .env 的 STRATEGY_MODULE 就能換策略，不用改這支檔案。
-# 每個策略模組（例如 strategy/rally/live.py）都要暴露同一組介面：
-# load_model() / predict_live(...) / SESSION_START / SESSION_END
-# strategy/base/date_trade_model.py 已刪除（2026-07-09，特徵整合進
-# strategy/rally），預設值改成 rally；沒設 STRATEGY_MODULE 的環境（例如
-# 還沒同步這次改動的 Render 部署）務必記得在 .env 補上這個變數。
-STRATEGY_MODULE = os.environ.get("STRATEGY_MODULE", "strategy.rally.live")
-_strategy = importlib.import_module(STRATEGY_MODULE)
-SESSION_END = _strategy.SESSION_END
-SESSION_START = _strategy.SESSION_START
-load_model = _strategy.load_model
-predict_live = _strategy.predict_live
-print(f"[策略] 使用 {STRATEGY_MODULE}", flush=True)
+from main import collector as _collector
+from main import premarket as _premarket
+from main.backfill import run_startup_backfill
+from main.config import (
+    FORCE_CLOSE_HOUR as _FORCE_CLOSE_HOUR,
+    FORCE_CLOSE_MIN as _FORCE_CLOSE_MIN,
+    STRATEGY_MODULE,
+    THRESHOLD,
+    TOTAL_CAPITAL,
+    TRADE_MODE,
+)
+from main.state import AppState
+from main.strategy_loader import load_strategy
 
-from data.fugle_tickers import update_tickers
-from data.m1_rest import M1RestPoller
+from data.data_manager import Phase
 from data.query import load_m1_live
-from data.data_manager import Phase, load_d1  # noqa: F401 Phase 供外部 import 參考
-
-TRADE_MODE = os.environ.get("TRADE_MODE", "off")  # off | paper | sim | live
-_TOTAL_CAPITAL_ENV = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
-
-
-# settings.json 存在且有 total_capital → 優先使用，否則回落 .env
-def _resolve_capital() -> float:
-    # api.py 已初始化 _settings_cache（含 HF Hub fallback），直接用 get_setting
-    try:
-        from api import get_setting
-
-        v = get_setting("total_capital")
-        if v is not None:
-            print(f"[設定] 總額度從 settings 載入：{float(v):,.0f}")
-            return float(v)
-    except Exception:
-        pass
-    return _TOTAL_CAPITAL_ENV
-
-
-TOTAL_CAPITAL = _resolve_capital()
-
 
 _TW = timezone(timedelta(hours=8))
-THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
-_FORCE_CLOSE_HOUR = int(os.environ.get("FORCE_CLOSE_HOUR", "13"))
-_FORCE_CLOSE_MIN = int(os.environ.get("FORCE_CLOSE_MIN", "25"))
 
+state = AppState()
+
+# strategy/base/date_trade_model.py 已刪除（2026-07-09，特徵整合進
+# strategy/rally），STRATEGY_MODULE 預設值改成 rally；每個策略模組都要暴露
+# 同一組介面：load_model() / predict_live(...) / SESSION_START / SESSION_END
+state.strategy_module = load_strategy(STRATEGY_MODULE)
+state.session_start = state.strategy_module.SESSION_START
+state.session_end = state.strategy_module.SESSION_END
+state.load_model = state.strategy_module.load_model
+state.predict_live = state.strategy_module.predict_live
+print(f"[策略] 使用 {STRATEGY_MODULE}", flush=True)
 
 print("載入模型...")
 sys.stdout.flush()
 try:
-    model = load_model()
+    state.model = state.load_model()
     print("✓ 模型載入成功", flush=True)
 except Exception as e:
     print(f"✗ 模型載入失敗: {e}", flush=True)
@@ -111,130 +100,124 @@ except Exception as e:
 
 print("更新當沖標的清單...", flush=True)
 try:
-    _tickers_df = update_tickers()
-    if _tickers_df.empty:
-        print("  警告：無法取得當沖標的（非盤中），不過濾股票", flush=True)
-        _tickers = {}
-    else:
-        _tickers = _tickers_df.set_index("stock_id")["name"].to_dict()
-    _day_trade_stocks = set(_tickers.keys()) or None  # None = 不過濾
-    print(f"  當沖標的（API）：{len(_tickers)} 支", flush=True)
+    _premarket.refresh_tickers(state)
+    print(f"  當沖標的（API）：{len(state.tickers)} 支", flush=True)
 except Exception as e:
     print(f"✗ 取得當沖標的失敗: {e}", flush=True)
-    _tickers = {}
-    _day_trade_stocks = None
+    state.tickers = {}
+    state.day_trade_stocks = None
 
 # 盤中才有標的清單，非盤中跳過日K載入（省記憶體）；_daily_refresh 在 06:00 補載
-if _day_trade_stocks:
+if state.day_trade_stocks:
     print(f"[D1] 載入日K（{Phase.PRE_MARKET.value}）...", flush=True)
     try:
-        _day, _day_trade_stocks = load_d1(_day_trade_stocks)
-        _d1_last = _day["date"].max() if not _day.empty else "無"
-        print(f"✓ [D1] {len(_day):,} 筆，{_day['stock_id'].nunique():,} 支，最新日期：{_d1_last}", flush=True)
-        _log_sys(f"D1 載入完成：{_day['stock_id'].nunique() if not _day.empty else 0} 支，最新 {_d1_last}")
+        _premarket.refresh_day(state)
+        _d1_last = state.day["date"].max() if not state.day.empty else "無"
+        print(
+            f"✓ [D1] {len(state.day):,} 筆，{state.day['stock_id'].nunique():,} 支，最新日期：{_d1_last}",
+            flush=True,
+        )
+        _log_sys(f"D1 載入完成：{state.day['stock_id'].nunique() if not state.day.empty else 0} 支，最新 {_d1_last}")
     except Exception as e:
         print(f"✗ [D1] 載入失敗: {e}", flush=True)
         _log_sys(f"D1 載入失敗: {e}", "error")
-        _day = pd.DataFrame()
+        state.day = pd.DataFrame()
 else:
-    _day = pd.DataFrame()
+    state.day = pd.DataFrame()
     print("[D1] 非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
 
+print("盤前預算快取...", flush=True)
+try:
+    _premarket.refresh_prewarm(state)
+    print(f"✓ 盤前快取完成：{list(state.prewarm_cache.keys())}", flush=True)
+except Exception as e:
+    print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
+    state.prewarm_cache = {}
+
 # 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
-if not _day.empty:
-    try:
-        _today_str = datetime.now(_TW).strftime("%Y-%m-%d")
-        print(f"[M1] 補載今日分K（{_today_str}）...", flush=True)
-        _m1_now = load_m1_live(_today_str)
-        if not _m1_now.empty:
-            _last_min = str(_m1_now["date"].max())
-            print(f"  → {len(_m1_now):,} 筆，{_m1_now['stock_id'].nunique():,} 支，最新分鐘：{_last_min}", flush=True)
-            _init_results = predict_live(
-                _last_min,
-                _day,
-                day_trade_stocks=_day_trade_stocks,
-                m1_live=_m1_now,
-            )
-            push_monitoring(_last_min, _init_results, THRESHOLD)
-            print(f"✓ [M1] 補載監控完成：{len(_init_results)} 支訊號", flush=True)
-        else:
-            print("  → 今日無分K資料（尚未開盤或非交易日）", flush=True)
-        del _m1_now
-    except Exception as _e:
-        print(f"✗ [M1] 補載失敗: {_e}", flush=True)
+run_startup_backfill(state, THRESHOLD)
 
 print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...", flush=True)
 
-_executor = None
 if TRADE_MODE != "off":
     try:
         from trade.run_execute import make_executor
 
-        _executor = make_executor(
+        state.executor = make_executor(
             TRADE_MODE,
             TOTAL_CAPITAL,
-            name_lookup=lambda sid: _tickers.get(sid, sid),
+            name_lookup=lambda sid: state.tickers.get(sid, sid),
         )
         print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}", flush=True)
         _log_sys(f"交易引擎啟動：{TRADE_MODE} 模式，資金={TOTAL_CAPITAL:,.0f}")
-        if hasattr(_executor, "sync_from_broker"):
-            _executor.sync_from_broker()
-        if hasattr(_executor, "startup_sltp_check"):
-            _executor.startup_sltp_check()
-        if hasattr(_executor, "close_stock_now"):
+        if hasattr(state.executor, "sync_from_broker"):
+            state.executor.sync_from_broker()
+        if hasattr(state.executor, "startup_sltp_check"):
+            state.executor.startup_sltp_check()
+        if hasattr(state.executor, "close_stock_now"):
             from api import register_close_now
 
-            register_close_now(_executor.close_stock_now)
+            register_close_now(state.executor.close_stock_now)
     except Exception as e:
         print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
         _log_sys(f"交易模組載入失敗: {e}", "error")
 
 
 def _daily_refresh():
-    """每天 06:00 更新當沖清單與日K（Render 24小時常駐用）"""
-    global _tickers, _day_trade_stocks, _day
+    """每天 06:00 更新當沖清單與日K；08:45（開盤前15分）重算盤前策略快取
+    （Render 24小時常駐用）"""
     last_refresh = None
+    last_prewarm = None
     while True:
         now = datetime.now(_TW)
         today = now.date()
         need_refresh = last_refresh != today and now.hour == 6 and now.minute >= 0
         # 啟動時若日K是空的（非盤中跳過）且已過 06:00，立即補載
-        need_refresh = need_refresh or (last_refresh is None and _day.empty and now.hour >= 6)
+        need_refresh = need_refresh or (last_refresh is None and state.day.empty and now.hour >= 6)
         if need_refresh:
             print(f"[{now.strftime('%H:%M')}] 每日更新：當沖標的 + 日K...")
             try:
-                df = update_tickers()
-                if not df.empty:
-                    _tickers = df.set_index("stock_id")["name"].to_dict()
-                    _day_trade_stocks = set(_tickers.keys()) or None
-                if _day_trade_stocks:
-                    _day, _day_trade_stocks = load_d1(_day_trade_stocks)
+                _premarket.refresh_tickers(state)
+                if state.day_trade_stocks:
+                    _premarket.refresh_day(state)
                 last_refresh = today
-                n = len(_day_trade_stocks) if _day_trade_stocks else 0
+                n = len(state.day_trade_stocks) if state.day_trade_stocks else 0
                 print(f"  更新完成，當沖標的：{n} 支")
                 _log_sys(f"每日更新完成（{Phase.PRE_MARKET.value}）：{n} 支標的")
             except Exception as e:
                 print(f"  更新失敗: {e}")
+
+        need_prewarm = last_prewarm != today and (now.hour, now.minute) >= (8, 45)
+        if need_prewarm:
+            print(f"[{now.strftime('%H:%M')}] 盤前策略快取重算...")
+            try:
+                _premarket.refresh_prewarm(state)
+                last_prewarm = today
+                print(f"  快取完成：{list(state.prewarm_cache.keys())}")
+                _log_sys(f"盤前策略快取重算完成：{list(state.prewarm_cache.keys())}")
+            except Exception as e:
+                print(f"  快取失敗: {e}")
+                _log_sys(f"盤前策略快取失敗: {e}", "error")
         time.sleep(60)
 
 
 def on_minute(minute_str: str, df: pd.DataFrame):
-    """M1RestPoller 每分鐘回呼：推論、推送監控/K線/訊號，並觸發下單。"""
+    """分K收集器每分鐘回呼：推論、推送監控/K線/訊號，並觸發下單。"""
     dt = pd.Timestamp(minute_str)
     h, m = dt.hour, dt.minute
 
-    if (h, m) < SESSION_START:
+    if (h, m) < state.session_start:
         return
 
     # SESSION_END 後：停止開倉，但繼續跑 reconcile 做 SL/TP 監控直到收盤
-    if (h, m) > SESSION_END:
-        if _executor is not None:
+    if (h, m) > state.session_end:
+        if state.executor is not None:
             price_map = {}
             if not df.empty and "stock_id" in df.columns and "close" in df.columns:
                 price_map = dict(zip(df["stock_id"].astype(str), df["close"].astype(float)))
                 update_positions_price(price_map)
             try:
-                _executor.reconcile([], prices=price_map)  # signals=[] 不開倉，只跑 SL/TP
+                state.executor.reconcile([], prices=price_map)  # signals=[] 不開倉，只跑 SL/TP
             except Exception as e:
                 print(f"[TRADE ERROR after session] {e}")
         return
@@ -266,16 +249,17 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             push_candles(str(sid), candles)
 
     # 模型推論：threshold=0 取得所有股票機率，共用已載入的 m1_live
-    all_results = predict_live(
+    all_results = state.predict_live(
         minute_str,
-        _day,
-        model=model,
+        state.day,
+        model=state.model,
         threshold=0,
-        day_trade_stocks=_day_trade_stocks,
+        day_trade_stocks=state.day_trade_stocks,
         m1_live=m1_live if not m1_live.empty else None,
+        **state.prewarm_cache,
     )
     for r in all_results:
-        r["name"] = _tickers.get(r["stock_id"], r["stock_id"])
+        r["name"] = state.tickers.get(r["stock_id"], r["stock_id"])
     # 每分鐘從 settings 讀信心度，允許前端即時調整
     from api import get_setting
 
@@ -306,9 +290,9 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         print(f"  → 訊號: {sig_str}", flush=True)
         _log_sys(f"訊號: {sig_str}")
 
-    if _executor is not None:
+    if state.executor is not None:
         try:
-            _executor.reconcile(signals, prices=price_map)
+            state.executor.reconcile(signals, prices=price_map)
         except Exception as e:
             print(f"[TRADE ERROR] {e}")
             _log_sys(f"reconcile 錯誤: {e}", "error")
@@ -334,76 +318,21 @@ def _force_close_eod():
             fc_h, fc_m = map(int, fc_str.split(":"))
         except Exception:
             fc_h, fc_m = _FORCE_CLOSE_HOUR, _FORCE_CLOSE_MIN
-        if (now.hour, now.minute) == (fc_h, fc_m) and _force_close_done_date != today and _executor is not None:
+        if (now.hour, now.minute) == (fc_h, fc_m) and _force_close_done_date != today and state.executor is not None:
             _force_close_done_date = today
             print(f"[{now.strftime('%H:%M:%S')}] 強制平倉：本系統當沖倉位（{fc_str}）", flush=True)
             try:
-                _executor.force_close_own_positions()
+                state.executor.force_close_own_positions()
             except Exception as e:
                 print(f"[FORCE CLOSE] 錯誤: {e}", flush=True)
             time.sleep(10)
-            if hasattr(_executor, "sync_from_broker"):
+            if hasattr(state.executor, "sync_from_broker"):
                 try:
-                    _executor.sync_from_broker()
+                    state.executor.sync_from_broker()
                     print(f"[FORCE CLOSE] 盤後同步完成", flush=True)
                 except Exception as e:
                     print(f"[FORCE CLOSE] 盤後同步失敗: {e}", flush=True)
         time.sleep(30)
-
-
-def _get_stocks():
-    """每次重連都取最新當沖標的；非盤中無清單時回退到所有可交易股票
-
-    固定加入 0050：它本身不是當沖候選股，但 rally 策略的 idx_* 特徵
-    （大盤 1分K 相對強弱）需要它當天的即時分K，若當沖候選清單剛好沒選到
-    0050，db/m1_live/ 就不會有它的資料，predict_live() 算 idx_* 特徵時
-    會直接 KeyError。
-    """
-    from data.fugle_tickers import fugle_stocks
-
-    stocks = list(_day_trade_stocks) if _day_trade_stocks else fugle_stocks()
-    if "0050" not in stocks:
-        stocks.append("0050")
-    return stocks
-
-
-def _on_rate_limited():
-    """Fugle 429 時推送前端警示。"""
-    try:
-        from api import push_alert
-
-        push_alert("Fugle REST API 限流，使用快取分K繼續監控（SL/TP 仍有效）", level="warning")
-    except Exception:
-        pass
-
-
-_M1_COLLECTOR = os.environ.get("M1_COLLECTOR", "rest")  # rest（預設）| fubon_ws
-
-
-def _start_collector():
-    """分K收集器背景執行緒，異常時更新 collector 狀態供 /health 回傳。
-
-    M1_COLLECTOR=fubon_ws：改用富邦 WebSocket（fubon/marketdata_ws.py），需要
-    .env 設好 FUBON_ID/PASSWORD/CERT，且開盤前先跑過 `python -m fubon.subscribe_list`
-    產生訂閱清單。帳號權限、candles payload 格式目前都還沒用真連線驗證過，
-    正式環境先別切過去，等驗證過再改 .env。
-    預設 rest：跟現在一樣用 M1RestPoller（Fugle REST）。
-    """
-    if _M1_COLLECTOR == "fubon_ws":
-        from fubon.marketdata_ws import FubonM1Collector
-
-        collector = FubonM1Collector(on_minute=on_minute)
-    else:
-        collector = M1RestPoller(on_minute=on_minute, stocks=_get_stocks, on_rate_limited=_on_rate_limited)
-
-    try:
-        set_collector_status("running")
-        collector.start()
-    except Exception as e:
-        set_collector_status("error")
-        print(f"Collector 中斷: {e}")
-    else:
-        set_collector_status("stopped")
 
 
 if __name__ == "__main__":
@@ -411,8 +340,8 @@ if __name__ == "__main__":
     threading.Thread(target=_daily_refresh, daemon=True).start()
     # 每日 13:25 強制平倉（當沖不過夜）
     threading.Thread(target=_force_close_eod, daemon=True).start()
-    # M1RestPoller 在背景執行緒
-    threading.Thread(target=_start_collector, daemon=True).start()
+    # 分K收集器在背景執行緒
+    threading.Thread(target=lambda: _collector.start_collector(state, on_minute), daemon=True).start()
 
     # uvicorn 跑主執行緒（阻塞）
     config = get_uvicorn_config(host="0.0.0.0", port=8000)

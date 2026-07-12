@@ -12,6 +12,8 @@ dist/
 .trade_env
 *.pfx
 *.p12
+*.whl
+*.zip
 *.egg-info
 db
 log/
@@ -34,6 +36,7 @@ signal*.txt
 *bak
 *.md
 !knowledge/**/*.md
+!main/README.md
 *.html
 *.txt
 !requirements.txt

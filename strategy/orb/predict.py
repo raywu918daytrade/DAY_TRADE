@@ -59,6 +59,22 @@ def predict(
     return df_proba
 
 
+def build_prewarm_cache() -> dict:
+    """
+    盤前預算快取 — 給 strategy/prewarm.py 統一呼叫的介面（見該檔案說明）。
+
+    open_vol_history/hourly_tr_history 只吃 db/m1（歷史資料，盤中不會變），
+    同一個交易日內不管幾點算結果都一樣，開盤前算一次存起來、整天重複用，
+    不要讓 predict_live() 每分鐘都自己重跑一次 build_history_tables()
+    （那是留給沒有傳快取時的 fallback，不是正常路徑該走的）。
+
+    回傳的 dict key 要跟 predict_live() 接受的參數名一致，因為
+    main/live_trader.py 會直接 **cache 展開傳進 predict_live()。
+    """
+    open_vol_history, hourly_tr_history = build_history_tables(load_m1())
+    return {"open_vol_history": open_vol_history, "hourly_tr_history": hourly_tr_history}
+
+
 def predict_live(
     minute_str: str,
     day: pd.DataFrame | None = None,

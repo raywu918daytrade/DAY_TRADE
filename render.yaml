@@ -3,7 +3,7 @@ services:
     name: just1stock-live
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python live_trader.py
+    startCommand: python -m main.live_trader
     envVars:
       - key: FUGLE
         sync: false   # 在 Render dashboard 手動填入 API Key

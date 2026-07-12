@@ -51,6 +51,14 @@ def intraday_tickers(sdk: FubonSDK, exchange: str, type_: str = "EQUITY", is_nor
     return r.get("data", [])
 
 
+def intraday_candles(sdk: FubonSDK, symbol: str, timeframe: int = 1) -> list[dict]:
+    """REST 行情 API：取得單一股票當日分K（intraday/candles/{symbol}）。呼叫前須先
+    init_market_data()。Rate limit 300次/分鐘（富邦官方文件），呼叫端要自行節流。"""
+    reststock = sdk.marketdata.rest_client.stock
+    r = reststock.intraday.candles(symbol=symbol, timeframe=timeframe)
+    return r.get("data", [])
+
+
 def realtime_token(sdk: FubonSDK) -> str:
     return sdk.exchange_realtime_token()
 
