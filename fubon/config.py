@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 _ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 # 富邦行情 WebSocket rate limit：200 檔訂閱/連線、最多 5 條連線。
 MAX_PER_CONNECTION = int(os.environ.get("FUBON_WS_SYMBOLS_PER_CONN", "200"))

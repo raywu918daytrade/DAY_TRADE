@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 _ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 _HF_INFERENCE_PREFIX = "day_trade/inference"

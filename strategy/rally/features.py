@@ -26,7 +26,7 @@ from data.query import load_day, load_m1, load_m3, load_m5
 from strategy.rally.config import HOLD_BARS, SL_PCT, TP_PCT
 
 _ROOT = Path(__file__).parent.parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 _M1_DIR = _ROOT / "db/m1"
 _DAY_DIR = _ROOT / "db/fugle_day"

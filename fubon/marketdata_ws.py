@@ -53,7 +53,7 @@ except Exception:
     def _log_sys(msg, level="info"): pass  # type: ignore
 
 _ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 _LIVE_DIR = _ROOT / "db/m1_live"

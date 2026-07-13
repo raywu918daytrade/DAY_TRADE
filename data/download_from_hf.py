@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from huggingface_hub import HfApi, hf_hub_download
 
 _ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None

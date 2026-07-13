@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 from fubon.config import MAX_CONNECTIONS, MAX_PER_CONNECTION
 
 _ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 _SUBSCRIBE_PATH = _ROOT / "db/fubon_subscribe/subscribe_list.parquet"

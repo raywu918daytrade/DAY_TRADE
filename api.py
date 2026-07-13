@@ -745,7 +745,6 @@ def push_signals(minute_str: str, signals: list):
 
 def push_candles(stock_id: str, candles: list):
     """推入 K 線資料（index=datetime, open/high/low/close/volume/vwap）"""
-    print(f"[push_candles] {stock_id} 推入 {len(candles)} 根 K 線", flush=True)
     with _lock:
         _candles[stock_id] = candles
         _broadcast({"type": "candles", "stock_id": stock_id})

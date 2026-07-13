@@ -11,7 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fubon_neo.sdk import FubonSDK, Mode, build_websocket_client
 
-load_dotenv(Path(__file__).parents[1] / ".env")
+load_dotenv(Path(__file__).parents[1] / ".env", override=True)
 
 _ROOT = Path(__file__).parents[1]
 

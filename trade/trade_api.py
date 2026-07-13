@@ -6,7 +6,7 @@ from pathlib import Path
 import shioaji as sj
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parents[1] / ".env")
+load_dotenv(Path(__file__).parents[1] / ".env", override=True)
 
 
 def login() -> sj.Shioaji:

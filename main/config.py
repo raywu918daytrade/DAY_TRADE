@@ -11,7 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 _ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 # 策略模組切換：改 .env 的 STRATEGY_MODULE 就能換策略，不用改 live_trader.py。
 # 每個策略模組（例如 strategy/rally/live.py）都要暴露同一組介面：

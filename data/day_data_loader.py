@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from data.fugle_tickers import fugle_stocks
 
 _ROOT = Path(__file__).parent.parent
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 
