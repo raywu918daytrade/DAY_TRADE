@@ -106,6 +106,10 @@ class FubonM1Collector:
         self._clients: list = []
         self._buffer: dict[tuple[str, str], dict] = {}  # (stock_id, minute_str) -> row
         self._buffer_lock = threading.Lock()
+        # 保護 _atomic_save()：_flush_loop 跟 _minute_tick_loop 都會呼叫 _flush()，
+        # 兩邊同時寫檔會搶同一個 .tmp 檔名，os.replace() 會噴 FileNotFoundError
+        # （2026-07-13 實際發生過，導致 collector 整個掛掉、不會自動重連）。
+        self._save_lock = threading.Lock()
         self._stop = False
 
     # ── 連線 ──────────────────────────────────────────────────────────────
@@ -242,8 +246,9 @@ class FubonM1Collector:
             rows = list(self._buffer.values())
 
         df = pd.DataFrame(rows)
-        for date_str, g in df.groupby(df["date"].str[:10]):
-            _atomic_save(g.copy(), _live_path(date_str))
+        with self._save_lock:
+            for date_str, g in df.groupby(df["date"].str[:10]):
+                _atomic_save(g.copy(), _live_path(date_str))
         print(f"[flush] 存檔 {len(df)} 筆（{df['stock_id'].nunique()} 支）", flush=True)
 
     # ── 每分鐘固定觸發一次 on_minute（保底機制）────────────────────────────

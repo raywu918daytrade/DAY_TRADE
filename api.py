@@ -475,6 +475,8 @@ def _reset_if_new_day():
 def push_monitoring(minute_str: str, all_results: list, threshold: float):
     """推入所有監控股票的最新推論結果（threshold=0 全部），由 on_minute 呼叫"""
     print(f"[push_monitoring] {minute_str} 接收 {len(all_results)} 支股票的推論結果", flush=True)
+    cur_dt = datetime.strptime(minute_str, "%Y-%m-%d %H:%M:%S")
+    date_str = minute_str[:10]
     with _lock:
         for r in all_results:
             _monitoring[r["stock_id"]] = {
@@ -486,6 +488,16 @@ def push_monitoring(minute_str: str, all_results: list, threshold: float):
                 "is_signal": r["proba"] >= threshold,
                 "minute": minute_str[11:16],
             }
+        # 清掉超過 3 分鐘沒被本輪 all_results 更新到的股票：這種股票已經不在目前
+        # 實際被推論的候選清單裡（例如 day_trade_stocks 名單變動、盤中被剔除），
+        # 若不清掉，它舊的（通常偏高的）proba 會永遠卡在排行榜頂端，跟 on_minute
+        # 印出的 top5 log 對不起來，且前端「監控中」清單會顯示早就過期的股票。
+        stale_ids = [
+            sid for sid, v in _monitoring.items()
+            if (cur_dt - datetime.strptime(f"{date_str} {v['minute']}", "%Y-%m-%d %H:%M")).total_seconds() > 180
+        ]
+        for sid in stale_ids:
+            del _monitoring[sid]
         data = sorted(_monitoring.values(), key=lambda x: -x["proba"])
         _broadcast({"type": "monitoring", "minute": minute_str[11:16], "data": data})
 

@@ -352,20 +352,20 @@ def make_features(
 
     # ── 3分鐘K volume pct_change + lag1/lag2 ────────────────────────
     g_m3 = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    m1["m3_volume"] = g_m3["m3_vol_raw"].pct_change(3)
+    m1["m3_volume"] = g_m3["m3_vol_raw"].pct_change(3, fill_method=None)
     g_m3 = m1.groupby(["stock_id", "day_date"], group_keys=False)
     for col in ["m3_open", "m3_high", "m3_low", "m3_close", "m3_volume"]:
         m1[f"{col}_lag1"] = g_m3[col].shift(3)
         m1[f"{col}_lag2"] = g_m3[col].shift(6)
-    m1["m3_ret"] = g_m3["m3_close"].pct_change(3)
+    m1["m3_ret"] = g_m3["m3_close"].pct_change(3, fill_method=None)
 
     # ── 5分鐘K volume pct_change + lag1 ─────────────────────────────
     g_m5 = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    m1["m5_volume"] = g_m5["m5_vol_raw"].pct_change(5)
+    m1["m5_volume"] = g_m5["m5_vol_raw"].pct_change(5, fill_method=None)
     g_m5 = m1.groupby(["stock_id", "day_date"], group_keys=False)
     for col in ["m5_open", "m5_high", "m5_low", "m5_close", "m5_volume"]:
         m1[f"{col}_lag1"] = g_m5[col].shift(5)
-    m1["m5_ret"] = g_m5["m5_close"].pct_change(5)
+    m1["m5_ret"] = g_m5["m5_close"].pct_change(5, fill_method=None)
 
     # ── 強過濾：破底翻訊號 ───────────────────────────────────────────
     # 第1根5分鐘K跌（lag1的ret < 0），第2根5分鐘K漲（當前ret > 0）
@@ -374,14 +374,14 @@ def make_features(
 
     # ── 報酬率與量比 ────────────────────────────────────────────────
     # 前1分鐘報酬率
-    m1["ret_1"] = g_day["close"].pct_change(1)
+    m1["ret_1"] = g_day["close"].pct_change(1, fill_method=None)
 
     # 量比（當前量 / 前1分鐘量）
     vol_shift1 = g_day["volume"].shift(1)
     m1["vol_ratio"] = m1["volume"] / vol_shift1.replace(0, np.nan)
 
     # 3分鐘K報酬率
-    m1["tf3_ret"] = g_day["close"].pct_change(3)
+    m1["tf3_ret"] = g_day["close"].pct_change(3, fill_method=None)
 
     # 3分鐘K量比
     m1["_vol_roll3"] = _degroup(g_day["volume"].rolling(3).sum(), m1.index)
@@ -389,7 +389,7 @@ def make_features(
     m1["tf3_vol_ratio"] = m1["_vol_roll3"] / g_day2["_vol_roll3"].shift(3).replace(0, np.nan)
 
     # 5分鐘K報酬率
-    m1["tf5_ret"] = g_day["close"].pct_change(5)
+    m1["tf5_ret"] = g_day["close"].pct_change(5, fill_method=None)
 
     # 5分鐘K量比
     m1["_vol_roll5"] = _degroup(g_day["volume"].rolling(5).sum(), m1.index)
@@ -405,8 +405,8 @@ def make_features(
     # 約115個）也不合併，維持特徵數量可控。
 
     # 更長天期報酬率（ret_10 約9:16後、ret_15 約9:21後才有值）
-    m1["ret_10"] = g_day["close"].pct_change(10)
-    m1["ret_15"] = g_day["close"].pct_change(15)
+    m1["ret_10"] = g_day["close"].pct_change(10, fill_method=None)
+    m1["ret_15"] = g_day["close"].pct_change(15, fill_method=None)
 
     # close 在當根K棒 (high-low) 的相對位置 [0,1]
     _bar_range = (m1["high"] - m1["low"]).replace(0, np.nan)
@@ -420,8 +420,8 @@ def make_features(
     # close_pos/range_pct/reversal 是「比值」，用已正規化的 m3_open/high/low/
     # close（除以 day_open）算，day_open 在分子分母會自動消掉，結果等於用
     # 原始未正規化價格算，不用另外拿一份原始高低價。
-    m1["tf3_ret_2"] = g_day["close"].pct_change(6)
-    m1["tf3_ret_3"] = g_day["close"].pct_change(9)
+    m1["tf3_ret_2"] = g_day["close"].pct_change(6, fill_method=None)
+    m1["tf3_ret_3"] = g_day["close"].pct_change(9, fill_method=None)
     _tf3_range = (m1["m3_high"] - m1["m3_low"]).replace(0, np.nan)
     m1["tf3_close_pos"] = (m1["m3_close"] - m1["m3_low"]) / _tf3_range
     m1["tf3_range_pct"] = _tf3_range / m1["m3_open"].replace(0, np.nan)
@@ -488,7 +488,7 @@ def make_features(
     dg = day.groupby("stock_id")
     # 短線均量（5日），避免 rolling(20) 吃掉過多歷史資料
     vol_ma5 = _degroup(dg["volume"].rolling(5).mean(), day.index).replace(0, np.nan)
-    day["_ret1"] = dg["close"].pct_change(1)
+    day["_ret1"] = dg["close"].pct_change(1, fill_method=None)
     day["_volr"] = day["volume"] / vol_ma5
     dg2 = day.groupby("stock_id", group_keys=False)
     day_ret_cols, day_vol_cols = [], []
@@ -546,7 +546,7 @@ def make_features(
     idx_day = day[day["stock_id"] == "0050"].copy()
     if not idx_day.empty:
         idx_dg = idx_day.groupby("stock_id")
-        idx_day["_idx_ret1"] = idx_dg["close"].pct_change(1)
+        idx_day["_idx_ret1"] = idx_dg["close"].pct_change(1, fill_method=None)
         idx_dg2 = idx_day.groupby("stock_id", group_keys=False)
         idx_day_ret_cols = []
         for lag in range(1, 6):
@@ -585,7 +585,7 @@ def make_features(
         # 0050 當日開盤價
         idx_day_open = idx_g_day["open"].transform("first").replace(0, np.nan)
         # 0050 前1分報酬率
-        idx_ret_1 = idx_g_day["close"].pct_change(1)
+        idx_ret_1 = idx_g_day["close"].pct_change(1, fill_method=None)
         m1.loc[idx_m1.index, "idx_ret_1"] = idx_ret_1.values
         # 0050 收盤 / 當日開盤（大盤相對開盤漲跌幅）
         m1.loc[idx_m1.index, "idx_vs_open"] = (idx_m1["close"] / idx_day_open).values
