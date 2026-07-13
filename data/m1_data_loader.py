@@ -135,7 +135,7 @@ def _download_m1_fubon(sdk, stock_id: str) -> pd.DataFrame:
     intraday/candles。"""
     from fubon import trade_api
 
-    bars = trade_api.historical_candles(sdk, stock_id)
+    bars = trade_api.historical_candles(sdk, stock_id, timeframe=1)
     if not bars:
         return pd.DataFrame()
     df = pd.DataFrame(bars)

@@ -71,13 +71,17 @@ def intraday_candles(sdk: FubonSDK, symbol: str, timeframe: int = 1) -> list[dic
     return r.get("data", [])
 
 
-def historical_candles(sdk: FubonSDK, symbol: str, timeframe: int = 1) -> list[dict]:
-    """REST 行情 API：取得單一股票近30日分K（historical/candles/{symbol}），語意
-    對齊 Fugle 的 /historical/candles（同一套底層 fugle_marketdata 元件）。呼叫前
-    須先 init_market_data()。Rate limit 60次/分鐘（富邦官方文件，比 intraday 慢
-    很多），呼叫端要自行節流。"""
+def historical_candles(sdk: FubonSDK, symbol: str, **params) -> list[dict]:
+    """REST 行情 API：取得單一股票歷史K線（historical/candles/{symbol}），語意
+    對齊 Fugle 的 /historical/candles（同一套底層 fugle_marketdata 元件，接受
+    一樣的 query params：timeframe/from/to/fields/sort/adjusted，2026-07-13
+    實測過 from/to 抓日K跟 Fugle 行為一致）。呼叫前須先 init_market_data()。
+    Rate limit 60次/分鐘（富邦官方文件），呼叫端要自行節流。
+
+    不帶 timeframe → 日K；timeframe=1 → 近30日分K（無法指定 from/to）。
+    """
     reststock = sdk.marketdata.rest_client.stock
-    r = reststock.historical.candles(symbol=symbol, timeframe=timeframe)
+    r = reststock.historical.candles(symbol=symbol, **params)
     return r.get("data", [])
 
 
