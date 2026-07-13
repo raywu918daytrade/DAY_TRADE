@@ -7,16 +7,22 @@ bootstrap 跟 _daily_refresh() 對同一種失敗要印的訊息、要做的 fal
 不一樣（見 main/live_trader.py）。
 """
 from data.data_manager import load_d1
-from data.fugle_tickers import update_tickers
+from fubon.subscribe_list import build_and_save_subscribe_list
 from strategy.prewarm import build_prewarm_cache
 
 
 def refresh_tickers(state) -> None:
     """更新當沖候選清單，寫入 state.tickers / state.day_trade_stocks。
-    API 回傳空值（例如非盤中）不算例外，視為「不過濾」。"""
-    df = update_tickers()
+
+    直接呼叫 fubon.subscribe_list.build_and_save_subscribe_list()：那是富邦
+    WebSocket 訂閱清單唯一的來源，這裡重用同一份，避免候選股跟 WebSocket
+    實際訂閱的股票不一致（先前這裡走 Fugle、WebSocket 那邊走富邦，兩邊
+    各自過濾，理論上該一致但沒有保證）。API 回傳空值（例如非盤中）不算
+    例外，視為「不過濾」。
+    """
+    df = build_and_save_subscribe_list()
     if df.empty:
-        print("  警告：無法取得當沖標的（非盤中），不過濾股票", flush=True)
+        print("  警告：無法取得候選股清單（非盤中或富邦 API 失敗），不過濾股票", flush=True)
         state.tickers = {}
         state.day_trade_stocks = None
         return

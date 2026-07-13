@@ -3,6 +3,12 @@
 把收到的 1分K 寫進 db/m1_live/{日期}.parquet（欄位/存檔邏輯對齊
 data/m1_rest.py，方便共用 data/query.py 的 load_m1_live()）。
 
+on_minute 觸發機制：存檔（_flush_loop，每 FUBON_WS_FLUSH_INTERVAL 秒）跟
+觸發推論（_minute_tick_loop，每分鐘固定一次，用真實時鐘驅動）是兩條分開的
+迴圈——不管這分鐘 WebSocket 有沒有推新訊息，_minute_tick_loop 都保證每分鐘
+呼叫一次 on_minute（讀 db/m1_live/ 當下最新資料），跟 M1RestPoller 的保底
+行為一致，確保收盤後的 SL/TP reconcile 監控不會因為行情安靜而跳過整分鐘。
+
 股票清單來自 fubon/subscribe_list.py 存好的
 db/fubon_subscribe/subscribe_list.parquet（開盤前先跑一次
 `python -m fubon.subscribe_list` 產生），這裡只負責讀檔訂閱，不重算排序。
@@ -34,6 +40,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from data.m1_rest import _atomic_save, _parse_rest_bars
+from data.query import load_m1_live
 from fubon import trade_api
 from fubon.subscribe_list import load_subscribe_batches
 
@@ -142,7 +149,6 @@ class FubonM1Collector:
         self._clients: list = []
         self._buffer: dict[tuple[str, str], dict] = {}  # (stock_id, minute_str) -> row
         self._buffer_lock = threading.Lock()
-        self._flushed_minutes: dict[str, set] = {}  # date_str -> 已呼叫過 on_minute 的分鐘
         self._stop = False
 
     # ── 連線 ──────────────────────────────────────────────────────────────
@@ -186,7 +192,8 @@ class FubonM1Collector:
         print(f"共訂閱 {total} 支（{len(self._clients)} 條連線），開始接收分K...", flush=True)
         _log_sys(f"富邦 WebSocket 訂閱完成：{total} 支（{len(self._clients)} 條連線）")
 
-        self._flush_loop()
+        threading.Thread(target=self._flush_loop, daemon=True).start()
+        self._minute_tick_loop()  # 主執行緒 block 在這裡，跟 M1RestPoller.start() 同樣角色
 
     def stop(self):
         self._stop = True
@@ -213,7 +220,7 @@ class FubonM1Collector:
                 self._buffer[(row["stock_id"], row["date"])] = row
         return handler
 
-    # ── 定期存檔 ──────────────────────────────────────────────────────────
+    # ── 定期存檔（只負責把 buffer 寫進 db/m1_live/，不觸發 on_minute）──────
 
     def _flush_loop(self):
         while not self._stop:
@@ -229,22 +236,42 @@ class FubonM1Collector:
         df = pd.DataFrame(rows)
         for date_str, g in df.groupby(df["date"].str[:10]):
             _atomic_save(g.copy(), _live_path(date_str))
-
-        if self._on_minute:
-            now_minute_str = datetime.now(_TW).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-            for minute_str, g in df.groupby("date"):
-                if minute_str >= now_minute_str:
-                    continue  # 這分鐘可能還在形成中，先不當已收盤處理
-                done = self._flushed_minutes.setdefault(minute_str[:10], set())
-                if minute_str in done:
-                    continue
-                done.add(minute_str)
-                try:
-                    self._on_minute(minute_str, g.copy())
-                except Exception as e:
-                    print(f"on_minute 錯誤: {e}", flush=True)
-
         print(f"[flush] 存檔 {len(df)} 筆（{df['stock_id'].nunique()} 支）", flush=True)
+
+    # ── 每分鐘固定觸發一次 on_minute（保底機制）────────────────────────────
+    #
+    # 跟 data/m1_rest.py::M1RestPoller 對齊：不管這分鐘 WebSocket 有沒有推新
+    # 訊息（連線斷線、行情安靜、還沒開盤都可能發生），每分鐘都要固定呼叫一次
+    # on_minute，否則 on_minute() 裡收盤後的 SL/TP reconcile 監控會因為某幾
+    # 分鐘沒有新訊息就整段被跳過。用真實時鐘（跟 REST 版本一樣卡在每分鐘 :05
+    # 秒）驅動，不是靠 buffer 裡有沒有「新完成的一分鐘」來判斷。
+
+    def _minute_tick_loop(self):
+        if not self._on_minute:
+            return
+        while not self._stop:
+            now = datetime.now(_TW)
+            next_tick = now.replace(second=5, microsecond=0) + timedelta(minutes=1)
+            wait = (next_tick - datetime.now(_TW)).total_seconds()
+            if wait > 0:
+                time.sleep(wait)
+            if self._stop:
+                break
+            self._flush()  # 先把 buffer 存檔，確保等一下讀到的是最新資料
+            self._tick_once()
+
+    def _tick_once(self):
+        closed_minute = datetime.now(_TW).replace(second=0, microsecond=0) - timedelta(minutes=1)
+        minute_str = closed_minute.strftime("%Y-%m-%d %H:%M:%S")
+        date_str = minute_str[:10]
+
+        day_df = load_m1_live(date_str)
+        minute_df = day_df[day_df["date"] == minute_str] if not day_df.empty else day_df
+
+        try:
+            self._on_minute(minute_str, minute_df)
+        except Exception as e:
+            print(f"on_minute 錯誤: {e}", flush=True)
 
 
 if __name__ == "__main__":
