@@ -24,6 +24,7 @@
         batches = load_subscribe_batches()  # 分組後的 stock_id list，給 WebSocket 用
 """
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -38,10 +39,21 @@ load_dotenv(_ROOT / ".env", override=True)
 _TW = timezone(timedelta(hours=8))
 _SUBSCRIBE_PATH = _ROOT / "db/fubon_subscribe/subscribe_list.parquet"
 
+# 台股 ETF 代號後綴慣例：00XXXB＝債券型ETF，00XXXD＝主動式債券/固定收益基金
+# （實測這批代號的名稱都帶「非投」「債」「入息」）。只要股票跟一般/槓桿/反向/
+# 主動股票型 ETF（無後綴、L、R、A），不要固定收益類。名稱含「債」字再補一層，
+# 避免名稱被 API 截斷看不出後面有「債」的漏網之魚。
+_BOND_ETF_PATTERN = re.compile(r"^00\d{3}[BD]$")
+
+
+def _is_bond(stock_id: str, name: str) -> bool:
+    return bool(_BOND_ETF_PATTERN.match(stock_id)) or "債" in name
+
 
 def _fubon_normal_tickers() -> dict[str, str]:
     """用富邦自己的 REST 行情 API 抓「正常交易」股票清單（isNormal=true，排除注意/處置股），
-    回傳 {stock_id: name}。
+    回傳 {stock_id: name}。排除債券型ETF／固定收益基金（見 _is_bond()），只留股票和
+    一般權益類 ETF。
 
     改用富邦而不是 Fugle 的 /intraday/tickers：Fugle 那邊原本多帶的 isDayTrading=true
     查無官方文件依據（見 memory 的 TODO）。TWSE / TPEx 各查一次再合併。實際 SDK 呼叫
@@ -55,7 +67,11 @@ def _fubon_normal_tickers() -> dict[str, str]:
         stocks: dict[str, str] = {}
         for exchange in ("TWSE", "TPEx"):
             for item in trade_api.intraday_tickers(sdk, exchange):
-                stocks[item["symbol"]] = item.get("name", "")
+                sid = item["symbol"]
+                name = item.get("name", "")
+                if _is_bond(sid, name):
+                    continue
+                stocks[sid] = name
         return stocks
     finally:
         trade_api.logout(sdk)

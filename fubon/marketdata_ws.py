@@ -48,9 +48,10 @@ from fubon import trade_api
 from fubon.subscribe_list import load_subscribe_batches
 
 try:
-    from api import append_system_log as _log_sys
+    from api import append_system_log as _log_sys, set_collector_coverage
 except Exception:
     def _log_sys(msg, level="info"): pass  # type: ignore
+    def set_collector_coverage(arrived, total): pass  # type: ignore
 
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env", override=True)
@@ -58,6 +59,12 @@ load_dotenv(_ROOT / ".env", override=True)
 _TW = timezone(timedelta(hours=8))
 _LIVE_DIR = _ROOT / "db/m1_live"
 _FLUSH_INTERVAL = float(os.environ.get("FUBON_WS_FLUSH_INTERVAL", "5"))
+# 觸發推論的時機：收盤後固定等 :05 秒是「最短」等待，之後改成看涵蓋率——
+# 涵蓋率達標（大部分股票的 candle 都到齊了）就提早觸發，資料慢的話最多等到
+# FUBON_WS_MAX_WAIT_SEC 秒還是會觸發（保底，不會無限等下去）。
+_COVERAGE_THRESHOLD = float(os.environ.get("FUBON_WS_COVERAGE_THRESHOLD", "0.95"))
+_MAX_WAIT_SEC = float(os.environ.get("FUBON_WS_MAX_WAIT_SEC", "15"))
+_COVERAGE_POLL_SEC = 1.0
 # 富邦 intraday/candles rate limit 300次/分鐘（官方文件），節流到 ~240次/分鐘留緩衝。
 # 這個間隔控制的是「發出下一個 request」的頻率，不是單一 worker 的間隔——
 # 多執行緒下大家共用同一個節流時鐘，各自的網路等待時間可以互相重疊
@@ -111,6 +118,12 @@ class FubonM1Collector:
         # （2026-07-13 實際發生過，導致 collector 整個掛掉、不會自動重連）。
         self._save_lock = threading.Lock()
         self._stop = False
+        # 涵蓋率追蹤：只記股票代號，不存報價內容（報價內容仍在 self._buffer）。
+        # _target_minute 是目前這一輪在等的那根已收盤分鐘，只有訊息剛好屬於這
+        # 一分鐘才會被算進涵蓋率，避免跨分鐘的訊息把下一輪的涵蓋率灌水。
+        self._arrived_this_minute: set[str] = set()
+        self._target_minute: str | None = None
+        self._total_subscribed = 0
 
     # ── 連線 ──────────────────────────────────────────────────────────────
 
@@ -153,6 +166,7 @@ class FubonM1Collector:
         # 不卡住即時資料流入（尤其是盤中重啟的情境）。
         date_str = datetime.now(_TW).strftime("%Y-%m-%d")
         all_symbols = [sid for batch in batches for sid in batch]
+        self._total_subscribed = len(all_symbols)
         threading.Thread(target=self._backfill_intraday, args=(all_symbols, date_str), daemon=True).start()
 
         threading.Thread(target=self._flush_loop, daemon=True).start()
@@ -181,6 +195,8 @@ class FubonM1Collector:
                 return
             with self._buffer_lock:
                 self._buffer[(row["stock_id"], row["date"])] = row
+                if row["date"] == self._target_minute:
+                    self._arrived_this_minute.add(row["stock_id"])
         return handler
 
     # ── 背景補歷史缺口（寫進共用 buffer，不直接存檔）─────────────────────
@@ -264,12 +280,43 @@ class FubonM1Collector:
             return
         while not self._stop:
             now = datetime.now(_TW)
-            next_tick = now.replace(second=5, microsecond=0) + timedelta(minutes=1)
-            wait = (next_tick - datetime.now(_TW)).total_seconds()
+            min_tick = now.replace(second=5, microsecond=0) + timedelta(minutes=1)
+            closed_minute = (min_tick - timedelta(minutes=1)).replace(second=0, microsecond=0)
+            target_minute_str = closed_minute.strftime("%Y-%m-%d %H:%M:%S")
+            with self._buffer_lock:
+                self._target_minute = target_minute_str
+                self._arrived_this_minute = set()
+
+            wait = (min_tick - datetime.now(_TW)).total_seconds()
             if wait > 0:
                 time.sleep(wait)
             if self._stop:
                 break
+
+            # 涵蓋率達標或等到上限，先到先觸發：資料到得快就不用死等 15 秒，
+            # 到得慢也不會像原本固定 5 秒那樣太早截斷、漏掉一大半股票。
+            deadline = min_tick + timedelta(seconds=_MAX_WAIT_SEC)
+            total = self._total_subscribed or 1
+            while not self._stop:
+                with self._buffer_lock:
+                    arrived = len(self._arrived_this_minute)
+                if arrived / total >= _COVERAGE_THRESHOLD or datetime.now(_TW) >= deadline:
+                    break
+                time.sleep(_COVERAGE_POLL_SEC)
+            if self._stop:
+                break
+
+            with self._buffer_lock:
+                arrived = len(self._arrived_this_minute)
+                self._arrived_this_minute = set()  # 送出這一輪後清空，重新計下一分鐘
+            total = self._total_subscribed or 0
+            pct = (arrived / total * 100) if total else 0
+            print(f"[minute_tick] {target_minute_str} 涵蓋率 {arrived}/{total}（{pct:.0f}%）", flush=True)
+            try:
+                set_collector_coverage(arrived, total)
+            except Exception:
+                pass
+
             self._flush()  # 先把 buffer 存檔，確保等一下讀到的是最新資料
             self._tick_once()
 

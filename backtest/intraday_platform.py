@@ -201,14 +201,8 @@ def optimize_optuna(df_proba: pd.DataFrame, n_trials: int = 50):
 
 
 # ── 執行入口 ──────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    from strategy.rally.predict import predict
-    from strategy.rally.train import load_model_xgb
-
-    df_proba = predict(model=load_model_xgb())  # 用 rally/XGB 模型產生預測機率
-    portfolio_df, trades_df = run_backtest(
-        df_proba,
-        threshold=0.70,
-    )
-    print_trades(trades_df)
+#
+# 這支檔案是共用回測引擎（gen_entries/run_backtest/print_trades/
+# optimize_optuna），不綁特定策略。各策略自己的回測入口：
+#     python strategy/rally/run_backtest.py
+#     python strategy/orb/run_backtest.py

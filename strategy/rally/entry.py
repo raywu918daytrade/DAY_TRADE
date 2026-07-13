@@ -19,6 +19,10 @@ train / train_xgb / train_lgbm   訓練模型
 validate                         信心度分析 + 召回率分析 + 模型×時段×信心度交叉報表
 signals                          每小時訊號數 vs 抓到筆數（固定門檻，原始筆數，見 validate.hour_signal_report）
 importance                       特徵重要性
+build_m3_m5                      補 db/m3/db/m5（增量，只重算比 db/m1 舊的月份）——訓練前務必先跑，
+                                  不然 load_features() fallback 讀到的 m3/m5 可能比 db/m1 舊，訓練資料
+                                  會悄悄漏掉最新幾天（2026-07-13 實際發生過：db/m1 到 07-09、
+                                  db/m3/db/m5 卡在 07-07，少算了2個交易日）
 """
 
 import argparse
@@ -28,6 +32,7 @@ from pathlib import Path
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from scripts.build_m3_m5 import build as build_m3_m5
 from strategy.rally.config import (  # noqa: F401  (re-export：交易參數一眼看到全部)
     BREAKOUT_TRADE_END,
     BREAKOUT_TRADE_START,
@@ -85,6 +90,7 @@ def main(
                 "validate",
                 "signals",
                 "importance",
+                "build_m3_m5",
             ],
             help="執行模式",
         )
@@ -119,8 +125,13 @@ def main(
     elif mode == "importance":
         feature_importance()
 
+    elif mode == "build_m3_m5":
+        # 增量重算：只補比 db/m1 舊的月份，訓練前跑這個確保 load_features()
+        # fallback 讀到的 db/m3/db/m5 沒有漏掉最新幾天。
+        build_m3_m5(incremental=True)
+
     else:
-        print(f"未知模式: {mode}，可用: train / validate / signals / importance")
+        print(f"未知模式: {mode}，可用: train / validate / signals / importance / build_m3_m5")
 
 
 if __name__ == "__main__":
@@ -140,6 +151,7 @@ if __name__ == "__main__":
         "importance"  顯示特徵重要性
         "train_xgb"   訓練 XGBoost 模型（存至 models/m1_xgb.pkl）
         "train_lgbm"  訓練 LightGBM 模型（存至 models/m1_lgbm_breakout.pkl）
+        "build_m3_m5" 增量補 db/m3/db/m5（只重算比 db/m1 舊的月份），train 前先跑這個
         ""            走 CLI argparse（terminal 下帶參數）
 
     可選參數（CLI 或下方變數）：

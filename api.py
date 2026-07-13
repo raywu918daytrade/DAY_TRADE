@@ -949,6 +949,16 @@ def set_collector_status(status: str):
     _collector_status = status
 
 
+_collector_coverage: dict = {"arrived": 0, "total": 0}
+
+
+def set_collector_coverage(arrived: int, total: int):
+    """由 fubon/marketdata_ws.py 呼叫：這一輪收盤後等涵蓋率/逾時二選一觸發時，
+    實際等到多少支股票回報（不含還沒到的），供前端顯示即時涵蓋率用。"""
+    global _collector_coverage
+    _collector_coverage = {"arrived": arrived, "total": total}
+
+
 _COLLECTOR_MSG = {
     "running": "資料流正常",
     "stopped": "盤後或尚未啟動",
@@ -1017,6 +1027,7 @@ def health():
         "sse_clients": len(_sse_clients),
         "ws_clients": len(_sse_clients),
         "last_signal_at": last_signal,
+        "coverage": _collector_coverage,
     }
 
 

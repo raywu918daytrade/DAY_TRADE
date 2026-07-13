@@ -5,7 +5,9 @@
 marketdata_ws.py 等上層程式只呼叫這裡的函式，不直接 import fubon_neo。
 好處：SDK 版本升級或呼叫方式變動時，只要改這一支檔案。
 """
+import base64
 import os
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,21 +15,45 @@ from fubon_neo.sdk import FubonSDK, Mode, build_websocket_client
 
 load_dotenv(Path(__file__).parents[1] / ".env", override=True)
 
-_ROOT = Path(__file__).parents[1]
+
+def _resolve_cert_path() -> str:
+    """憑證路徑：.p12 檔案不進版控，一律用 FUBON_CERT_B64（憑證 base64 編碼）
+    在執行期寫一個暫存檔，本機、雲端（Render）都走同一條路，比照
+    trade/trade_api.py 對永豐 .pfx 的處理方式。
+    產生 FUBON_CERT_B64：base64 -i 憑證.p12 | tr -d '\\n'
+    """
+    cert_data = base64.b64decode(os.environ["FUBON_CERT_B64"])
+    with tempfile.NamedTemporaryFile(suffix=".p12", delete=False) as f:
+        f.write(cert_data)
+        return f.name
 
 
 def login() -> tuple[FubonSDK, list]:
     """第一次連線測試須用身分證字號＋登入密碼＋憑證（不可用 API Key）。"""
     sdk = FubonSDK()
-    cert_path = _ROOT / os.environ["FUBON_CERT_PATH"]
     result = sdk.login(
         os.environ["FUBON_ID"],
         os.environ["FUBON_PASSWORD"],
-        str(cert_path),
+        _resolve_cert_path(),
         os.environ.get("FUBON_CERT_PASS") or None,
     )
     if not result.is_success:
         raise RuntimeError(f"富邦登入失敗: {result.message}")
+    return sdk, result.data
+
+
+def login_with_api_key() -> tuple[FubonSDK, list]:
+    """第一次連線測試通過、帳號權限開通後才能用這個。還是要身分證字號＋憑證，
+    只是密碼換成 API Key（.env 的 FUBON_API_KEY）。"""
+    sdk = FubonSDK()
+    result = sdk.apikey_login(
+        os.environ["FUBON_ID"],
+        os.environ["FUBON_API_KEY"],
+        _resolve_cert_path(),
+        os.environ.get("FUBON_CERT_PASS") or None,
+    )
+    if not result.is_success:
+        raise RuntimeError(f"富邦 API Key 登入失敗: {result.message}")
     return sdk, result.data
 
 

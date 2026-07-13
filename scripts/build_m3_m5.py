@@ -44,9 +44,12 @@ def _needs_update(target_dir: Path, month_key: str, m1_mtime: float) -> bool:
 
 
 def _save_monthly(df: pd.DataFrame, target_dir: Path, prefix: str):
-    """按年月分檔存 parquet。"""
+    """按年月分檔存 parquet。月份補零（"2026_07" 不是 "2026_7"），
+    要跟 db/m1/ 既有檔名一致——不補零會跟 db/m1/ 對不上，load_m3()/load_m5()
+    用 ds.dataset() 整個資料夾一起讀，新舊檔名並存會把同一個月的資料算兩次
+    （2026-07-08 修過同一種 bug，這支腳本當時漏改）。"""
     df["date"] = pd.to_datetime(df["date"])
-    df["_ym"] = df["date"].dt.strftime("%Y_%-m")
+    df["_ym"] = df["date"].dt.strftime("%Y_%m")
     target_dir.mkdir(parents=True, exist_ok=True)
     for ym, g in df.groupby("_ym"):
         path = target_dir / f"{ym}.parquet"
