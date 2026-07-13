@@ -14,10 +14,13 @@ db/fubon_subscribe/subscribe_list.parquet（開盤前先跑一次
 `python -m fubon.subscribe_list` 產生），這裡只負責讀檔訂閱，不重算排序。
 
 補資料（backfill）：WebSocket 只會推「連線之後」的分K，如果不是一開盤就連線
-（例如中途 9:05 才啟動），連線前那段會整段缺資料。start() 會在開 WebSocket
-連線之前，先用富邦 REST intraday/candles/{symbol}（rate limit 300次/分鐘，
-這裡節流得保守一點）把當天到目前為止的分K全部補進 db/m1_live/，補完才開始
-連線收即時資料，確保「WebSocket 連上後才推論」時當天資料是完整的。
+（例如盤中重啟），連線前那段會整段缺資料。start() 會**先**開好 WebSocket 連線
+開始收即時資料，**再**用富邦 REST intraday/candles/{symbol}（rate limit
+300次/分鐘，這裡節流得保守一點）在背景執行緒補「連線前」缺的分K，兩者不會
+互相卡住——盤中重啟不會因為要等 backfill 跑完（880支約3~5分鐘）才開始收
+新資料。backfill 補到的資料寫進跟 WebSocket 共用的同一個 buffer（由
+_flush_loop 統一存檔），不會各自獨立呼叫存檔函式，避免兩個執行緒同時
+讀寫同一個檔案的 race condition。
 
 ⚠️ 帳號目前還在等富邦開通 API 使用權限，candles 訊息的實際欄位／推送頻率
 （每筆成交都推、還是分鐘收盤才推一次）尚未用真實連線驗證過。等權限開通、
@@ -65,52 +68,6 @@ _BACKFILL_WORKERS = int(os.environ.get("FUBON_BACKFILL_WORKERS", "10"))
 
 def _live_path(date_str: str) -> Path:
     return _LIVE_DIR / f"{date_str}.parquet"
-
-
-def _backfill_intraday(sdk, symbols: list[str], date_str: str):
-    """連線前先用 REST 補齊當天已經產生、但 WebSocket 連上前收不到的分K。
-    多執行緒併發抓取，全域節流頻率控制在 ~1/_BACKFILL_INTERVAL 次/秒，
-    避免逐支序列等待網路延遲拖慢整體時間。
-    """
-    print(f"[backfill] 開始補 {len(symbols)} 支 {date_str} 的分K（連線前資料，"
-          f"{_BACKFILL_WORKERS} 併發）...", flush=True)
-    t0 = time.time()
-    frames: list[pd.DataFrame] = []
-    frames_lock = threading.Lock()
-    throttle = threading.Semaphore(_BACKFILL_WORKERS)
-    rate_lock = threading.Lock()
-    last_req = [0.0]
-    done = [0]
-
-    def fetch_one(sid: str):
-        with throttle:
-            with rate_lock:
-                wait = _BACKFILL_INTERVAL - (time.time() - last_req[0])
-                if wait > 0:
-                    time.sleep(wait)
-                last_req[0] = time.time()
-            try:
-                bars = trade_api.intraday_candles(sdk, sid)
-                df = _parse_rest_bars(sid, bars, date_str)
-                if not df.empty:
-                    with frames_lock:
-                        frames.append(df)
-            except Exception as e:
-                print(f"[backfill] {sid} 失敗: {e}", flush=True)
-        with frames_lock:
-            done[0] += 1
-            if done[0] % 100 == 0 or done[0] == len(symbols):
-                print(f"[backfill] 進度 {done[0]}/{len(symbols)}", flush=True)
-
-    with ThreadPoolExecutor(max_workers=_BACKFILL_WORKERS) as ex:
-        list(ex.map(fetch_one, symbols))
-
-    if frames:
-        _atomic_save(pd.concat(frames, ignore_index=True), _live_path(date_str))
-    elapsed = time.time() - t0
-    msg = f"[backfill] 完成，{len(frames)}/{len(symbols)} 支有資料（{elapsed:.1f}s）"
-    print(msg, flush=True)
-    _log_sys(f"富邦 backfill 完成 {date_str}：{len(frames)}/{len(symbols)} 支（{elapsed:.1f}s）")
 
 
 def _parse_candle(raw: bytes | str) -> dict | None:
@@ -164,10 +121,6 @@ class FubonM1Collector:
         if not batches:
             raise RuntimeError("訂閱清單是空的，請先跑 python -m fubon.subscribe_list")
 
-        date_str = datetime.now(_TW).strftime("%Y-%m-%d")
-        all_symbols = [sid for batch in batches for sid in batch]
-        _backfill_intraday(self._sdk, all_symbols, date_str)
-
         token = trade_api.realtime_token(self._sdk)
 
         total = 0
@@ -191,6 +144,12 @@ class FubonM1Collector:
 
         print(f"共訂閱 {total} 支（{len(self._clients)} 條連線），開始接收分K...", flush=True)
         _log_sys(f"富邦 WebSocket 訂閱完成：{total} 支（{len(self._clients)} 條連線）")
+
+        # WebSocket 已經在收即時資料了，backfill 補「連線前」的缺口丟到背景執行緒，
+        # 不卡住即時資料流入（尤其是盤中重啟的情境）。
+        date_str = datetime.now(_TW).strftime("%Y-%m-%d")
+        all_symbols = [sid for batch in batches for sid in batch]
+        threading.Thread(target=self._backfill_intraday, args=(all_symbols, date_str), daemon=True).start()
 
         threading.Thread(target=self._flush_loop, daemon=True).start()
         self._minute_tick_loop()  # 主執行緒 block 在這裡，跟 M1RestPoller.start() 同樣角色
@@ -219,6 +178,55 @@ class FubonM1Collector:
             with self._buffer_lock:
                 self._buffer[(row["stock_id"], row["date"])] = row
         return handler
+
+    # ── 背景補歷史缺口（寫進共用 buffer，不直接存檔）─────────────────────
+
+    def _backfill_intraday(self, symbols: list[str], date_str: str):
+        """用 REST 補「WebSocket 連線前」缺的分K，寫進跟即時資料共用的
+        self._buffer（由 _flush_loop 統一存檔），不直接呼叫存檔函式——避免
+        這個背景執行緒跟 _flush_loop 同時讀寫同一個檔案造成 race condition。
+        多執行緒併發抓取，全域節流頻率控制在 ~1/_BACKFILL_INTERVAL 次/秒，
+        避免逐支序列等待網路延遲拖慢整體時間。
+        """
+        print(f"[backfill] 開始補 {len(symbols)} 支 {date_str} 的分K（背景執行，"
+              f"{_BACKFILL_WORKERS} 併發）...", flush=True)
+        t0 = time.time()
+        rate_lock = threading.Lock()
+        last_req = [0.0]
+        done = [0]
+        got = [0]
+
+        def fetch_one(sid: str):
+            with rate_lock:
+                wait = _BACKFILL_INTERVAL - (time.time() - last_req[0])
+                if wait > 0:
+                    time.sleep(wait)
+                last_req[0] = time.time()
+            try:
+                bars = trade_api.intraday_candles(self._sdk, sid)
+                df = _parse_rest_bars(sid, bars, date_str)
+                if not df.empty:
+                    with self._buffer_lock:
+                        for row in df.to_dict("records"):
+                            key = (row["stock_id"], row["date"])
+                            # WebSocket 即時資料優先：這個 key 已經被即時訊息
+                            # 寫過就不覆蓋，backfill 只補真正缺的部分
+                            if key not in self._buffer:
+                                self._buffer[key] = row
+                    got[0] += 1
+            except Exception as e:
+                print(f"[backfill] {sid} 失敗: {e}", flush=True)
+            done[0] += 1
+            if done[0] % 100 == 0 or done[0] == len(symbols):
+                print(f"[backfill] 進度 {done[0]}/{len(symbols)}", flush=True)
+
+        with ThreadPoolExecutor(max_workers=_BACKFILL_WORKERS) as ex:
+            list(ex.map(fetch_one, symbols))
+
+        elapsed = time.time() - t0
+        msg = f"[backfill] 完成，{got[0]}/{len(symbols)} 支有資料（{elapsed:.1f}s）"
+        print(msg, flush=True)
+        _log_sys(f"富邦 backfill 完成 {date_str}：{got[0]}/{len(symbols)} 支（{elapsed:.1f}s）")
 
     # ── 定期存檔（只負責把 buffer 寫進 db/m1_live/，不觸發 on_minute）──────
 

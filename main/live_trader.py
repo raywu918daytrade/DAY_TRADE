@@ -88,12 +88,14 @@ state.session_end = state.strategy_module.SESSION_END
 state.load_model = state.strategy_module.load_model
 state.predict_live = state.strategy_module.predict_live
 print(f"[策略] 使用 {STRATEGY_MODULE}", flush=True)
+_log_sys(f"策略模組：{STRATEGY_MODULE}")
 
 print("載入模型...")
 sys.stdout.flush()
 try:
     state.model = state.load_model()
     print("✓ 模型載入成功", flush=True)
+    _log_sys(f"模型載入成功（策略：{STRATEGY_MODULE}，model={type(state.model).__name__}）")
 except Exception as e:
     print(f"✗ 模型載入失敗: {e}", flush=True)
     raise
