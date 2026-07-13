@@ -51,9 +51,11 @@ from api import (
     append_system_log as _log_sys,
     get_uvicorn_config,
     push_candles,
+    push_consensus_signals,
     push_inference_log,
     push_monitoring,
     push_signals,
+    set_strategies,
     tw_naive_to_epoch,
     update_positions_price,
 )
@@ -62,15 +64,16 @@ from main import collector as _collector
 from main import premarket as _premarket
 from main.backfill import run_startup_backfill
 from main.config import (
+    CONSENSUS_TOP_N,
     FORCE_CLOSE_HOUR as _FORCE_CLOSE_HOUR,
     FORCE_CLOSE_MIN as _FORCE_CLOSE_MIN,
-    STRATEGY_MODULE,
+    STRATEGY_MODULES,
     THRESHOLD,
     TOTAL_CAPITAL,
     TRADE_MODE,
 )
-from main.state import AppState
-from main.strategy_loader import load_strategy
+from main.state import AppState, StrategyState
+from main.strategy_loader import load_strategies
 
 from data.data_manager import Phase
 from data.query import load_m1_live
@@ -79,23 +82,36 @@ _TW = timezone(timedelta(hours=8))
 
 state = AppState()
 
-# strategy/base/date_trade_model.py 已刪除（2026-07-09，特徵整合進
-# strategy/rally），STRATEGY_MODULE 預設值改成 rally；每個策略模組都要暴露
-# 同一組介面：load_model() / predict_live(...) / SESSION_START / SESSION_END
-state.strategy_module = load_strategy(STRATEGY_MODULE)
-state.session_start = state.strategy_module.SESSION_START
-state.session_end = state.strategy_module.SESSION_END
-state.load_model = state.strategy_module.load_model
-state.predict_live = state.strategy_module.predict_live
-print(f"[策略] 使用 {STRATEGY_MODULE}", flush=True)
-_log_sys(f"策略模組：{STRATEGY_MODULE}")
+# 可同時載入多個策略模組（見 main/config.py 的 STRATEGY_MODULES）；每個策略
+# 模組都要暴露同一組介面：load_model() / predict_live(...) / SESSION_START /
+# SESSION_END，包成 StrategyState 存進 state.strategies（key=策略名）。
+for _name, _module in load_strategies(STRATEGY_MODULES).items():
+    state.strategies[_name] = StrategyState(_name, _module)
+print(f"[策略] 使用 {list(state.strategies.keys())}（{STRATEGY_MODULES}）", flush=True)
+_log_sys(f"策略模組：{list(state.strategies.keys())}")
+
+# 登記給前端 GET /strategies 查詢用，讓前端開機就知道有幾個模型、各自的
+# session範圍，不用等第一筆 monitoring/signals 事件才知道（見 api.py 的
+# set_strategies() 說明）。
+set_strategies(
+    [
+        {
+            "name": _s.name,
+            "session_start": f"{_s.session_start[0]:02d}:{_s.session_start[1]:02d}",
+            "session_end": f"{_s.session_end[0]:02d}:{_s.session_end[1]:02d}",
+        }
+        for _s in state.strategies.values()
+    ],
+    consensus_top_n=CONSENSUS_TOP_N,
+)
 
 print("載入模型...")
 sys.stdout.flush()
 try:
-    state.model = state.load_model()
-    print("✓ 模型載入成功", flush=True)
-    _log_sys(f"模型載入成功（策略：{STRATEGY_MODULE}，model={type(state.model).__name__}）")
+    for _s in state.strategies.values():
+        _s.model = _s.load_model()
+        print(f"✓ [{_s.name}] 模型載入成功（{type(_s.model).__name__}）", flush=True)
+    _log_sys(f"模型載入成功：{[(s.name, type(s.model).__name__) for s in state.strategies.values()]}")
 except Exception as e:
     print(f"✗ 模型載入失敗: {e}", flush=True)
     raise
@@ -131,10 +147,9 @@ else:
 print("盤前預算快取...", flush=True)
 try:
     _premarket.refresh_prewarm(state)
-    print(f"✓ 盤前快取完成：{list(state.prewarm_cache.keys())}", flush=True)
+    print(f"✓ 盤前快取完成：{ {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()} }", flush=True)
 except Exception as e:
     print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
-    state.prewarm_cache = {}
 
 # 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
 run_startup_backfill(state, THRESHOLD)
@@ -195,8 +210,9 @@ def _daily_refresh():
             try:
                 _premarket.refresh_prewarm(state)
                 last_prewarm = today
-                print(f"  快取完成：{list(state.prewarm_cache.keys())}")
-                _log_sys(f"盤前策略快取重算完成：{list(state.prewarm_cache.keys())}")
+                _cache_keys = {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()}
+                print(f"  快取完成：{_cache_keys}")
+                _log_sys(f"盤前策略快取重算完成：{_cache_keys}")
             except Exception as e:
                 print(f"  快取失敗: {e}")
                 _log_sys(f"盤前策略快取失敗: {e}", "error")
@@ -204,27 +220,19 @@ def _daily_refresh():
 
 
 def on_minute(minute_str: str, df: pd.DataFrame):
-    """分K收集器每分鐘回呼：推論、推送監控/K線/訊號，並觸發下單。"""
+    """分K收集器每分鐘回呼：每個策略各自推論、推送監控/訊號，並觸發下單。
+
+    2026-07-13 改成多策略：SESSION_START/SESSION_END 現在是每個策略各自的
+    範圍（StrategyState.session_start/session_end），不是單一全域邊界——
+    候選/K線資料共用一份 m1_live，但要不要對某個策略呼叫 predict_live() 是
+    逐一策略各自判斷。目前 TRADE_MODE 還是關的（交易先暫停，等實盤穩定），
+    reconcile() 收到的 all_signals 是把所有策略達門檻的訊號直接合併，還沒
+    處理「兩個策略同時看好同一支股票」的衝突，見 main/config.py 的說明。
+    """
     dt = pd.Timestamp(minute_str)
     h, m = dt.hour, dt.minute
 
-    if (h, m) < state.session_start:
-        return
-
-    # SESSION_END 後：停止開倉，但繼續跑 reconcile 做 SL/TP 監控直到收盤
-    if (h, m) > state.session_end:
-        if state.executor is not None:
-            price_map = {}
-            if not df.empty and "stock_id" in df.columns and "close" in df.columns:
-                price_map = dict(zip(df["stock_id"].astype(str), df["close"].astype(float)))
-                update_positions_price(price_map)
-            try:
-                state.executor.reconcile([], prices=price_map)  # signals=[] 不開倉，只跑 SL/TP
-            except Exception as e:
-                print(f"[TRADE ERROR after session] {e}")
-        return
-
-    # 載入今日分K（只載一次，下面 push_candles 和 predict_live 共用）
+    # 載入今日分K（只載一次，下面 push_candles 和每個策略的 predict_live 共用）
     date_str = minute_str[:10]
     m1_live = load_m1_live(date_str)
     print(
@@ -236,8 +244,8 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         for sid, g in m1_live.groupby("stock_id"):
             candles = []
             for _, row in g.iterrows():
-                dt = datetime.strptime(str(row["date"]), "%Y-%m-%d %H:%M:%S")
-                ts = tw_naive_to_epoch(dt)
+                dt2 = datetime.strptime(str(row["date"]), "%Y-%m-%d %H:%M:%S")
+                ts = tw_naive_to_epoch(dt2)
                 candles.append(
                     {
                         "time": ts,
@@ -250,51 +258,92 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                 )
             push_candles(str(sid), candles)
 
-    # 模型推論：threshold=0 取得所有股票機率，共用已載入的 m1_live
-    all_results = state.predict_live(
-        minute_str,
-        state.day,
-        model=state.model,
-        threshold=0,
-        day_trade_stocks=state.day_trade_stocks,
-        m1_live=m1_live if not m1_live.empty else None,
-        **state.prewarm_cache,
-    )
-    for r in all_results:
-        r["name"] = state.tickers.get(r["stock_id"], r["stock_id"])
     # 每分鐘從 settings 讀信心度，允許前端即時調整
     from api import get_setting
 
     threshold = float(get_setting("threshold") or THRESHOLD)
 
-    push_monitoring(minute_str, all_results, threshold)
-    push_inference_log(minute_str, all_results, threshold)
+    # price_map 先用這分鐘全部收到的分K收盤價打底（涵蓋所有目前有持倉的股票，
+    # 不受任何策略候選清單過濾影響），下面各策略的 predict_live 結果再疊上去
+    # （通常是同一個值，只是保險起見以最新推論結果優先）。
+    price_map = {}
+    if not df.empty and "stock_id" in df.columns and "close" in df.columns:
+        price_map = dict(zip(df["stock_id"].astype(str), df["close"].astype(float)))
 
-    # 用最新分K收盤價更新持倉卡片浮動損益（今日損益只計已實現，不含此處）
-    price_map = {r["stock_id"]: r["price"] for r in all_results}
-    update_positions_price(price_map)
+    all_signals = []
+    top_by_strategy: dict[str, list[dict]] = {}  # 各策略前N名（依proba排名，不管有沒有過門檻），給下面重疊比對用
+    for s in state.strategies.values():
+        if (h, m) < s.session_start or (h, m) > s.session_end:
+            continue  # 這個策略還沒開始/已經過了進場窗口，不產生新訊號（既有持倉SL/TP由下面reconcile統一監控，不受這裡影響）
 
-    # 只有達門檻才產生交易訊號
-    signals = [r for r in all_results if r["proba"] >= threshold]
-    push_signals(minute_str, signals)
+        all_results = s.predict_live(
+            minute_str,
+            state.day,
+            model=s.model,
+            threshold=0,
+            day_trade_stocks=state.day_trade_stocks,
+            m1_live=m1_live if not m1_live.empty else None,
+            **s.prewarm_cache,
+        )
+        for r in all_results:
+            r["name"] = state.tickers.get(r["stock_id"], r["stock_id"])
+            r["strategy"] = s.name  # 保留來源策略，reconcile() 收到的合併清單才分得出是誰產生的
 
-    top = sorted(all_results, key=lambda x: -x["proba"])[:5]
-    top_str = " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in top)
-    print(
-        f"  推論:{len(all_results)} 支  訊號:{len(signals)} 支（門檻={threshold:.2f}）  top5:[{top_str}]",
-        flush=True,
-    )
-    _log_sys(
-        f"推論 {minute_str}：{len(all_results)} 支 → {len(signals)} 個訊號（門檻={threshold:.2f}）  top5:[{top_str}]"
-    )
-    if signals:
-        sig_str = " ".join(f"{s['stock_id']}={s['proba']:.2f}" for s in signals)
-        print(f"  → 訊號: {sig_str}", flush=True)
-        _log_sys(f"訊號: {sig_str}")
+        push_monitoring(minute_str, all_results, threshold, strategy=s.name)
+        push_inference_log(minute_str, all_results, threshold, strategy=s.name)
+        price_map.update({r["stock_id"]: r["price"] for r in all_results})
+
+        signals = [r for r in all_results if r["proba"] >= threshold]
+        push_signals(minute_str, signals, strategy=s.name)
+        all_signals.extend(signals)
+
+        top = sorted(all_results, key=lambda x: -x["proba"])[:5]
+        top_by_strategy[s.name] = sorted(all_results, key=lambda x: -x["proba"])[:CONSENSUS_TOP_N]
+        top_str = " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in top)
+        print(
+            f"  [{s.name}] 推論:{len(all_results)} 支  訊號:{len(signals)} 支（門檻={threshold:.2f}）  top5:[{top_str}]",
+            flush=True,
+        )
+        _log_sys(
+            f"[{s.name}] 推論 {minute_str}：{len(all_results)} 支 → {len(signals)} 個訊號（門檻={threshold:.2f}）  top5:[{top_str}]"
+        )
+        if signals:
+            sig_str = " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in signals)
+            print(f"  [{s.name}] → 訊號: {sig_str}", flush=True)
+            _log_sys(f"[{s.name}] 訊號: {sig_str}")
+
+    # 多策略共識訊號：等所有策略這分鐘都跑完，比對誰的前N名彼此重疊（見
+    # main/config.py 的 CONSENSUS_TOP_N）。2個以上策略同時看好同一支股票，
+    # 才算共識，跟各策略自己的 monitoring/signals 分開推送，不取代它們。
+    if len(top_by_strategy) >= 2:
+        stock_hits: dict[str, dict[str, float]] = {}  # stock_id -> {策略名: proba}
+        stock_names: dict[str, str] = {}
+        for name, top in top_by_strategy.items():
+            for r in top:
+                stock_hits.setdefault(r["stock_id"], {})[name] = r["proba"]
+                stock_names[r["stock_id"]] = r["name"]
+        consensus = [
+            {
+                "stock_id": sid,
+                "name": stock_names[sid],
+                "strategies": sorted(probas.keys()),
+                "probas": probas,
+            }
+            for sid, probas in stock_hits.items()
+            if len(probas) >= 2
+        ]
+        if consensus:
+            consensus.sort(key=lambda c: -sum(c["probas"].values()) / len(c["probas"]))
+            push_consensus_signals(minute_str, consensus)
+            print(f"  [共識] {len(consensus)} 支同時進入 {CONSENSUS_TOP_N} 名內: "
+                  + " ".join(f"{c['stock_id']}({'+'.join(c['strategies'])})" for c in consensus), flush=True)
+
+    if price_map:
+        update_positions_price(price_map)
 
     if state.executor is not None:
         try:
-            state.executor.reconcile(signals, prices=price_map)
+            state.executor.reconcile(all_signals, prices=price_map)
         except Exception as e:
             print(f"[TRADE ERROR] {e}")
             _log_sys(f"reconcile 錯誤: {e}", "error")

@@ -38,6 +38,8 @@ def refresh_day(state) -> None:
 
 
 def refresh_prewarm(state) -> None:
-    """重算策略盤前快取，寫入 state.prewarm_cache。策略不需要就回傳空 dict
-    （見 strategy/prewarm.py），predict_live() 展開空 dict 等於沒有額外參數。"""
-    state.prewarm_cache = build_prewarm_cache(state.strategy_module)
+    """重算每個策略各自的盤前快取，寫入對應 StrategyState.prewarm_cache。
+    策略不需要就回傳空 dict（見 strategy/prewarm.py），predict_live() 展開
+    空 dict 等於沒有額外參數。"""
+    for s in state.strategies.values():
+        s.prewarm_cache = build_prewarm_cache(s.module)

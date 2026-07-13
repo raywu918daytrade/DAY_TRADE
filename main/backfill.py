@@ -22,22 +22,24 @@ def run_startup_backfill(state, threshold: float) -> None:
         today_str = datetime.now(_TW).strftime("%Y-%m-%d")
         print(f"[M1] 補載今日分K（{today_str}）...", flush=True)
         m1_now = load_m1_live(today_str)
-        if not m1_now.empty:
-            last_min = str(m1_now["date"].max())
-            print(
-                f"  → {len(m1_now):,} 筆，{m1_now['stock_id'].nunique():,} 支，最新分鐘：{last_min}",
-                flush=True,
-            )
-            init_results = state.predict_live(
+        if m1_now.empty:
+            print("  → 今日無分K資料（尚未開盤或非交易日）", flush=True)
+            return
+        last_min = str(m1_now["date"].max())
+        print(
+            f"  → {len(m1_now):,} 筆，{m1_now['stock_id'].nunique():,} 支，最新分鐘：{last_min}",
+            flush=True,
+        )
+        for s in state.strategies.values():
+            init_results = s.predict_live(
                 last_min,
                 state.day,
+                model=s.model,
                 day_trade_stocks=state.day_trade_stocks,
                 m1_live=m1_now,
-                **state.prewarm_cache,
+                **s.prewarm_cache,
             )
-            push_monitoring(last_min, init_results, threshold)
-            print(f"✓ [M1] 補載監控完成：{len(init_results)} 支訊號", flush=True)
-        else:
-            print("  → 今日無分K資料（尚未開盤或非交易日）", flush=True)
+            push_monitoring(last_min, init_results, threshold, strategy=s.name)
+            print(f"✓ [M1] [{s.name}] 補載監控完成：{len(init_results)} 支訊號", flush=True)
     except Exception as e:
         print(f"✗ [M1] 補載失敗: {e}", flush=True)

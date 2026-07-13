@@ -8,6 +8,8 @@ ReDoc      : http://localhost:8000/redoc
     GET  /health                     健康檢查
     GET  /dashboard/summary          上方資訊列統計
     GET  /signals/today              左邊訊號列表
+    GET  /consensus/today            今日「多個策略前N名重疊」訊號列表
+    GET  /strategies                 目前啟用的策略清單（幾個模型、各自session範圍）
     GET  /signals/{stock_id}/detail  右邊訊號詳情
     GET  /chart/{stock_id}/candles   中間 K 圖
     GET  /chart/{stock_id}/candles/history   歷史K線（任意過去日期，交易回放用）
@@ -375,6 +377,8 @@ _completed_trades: list = []  # 今日完整回合（進出配對，含損益）
 _candles: dict = {}  # {stock_id: [Candle dict, ...]}
 _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
 _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
+_consensus_signals: list = []  # 今日「多個策略的前N名重疊」記錄，見 push_consensus_signals()
+_strategies_registry: dict = {"strategies": [], "consensus_top_n": 0}  # 見 set_strategies()
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
 from collections import OrderedDict as _OrderedDict
@@ -452,11 +456,22 @@ def _broadcast(data: dict):
     asyncio.run_coroutine_threadsafe(_enqueue_all(), _event_loop)
 
 
+def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
+    """由 main/live_trader.py 開機時呼叫一次，登記目前有哪些策略在跑，供前端
+    GET /strategies 查詢——例如要動態渲染幾組監控面板、每組叫什麼名字，不用
+    等第一筆 monitoring/signals 事件送到才知道有幾個模型。
+
+    strategies: [{"name":..., "session_start":"HH:MM", "session_end":"HH:MM"}, ...]
+    """
+    global _strategies_registry
+    _strategies_registry = {"strategies": strategies, "consensus_top_n": consensus_top_n}
+
+
 # ── Public push functions（由 live_trader.py 呼叫）───────────────────────────
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _signal_detail, _positions, _monitoring
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _signal_detail, _positions, _monitoring, _consensus_signals
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -469,18 +484,29 @@ def _reset_if_new_day():
         _system_logs.clear()
         _trade_logs.clear()
         _monitoring.clear()
+        _consensus_signals.clear()
         _summary = dict(_SUMMARY_DEFAULT)
 
 
-def push_monitoring(minute_str: str, all_results: list, threshold: float):
-    """推入所有監控股票的最新推論結果（threshold=0 全部），由 on_minute 呼叫"""
-    print(f"[push_monitoring] {minute_str} 接收 {len(all_results)} 支股票的推論結果", flush=True)
+def push_monitoring(minute_str: str, all_results: list, threshold: float, strategy: str = ""):
+    """推入所有監控股票的最新推論結果（threshold=0 全部），由 on_minute 呼叫。
+
+    strategy: 產生這批結果的策略名稱（main/state.py 的 StrategyState.name）。
+    可能同時有多個策略在跑（見 main/config.py 的 STRATEGY_MODULES），_monitoring
+    的 key 因此是 f"{strategy}:{stock_id}" 不是單純 stock_id，避免不同策略
+    對同一支股票的推論互相覆蓋掉；每筆資料也帶 "strategy" 欄位，前端目前還是
+    混在一起顯示（還沒做分策略 UI），之後要分開顯示時直接篩這個欄位。
+    strategy 留空（沒有策略概念的舊呼叫端）就退回單純用 stock_id 當 key。
+    """
+    print(f"[push_monitoring] {minute_str} [{strategy or '-'}] 接收 {len(all_results)} 支股票的推論結果", flush=True)
     cur_dt = datetime.strptime(minute_str, "%Y-%m-%d %H:%M:%S")
     date_str = minute_str[:10]
     with _lock:
         for r in all_results:
-            _monitoring[r["stock_id"]] = {
+            key = f"{strategy}:{r['stock_id']}" if strategy else r["stock_id"]
+            _monitoring[key] = {
                 "stock_id": r["stock_id"],
+                "strategy": strategy,
                 "name": r.get("name", r["stock_id"]),
                 "proba": round(r["proba"], 4),
                 "price": r["price"],
@@ -492,12 +518,12 @@ def push_monitoring(minute_str: str, all_results: list, threshold: float):
         # 實際被推論的候選清單裡（例如 day_trade_stocks 名單變動、盤中被剔除），
         # 若不清掉，它舊的（通常偏高的）proba 會永遠卡在排行榜頂端，跟 on_minute
         # 印出的 top5 log 對不起來，且前端「監控中」清單會顯示早就過期的股票。
-        stale_ids = [
-            sid for sid, v in _monitoring.items()
+        stale_keys = [
+            key for key, v in _monitoring.items()
             if (cur_dt - datetime.strptime(f"{date_str} {v['minute']}", "%Y-%m-%d %H:%M")).total_seconds() > 180
         ]
-        for sid in stale_ids:
-            del _monitoring[sid]
+        for key in stale_keys:
+            del _monitoring[key]
         data = sorted(_monitoring.values(), key=lambda x: -x["proba"])
         _broadcast({"type": "monitoring", "minute": minute_str[11:16], "data": data})
 
@@ -506,9 +532,12 @@ _INFERENCE_LOCAL_DIR = Path(__file__).parent / "db" / "inference_live"
 _HF_INFERENCE_PREFIX = "day_trade/inference"
 
 
-def push_inference_log(minute_str: str, all_results: list, threshold: float = 0.0):
+def push_inference_log(minute_str: str, all_results: list, threshold: float = 0.0, strategy: str = ""):
     """每分鐘全部監控股票的推論結果落地：記憶體累積今日資料 + 背景寫本地 parquet + 同步至 HF Hub。
     由 on_minute 在 push_monitoring 之後呼叫，供 /api/inference/history 分析查詢用。
+
+    strategy: 見 push_monitoring() 的說明，附加成一個欄位（純新增欄位，parquet/
+    下游查詢不會因為多這欄而壞掉）。
     """
     global _inference_buffer, _inference_date
     if not all_results:
@@ -524,6 +553,7 @@ def push_inference_log(minute_str: str, all_results: list, threshold: float = 0.
                 {
                     "date": date_str,
                     "time": minute_str[11:16],
+                    "strategy": strategy,
                     "stock_id": r["stock_id"],
                     "name": r.get("name", r["stock_id"]),
                     "proba": round(float(r["proba"]), 4),
@@ -714,14 +744,23 @@ def _build_eval_summary(df) -> dict:
     }
 
 
-def push_signals(minute_str: str, signals: list):
-    """每分K推入新訊號（由 on_minute 呼叫）"""
-    print(f"[push_signals] {minute_str} 產生 {len(signals)} 筆訊號", flush=True)
+def push_signals(minute_str: str, signals: list, strategy: str = ""):
+    """每分K推入新訊號（由 on_minute 呼叫）。
+
+    strategy: 見 push_monitoring() 的說明。_signal_detail 目前還是單純用
+    stock_id 當 key（跟交易回合/成交配對邏輯綁在一起，見下面 update_signal_status
+    這類函式），如果兩個策略同一天對同一支股票都發訊號，後者會覆蓋前者的
+    詳情——TRADE_MODE=off（交易先暫停）時不影響監控顯示，但之後要多策略
+    同時「真的下單」時，這裡要重新設計成 (strategy, stock_id) 當 key，不要
+    假設現在已經處理好。
+    """
+    print(f"[push_signals] {minute_str} [{strategy or '-'}] 產生 {len(signals)} 筆訊號", flush=True)
     with _lock:
         _reset_if_new_day()
         for s in signals:
             record = {
                 "time": minute_str[11:16],
+                "strategy": strategy,
                 "stock_id": s["stock_id"],
                 "name": s.get("name", s["stock_id"]),
                 "direction": "buy",
@@ -736,6 +775,7 @@ def push_signals(minute_str: str, signals: list):
             # 初始化詳情
             _signal_detail[s["stock_id"]] = {
                 "stock_id": s["stock_id"],
+                "strategy": strategy,
                 "name": s.get("name", s["stock_id"]),
                 "direction": "buy",
                 "signal_time": minute_str[11:],
@@ -752,7 +792,24 @@ def push_signals(minute_str: str, signals: list):
                 ],
             }
 
-        _broadcast({"type": "signals", "minute": minute_str, "data": signals})
+        _broadcast({"type": "signals", "minute": minute_str, "strategy": strategy, "data": signals})
+
+
+def push_consensus_signals(minute_str: str, consensus: list):
+    """推入「多個策略的前N名重疊」訊號（由 main/live_trader.py 的 on_minute() 在
+    所有策略都跑完那分鐘的推論後呼叫，見 CONSENSUS_TOP_N 設定）。
+
+    consensus 每筆結構：{"stock_id", "name", "strategies": [策略名,...],
+    "probas": {策略名: proba}}——同一支股票同時出現在2個以上策略的前N名，
+    才會被列進來，代表「多個模型都看好」，給前端額外標記參考用，跟個別
+    策略自己的 monitoring/signals 是分開的資訊，不會互相取代。
+    """
+    print(f"[push_consensus_signals] {minute_str} 產生 {len(consensus)} 筆重疊訊號", flush=True)
+    with _lock:
+        _reset_if_new_day()
+        for c in consensus:
+            _consensus_signals.append({**c, "time": minute_str[11:16]})
+        _broadcast({"type": "consensus_signals", "minute": minute_str[11:16], "data": consensus})
 
 
 def push_candles(stock_id: str, candles: list):
@@ -1056,6 +1113,26 @@ def signals_today():
     print(f"[GET /signals/today] 回傳 {len(_signals)} 筆訊號", flush=True)
     with _lock:
         return list(reversed(_signals))  # 最新在上
+
+
+@app.get(
+    "/consensus/today",
+    tags=["訊號"],
+    summary="今日「多個策略前N名重疊」訊號列表",
+)
+def consensus_today():
+    print(f"[GET /consensus/today] 回傳 {len(_consensus_signals)} 筆重疊訊號", flush=True)
+    with _lock:
+        return list(reversed(_consensus_signals))  # 最新在上
+
+
+@app.get(
+    "/strategies",
+    tags=["訊號"],
+    summary="目前啟用的策略清單（給前端動態渲染幾個模型的面板用）",
+)
+def get_strategies():
+    return _strategies_registry
 
 
 @app.get(

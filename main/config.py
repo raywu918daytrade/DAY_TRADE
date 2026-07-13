@@ -13,10 +13,21 @@ from dotenv import load_dotenv
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env", override=True)
 
-# 策略模組切換：改 .env 的 STRATEGY_MODULE 就能換策略，不用改 live_trader.py。
-# 每個策略模組（例如 strategy/rally/live.py）都要暴露同一組介面：
-# load_model() / predict_live(...) / SESSION_START / SESSION_END
-STRATEGY_MODULE = os.environ.get("STRATEGY_MODULE", "strategy.orb.live")
+# 策略模組（可同時跑多個）：改 .env 的 STRATEGY_MODULES（逗號分隔）就能切換，
+# 不用改 live_trader.py。每個策略模組（例如 strategy/rally/live.py）都要暴露
+# 同一組介面：load_model() / predict_live(...) / SESSION_START / SESSION_END。
+# 2026-07-13：交易執行先暫停（見 main/live_trader.py 的 TRADE_MODE），多策略
+# 同時跑只做「各自推論、結果分開傳到前端，最終由使用者決定」，還沒有處理
+# 多策略同時下單的資金分配/訊號衝突問題——等實盤穩定、真的要多策略同時
+# 交易時，要先設計好這塊，不要假設現在的架構已經支援。
+STRATEGY_MODULES = [
+    s.strip() for s in os.environ.get("STRATEGY_MODULES", "strategy.orb.live").split(",") if s.strip()
+]
+
+# 多策略「前N名重疊」比對：每個策略各自依 proba 排名取前N名（不管有沒有過
+# 該策略自己的門檻），同一支股票同時出現在2個以上策略的前N名，視為多模型
+# 共識訊號，額外推送給前端參考（見 main/live_trader.py 的 on_minute()）。
+CONSENSUS_TOP_N = int(os.environ.get("CONSENSUS_TOP_N", "10"))
 
 TRADE_MODE = os.environ.get("TRADE_MODE", "off")  # off | paper | sim | live
 THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
