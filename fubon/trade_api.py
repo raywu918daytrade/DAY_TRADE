@@ -29,22 +29,8 @@ def _resolve_cert_path() -> str:
 
 
 def login() -> tuple[FubonSDK, list]:
-    """第一次連線測試須用身分證字號＋登入密碼＋憑證（不可用 API Key）。"""
-    sdk = FubonSDK()
-    result = sdk.login(
-        os.environ["FUBON_ID"],
-        os.environ["FUBON_PASSWORD"],
-        _resolve_cert_path(),
-        os.environ.get("FUBON_CERT_PASS") or None,
-    )
-    if not result.is_success:
-        raise RuntimeError(f"富邦登入失敗: {result.message}")
-    return sdk, result.data
-
-
-def login_with_api_key() -> tuple[FubonSDK, list]:
-    """第一次連線測試通過、帳號權限開通後才能用這個。還是要身分證字號＋憑證，
-    只是密碼換成 API Key（.env 的 FUBON_API_KEY）。"""
+    """身分證字號＋API Key（.env 的 FUBON_API_KEY）＋憑證登入。第一次連線測試
+    （身分證字號＋密碼＋憑證）已經在 2026-07 完成、帳號權限開通，之後一律用這個。"""
     sdk = FubonSDK()
     result = sdk.apikey_login(
         os.environ["FUBON_ID"],
@@ -82,6 +68,16 @@ def intraday_candles(sdk: FubonSDK, symbol: str, timeframe: int = 1) -> list[dic
     init_market_data()。Rate limit 300次/分鐘（富邦官方文件），呼叫端要自行節流。"""
     reststock = sdk.marketdata.rest_client.stock
     r = reststock.intraday.candles(symbol=symbol, timeframe=timeframe)
+    return r.get("data", [])
+
+
+def historical_candles(sdk: FubonSDK, symbol: str, timeframe: int = 1) -> list[dict]:
+    """REST 行情 API：取得單一股票近30日分K（historical/candles/{symbol}），語意
+    對齊 Fugle 的 /historical/candles（同一套底層 fugle_marketdata 元件）。呼叫前
+    須先 init_market_data()。Rate limit 60次/分鐘（富邦官方文件，比 intraday 慢
+    很多），呼叫端要自行節流。"""
+    reststock = sdk.marketdata.rest_client.stock
+    r = reststock.historical.candles(symbol=symbol, timeframe=timeframe)
     return r.get("data", [])
 
 

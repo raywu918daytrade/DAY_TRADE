@@ -23,10 +23,6 @@ THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
 FORCE_CLOSE_HOUR = int(os.environ.get("FORCE_CLOSE_HOUR", "13"))
 FORCE_CLOSE_MIN = int(os.environ.get("FORCE_CLOSE_MIN", "25"))
 
-# 分K收集器：rest（Fugle REST）| fubon_ws（富邦 WebSocket）。實際值看 .env，
-# candles channel payload 格式尚未在平日開盤驗證過，見 fubon/marketdata_ws.py 的說明。
-M1_COLLECTOR = os.environ.get("M1_COLLECTOR", "rest")
-
 _TOTAL_CAPITAL_ENV = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
 
 

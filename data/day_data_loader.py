@@ -24,8 +24,6 @@ import pyarrow.dataset as ds
 import requests
 from dotenv import load_dotenv
 
-from data.fugle_tickers import fugle_stocks
-
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env", override=True)
 
@@ -151,8 +149,11 @@ def _update_flag(stock_id: str, date_str: str):
 
 
 def _all_stocks() -> list:
-    """從 Fugle 當日清單取得可交易股票"""
-    return fugle_stocks()
+    """股票母體，統一走富邦（跟即時交易的候選股同一個資料源，見
+    fubon/subscribe_list.py::all_normal_stocks()），不再用 Fugle 的清單。"""
+    from fubon.subscribe_list import all_normal_stocks
+
+    return all_normal_stocks()
 
 
 def _get_done_stocks(date_str: str) -> set:

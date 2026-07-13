@@ -22,6 +22,10 @@
         from fubon.subscribe_list import load_candidates, load_subscribe_batches
         df = load_candidates()          # 完整 DataFrame（含 name）
         batches = load_subscribe_batches()  # 分組後的 stock_id list，給 WebSocket 用
+
+    訓練資料批次下載器（不受均量排序/WebSocket上限限制，只要完整母體）：
+        from fubon.subscribe_list import all_normal_stocks
+        stocks = all_normal_stocks()    # 每次呼叫都現抓，不經過存檔的候選清單
 """
 import os
 import re
@@ -75,6 +79,14 @@ def _fubon_normal_tickers() -> dict[str, str]:
         return stocks
     finally:
         trade_api.logout(sdk)
+
+
+def all_normal_stocks() -> list[str]:
+    """完整股票母體（isNormal=true、排除債券ETF，不做均量排序/上限），給訓練資料
+    批次下載器用（data/day_data_loader.py、data/m1_data_loader.py）——那兩支不受
+    WebSocket 訂閱數限制，不需要 ranked_candidates() 的排序/截斷，只要「今天有哪些
+    股票可以交易」這個母體即可。"""
+    return list(_fubon_normal_tickers().keys())
 
 
 def ranked_candidates(names: dict[str, str]) -> list[str]:

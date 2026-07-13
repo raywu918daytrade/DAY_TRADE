@@ -3,7 +3,7 @@
 
 架構：
     主執行緒  → uvicorn（FastAPI + SSE）
-    背景執行緒 → 分K收集器（main/collector.py，REST 或富邦 WebSocket）
+    背景執行緒 → 分K收集器（main/collector.py，富邦 WebSocket）
     背景執行緒 → _daily_refresh（每天 06:00 更新當沖標的 + 日K，08:45 重算策略盤前快取）
     背景執行緒 → _force_close_eod（每天 13:25 強制平倉，當沖不過夜）
 
@@ -13,12 +13,12 @@
     main/strategy_loader.py → 動態載入策略模組（切換模型／策略）
     main/premarket.py       → 盤前資料準備（當沖候選清單、日K、策略快取）
     main/backfill.py        → 開機補載推論（填 SSE monitoring，不用等下一分鐘）
-    main/collector.py       → 分K收集器（REST／富邦 WebSocket 切換）
+    main/collector.py       → 分K收集器（富邦 WebSocket，fubon/marketdata_ws.py）
 
 資料取用時段：
     盤前（<09:01）  : 日K 從 HF Hub / 本地載入；分K 從既有 parquet 讀取（昨日 backfill）
-    盤中（09:01~13:00）: 分K收集器每分鐘 poll/推送，寫入 db/m1_live/
-    盤後（>13:00）  : REST /historical/candles 補齊完整今日分K，再 sleep 到隔日
+    盤中（09:01~13:00）: 富邦 WebSocket 即時推送，寫入 db/m1_live/
+    盤後（>13:00）  : 持續收 WebSocket 資料到收盤，SL/TP reconcile 監控不中斷
 
 流程：
     on_minute → predict_live → push_monitoring → SSE monitoring event
@@ -343,7 +343,7 @@ if __name__ == "__main__":
     # 每日 13:25 強制平倉（當沖不過夜）
     threading.Thread(target=_force_close_eod, daemon=True).start()
     # 分K收集器在背景執行緒
-    threading.Thread(target=lambda: _collector.start_collector(state, on_minute), daemon=True).start()
+    threading.Thread(target=lambda: _collector.start_collector(on_minute), daemon=True).start()
 
     # uvicorn 跑主執行緒（阻塞）
     config = get_uvicorn_config(host="0.0.0.0", port=8000)

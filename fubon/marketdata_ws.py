@@ -1,13 +1,14 @@
 """
 富邦即時分K收集器：開最多 5 條 WebSocket 連線，訂閱 candles channel，
-把收到的 1分K 寫進 db/m1_live/{日期}.parquet（欄位/存檔邏輯對齊
-data/m1_rest.py，方便共用 data/query.py 的 load_m1_live()）。
+把收到的 1分K 寫進 db/m1_live/{日期}.parquet（欄位/存檔邏輯共用
+data/m1_utils.py，方便共用 data/query.py 的 load_m1_live()）。
 
 on_minute 觸發機制：存檔（_flush_loop，每 FUBON_WS_FLUSH_INTERVAL 秒）跟
 觸發推論（_minute_tick_loop，每分鐘固定一次，用真實時鐘驅動）是兩條分開的
 迴圈——不管這分鐘 WebSocket 有沒有推新訊息，_minute_tick_loop 都保證每分鐘
-呼叫一次 on_minute（讀 db/m1_live/ 當下最新資料），跟 M1RestPoller 的保底
-行為一致，確保收盤後的 SL/TP reconcile 監控不會因為行情安靜而跳過整分鐘。
+呼叫一次 on_minute（讀 db/m1_live/ 當下最新資料），確保收盤後的 SL/TP
+reconcile 監控不會因為行情安靜而跳過整分鐘（Fugle REST 輪詢器年代就是這樣
+設計的，2026-07-13 移除那支檔案時保留了這個保底邏輯）。
 
 股票清單來自 fubon/subscribe_list.py 存好的
 db/fubon_subscribe/subscribe_list.parquet（開盤前先跑一次
@@ -42,7 +43,7 @@ import orjson
 import pandas as pd
 from dotenv import load_dotenv
 
-from data.m1_rest import _atomic_save, _parse_rest_bars
+from data.m1_utils import _atomic_save, _parse_rest_bars
 from data.query import load_m1_live
 from fubon import trade_api
 from fubon.subscribe_list import load_subscribe_batches
@@ -67,8 +68,7 @@ _MAX_WAIT_SEC = float(os.environ.get("FUBON_WS_MAX_WAIT_SEC", "15"))
 _COVERAGE_POLL_SEC = 1.0
 # 富邦 intraday/candles rate limit 300次/分鐘（官方文件），節流到 ~240次/分鐘留緩衝。
 # 這個間隔控制的是「發出下一個 request」的頻率，不是單一 worker 的間隔——
-# 多執行緒下大家共用同一個節流時鐘，各自的網路等待時間可以互相重疊
-# （寫法對齊 data/m1_rest.py::_fetch_all 的 _throttled_fetch）。
+# 多執行緒下大家共用同一個節流時鐘，各自的網路等待時間可以互相重疊。
 _BACKFILL_INTERVAL = float(os.environ.get("FUBON_REST_INTERVAL", "0.25"))
 _BACKFILL_WORKERS = int(os.environ.get("FUBON_BACKFILL_WORKERS", "10"))
 
@@ -170,7 +170,7 @@ class FubonM1Collector:
         threading.Thread(target=self._backfill_intraday, args=(all_symbols, date_str), daemon=True).start()
 
         threading.Thread(target=self._flush_loop, daemon=True).start()
-        self._minute_tick_loop()  # 主執行緒 block 在這裡，跟 M1RestPoller.start() 同樣角色
+        self._minute_tick_loop()  # 主執行緒 block 在這裡，直到 stop() 被呼叫
 
     def stop(self):
         self._stop = True
@@ -269,11 +269,11 @@ class FubonM1Collector:
 
     # ── 每分鐘固定觸發一次 on_minute（保底機制）────────────────────────────
     #
-    # 跟 data/m1_rest.py::M1RestPoller 對齊：不管這分鐘 WebSocket 有沒有推新
-    # 訊息（連線斷線、行情安靜、還沒開盤都可能發生），每分鐘都要固定呼叫一次
-    # on_minute，否則 on_minute() 裡收盤後的 SL/TP reconcile 監控會因為某幾
-    # 分鐘沒有新訊息就整段被跳過。用真實時鐘（跟 REST 版本一樣卡在每分鐘 :05
-    # 秒）驅動，不是靠 buffer 裡有沒有「新完成的一分鐘」來判斷。
+    # 不管這分鐘 WebSocket 有沒有推新訊息（連線斷線、行情安靜、還沒開盤都
+    # 可能發生），每分鐘都要固定呼叫一次 on_minute，否則 on_minute() 裡
+    # 收盤後的 SL/TP reconcile 監控會因為某幾分鐘沒有新訊息就整段被跳過。
+    # 用真實時鐘卡在每分鐘 :05 秒驅動，不是靠 buffer 裡有沒有「新完成的
+    # 一分鐘」來判斷。
 
     def _minute_tick_loop(self):
         if not self._on_minute:
