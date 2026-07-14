@@ -467,6 +467,7 @@ def push_monitoring(minute_str: str, all_results: list, threshold: float, strate
                 "name": r.get("name", r["stock_id"]),
                 "proba": round(r["proba"], 4),
                 "price": r["price"],
+                "volume": r.get("volume"),  # 這一分鐘的成交量（不是累積量），純參考用
                 "direction": r.get("direction", "buy"),
                 "is_signal": r["proba"] >= threshold,
                 "minute": minute_str[11:16],

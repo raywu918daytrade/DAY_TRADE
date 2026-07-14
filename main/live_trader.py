@@ -270,6 +270,12 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     if not df.empty and "stock_id" in df.columns and "close" in df.columns:
         price_map = dict(zip(df["stock_id"].astype(str), df["close"].astype(float)))
 
+    # volume_map：這一分鐘各股票自己的成交量（不是累積量），給前端監控參考用，
+    # 跟 price_map 同樣的來源（這分鐘收到的分K），不影響任何策略的推論輸入。
+    volume_map = {}
+    if not df.empty and "stock_id" in df.columns and "volume" in df.columns:
+        volume_map = dict(zip(df["stock_id"].astype(str), df["volume"].astype(int)))
+
     all_signals = []
     top_by_strategy: dict[str, list[dict]] = {}  # 各策略前N名（依proba排名，不管有沒有過門檻），給下面重疊比對用
     for s in state.strategies.values():
@@ -288,6 +294,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         for r in all_results:
             r["name"] = state.tickers.get(r["stock_id"], r["stock_id"])
             r["strategy"] = s.name  # 保留來源策略，reconcile() 收到的合併清單才分得出是誰產生的
+            r["volume"] = volume_map.get(r["stock_id"])
 
         push_monitoring(minute_str, all_results, threshold, strategy=s.name)
         push_inference_log(minute_str, all_results, threshold, strategy=s.name)

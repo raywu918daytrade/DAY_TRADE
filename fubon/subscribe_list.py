@@ -49,15 +49,29 @@ _SUBSCRIBE_PATH = _ROOT / "db/fubon_subscribe/subscribe_list.parquet"
 # 避免名稱被 API 截斷看不出後面有「債」的漏網之魚。
 _BOND_ETF_PATTERN = re.compile(r"^00\d{3}[BD]$")
 
+# 一般股票代號固定4碼數字；5碼以上（例如00631L槓桿ETF、00632R反向ETF）都是
+# ETF，不是個股。只取4碼的話連 0050 這種4碼ETF也留著沒濾掉（main/live_trader.py
+# 的 idx_* 特徵需要 0050，見 _get_stocks() 固定補進候選清單那段），這裡的
+# 4碼過濾只是額外把5碼以上的槓桿/反向/主動型ETF擋掉，不是要把ETF全部濾乾淨。
+_STOCK_CODE_PATTERN = re.compile(r"^\d{4}$")
+
 
 def _is_bond(stock_id: str, name: str) -> bool:
     return bool(_BOND_ETF_PATTERN.match(stock_id)) or "債" in name
 
 
-def _fubon_normal_tickers() -> dict[str, str]:
+def _is_4digit_stock(stock_id: str) -> bool:
+    return bool(_STOCK_CODE_PATTERN.match(stock_id))
+
+
+def _fubon_normal_tickers(only_4digit: bool = False) -> dict[str, str]:
     """用富邦自己的 REST 行情 API 抓「正常交易」股票清單（isNormal=true，排除注意/處置股），
     回傳 {stock_id: name}。排除債券型ETF／固定收益基金（見 _is_bond()），只留股票和
     一般權益類 ETF。
+
+    only_4digit: 選填，只留4碼代號（見 _is_4digit_stock()），把5碼以上的槓桿/反向/
+    主動型ETF（例如00631L、00632R）也濾掉，不只濾債券ETF。預設 False，不改變既有
+    行為（例如即時交易候選股清單、其他呼叫端不會突然少了這些ETF）。
 
     改用富邦而不是 Fugle 的 /intraday/tickers：Fugle 那邊原本多帶的 isDayTrading=true
     查無官方文件依據（見 memory 的 TODO）。TWSE / TPEx 各查一次再合併。實際 SDK 呼叫
@@ -75,18 +89,23 @@ def _fubon_normal_tickers() -> dict[str, str]:
                 name = item.get("name", "")
                 if _is_bond(sid, name):
                     continue
+                if only_4digit and not _is_4digit_stock(sid):
+                    continue
                 stocks[sid] = name
         return stocks
     finally:
         trade_api.logout(sdk)
 
 
-def all_normal_stocks() -> list[str]:
+def all_normal_stocks(only_4digit: bool = False) -> list[str]:
     """完整股票母體（isNormal=true、排除債券ETF，不做均量排序/上限），給訓練資料
     批次下載器用（data/day_data_loader.py、data/m1_data_loader.py）——那兩支不受
     WebSocket 訂閱數限制，不需要 ranked_candidates() 的排序/截斷，只要「今天有哪些
-    股票可以交易」這個母體即可。"""
-    return list(_fubon_normal_tickers().keys())
+    股票可以交易」這個母體即可。
+
+    only_4digit: 選填，見 _fubon_normal_tickers() 的說明，只留4碼個股代號，濾掉
+    5碼以上的槓桿/反向/主動型ETF。"""
+    return list(_fubon_normal_tickers(only_4digit=only_4digit).keys())
 
 
 def ranked_candidates(names: dict[str, str]) -> list[str]:
@@ -110,11 +129,16 @@ def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     return batches[:MAX_CONNECTIONS]
 
 
-def build_and_save_subscribe_list() -> pd.DataFrame:
+def build_and_save_subscribe_list(only_4digit: bool = False) -> pd.DataFrame:
     """算好分連線的候選股清單（含名稱），存到 db/fubon_subscribe/。
     main/premarket.py::refresh_tickers() 開機、每天 06:00 都會呼叫這個，
-    不用另外排程。"""
-    names = _fubon_normal_tickers()
+    不用另外排程。
+
+    only_4digit: 選填，見 _fubon_normal_tickers() 的說明，濾掉5碼以上的槓桿/
+    反向/主動型ETF——這類ETF成交量常常很大，會擠掉均量排序裡真正的個股
+    （2026-07-14 實測：現有清單前幾名就有00685L/00631L/00403A這幾支ETF）。
+    """
+    names = _fubon_normal_tickers(only_4digit=only_4digit)
     if not names:
         print("  警告：富邦 API 沒回傳任何股票（非盤中？），清單維持空白", flush=True)
         return pd.DataFrame()

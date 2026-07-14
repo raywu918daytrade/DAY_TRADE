@@ -23,9 +23,12 @@ db/fubon_subscribe/subscribe_list.parquet（開盤前先跑一次
 _flush_loop 統一存檔），不會各自獨立呼叫存檔函式，避免兩個執行緒同時
 讀寫同一個檔案的 race condition。
 
-⚠️ 帳號目前還在等富邦開通 API 使用權限，candles 訊息的實際欄位／推送頻率
-（每筆成交都推、還是分鐘收盤才推一次）尚未用真實連線驗證過。等權限開通、
-第一次連線務必先看 log 確認 payload 長相，必要時調整 _parse_candle()。
+富邦 API 使用權限已開通（2026-07-14）。/health 已確認 collector 能實際連線、
+持續收到即時資料（coverage 逐步從 0 補到 1000 支）。但 candles 訊息的實際
+欄位／推送頻率（每筆成交都推、還是分鐘收盤才推一次）目前是靠下游 cumsum
+算出來的 cum_vol_today 間接推斷，還沒直接對照過原始 payload log 逐欄確認，
+如果之後對到某支股票的累積量兜不起來，先看 log 裡的原始 payload 長相，
+必要時調整 _parse_candle()。
 
 使用方式：
     python -m fubon.marketdata_ws
