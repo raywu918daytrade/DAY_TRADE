@@ -105,7 +105,7 @@ def main():
     print(f"回補日期：{date_str}（訊號門檻僅影響 is_signal 標記，推論記錄本身門檻恆為 0）")
 
     from data.data_manager import load_d1
-    from data.fugle_tickers import update_tickers
+    from fubon.intraday_tickers import update_tickers
     from strategy.rally.live import SESSION_END, SESSION_START, load_model, predict_live
 
     # 1. 當沖候選清單（名稱查詢也用這份）

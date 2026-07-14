@@ -25,8 +25,8 @@ from huggingface_hub import HfApi, hf_hub_download
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from data.fugle_tickers import update_tickers
 from data.m1_data_loader import update_m1
+from fubon.intraday_tickers import update_tickers
 
 _TW = timezone(timedelta(hours=8))
 _ROOT = Path(__file__).parent.parent
@@ -47,7 +47,7 @@ if tickers_df.empty:
     print("  非盤中，從 HF Hub 取快取標的清單...")
     try:
         cached = hf_hub_download(
-            repo_id=HF_REPO_ID, filename="day_trade/tickers/fugle_tickers.parquet",
+            repo_id=HF_REPO_ID, filename="day_trade/tickers/tickers.parquet",
             repo_type="dataset", token=HF_TOKEN,
         )
         tickers_df = pd.read_parquet(cached)
@@ -60,7 +60,7 @@ if tickers_df.empty:
 else:
     print(f"  {len(tickers_df)} 支")
 
-tickers_local = _ROOT / "db/fugle_tickers"
+tickers_local = _ROOT / "db/tickers"
 tickers_local.mkdir(parents=True, exist_ok=True)
 tickers_df.to_parquet(tickers_local / "tickers.parquet", index=False)
 stocks = tickers_df["stock_id"].tolist()

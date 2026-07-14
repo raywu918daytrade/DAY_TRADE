@@ -43,12 +43,6 @@ load_dotenv(_ROOT / ".env", override=True)
 _TW = timezone(timedelta(hours=8))
 _SUBSCRIBE_PATH = _ROOT / "db/fubon_subscribe/subscribe_list.parquet"
 
-# 台股 ETF 代號後綴慣例：00XXXB＝債券型ETF，00XXXD＝主動式債券/固定收益基金
-# （實測這批代號的名稱都帶「非投」「債」「入息」）。只要股票跟一般/槓桿/反向/
-# 主動股票型 ETF（無後綴、L、R、A），不要固定收益類。名稱含「債」字再補一層，
-# 避免名稱被 API 截斷看不出後面有「債」的漏網之魚。
-_BOND_ETF_PATTERN = re.compile(r"^00\d{3}[BD]$")
-
 # 一般股票代號固定4碼數字；5碼以上（例如00631L槓桿ETF、00632R反向ETF）都是
 # ETF，不是個股。只取4碼的話連 0050 這種4碼ETF也留著沒濾掉（main/live_trader.py
 # 的 idx_* 特徵需要 0050，見 _get_stocks() 固定補進候選清單那段），這裡的
@@ -56,57 +50,26 @@ _BOND_ETF_PATTERN = re.compile(r"^00\d{3}[BD]$")
 _STOCK_CODE_PATTERN = re.compile(r"^\d{4}$")
 
 
-def _is_bond(stock_id: str, name: str) -> bool:
-    return bool(_BOND_ETF_PATTERN.match(stock_id)) or "債" in name
-
-
-def _is_junk(stock_id: str) -> bool:
-    """富邦 intraday.tickers() 回傳的清單裡混了一批非個股代號（例如 A00104、
-    A01102，industry 欄位是 A1/A2 這種產業分類代碼，不是真正的股票/ETF）。
-    台股股票/ETF代號一律數字開頭（4碼股票、00開頭ETF、含字母尾碼的特別股如
-    2887Z1 也是數字開頭），這批垃圾代號則是字母開頭，用這個規則排除。
-    2026-07-14 實測：這批代號在日K historical/candles 一律 404（Fugle/富邦
-    共用同一套底層資料源，兩邊都查不到），會讓 update_day() 每天重複打一樣
-    的失敗請求；也實測過跟「name==symbol」這個較脆弱的判斷法比對，兩者篩出
-    的集合完全一致，改用代號開頭是不是數字判斷。"""
-    return not stock_id[0].isdigit()
-
-
 def _is_4digit_stock(stock_id: str) -> bool:
     return bool(_STOCK_CODE_PATTERN.match(stock_id))
 
 
 def _fubon_normal_tickers(only_4digit: bool = False) -> dict[str, str]:
-    """用富邦自己的 REST 行情 API 抓「正常交易」股票清單（isNormal=true，排除注意/處置股），
-    回傳 {stock_id: name}。排除債券型ETF／固定收益基金（見 _is_bond()），只留股票和
-    一般權益類 ETF。
+    """股票清單（垃圾代號、債券ETF已經在 fubon/intraday_tickers.py::update_tickers()
+    這個唯一過濾源頭濾掉了），回傳 {stock_id: name}。
 
     only_4digit: 選填，只留4碼代號（見 _is_4digit_stock()），把5碼以上的槓桿/反向/
-    主動型ETF（例如00631L、00632R）也濾掉，不只濾債券ETF。預設 False，不改變既有
-    行為（例如即時交易候選股清單、其他呼叫端不會突然少了這些ETF）。
-
-    改用富邦而不是 Fugle 的 /intraday/tickers：Fugle 那邊原本多帶的 isDayTrading=true
-    查無官方文件依據（見 memory 的 TODO）。TWSE / TPEx 各查一次再合併。實際 SDK 呼叫
-    都包在 fubon/trade_api.py，這裡不直接碰 fubon_neo。
+    主動型ETF（例如00631L、00632R）也濾掉。預設 False，不改變既有行為（例如即時
+    交易候選股清單、其他呼叫端不會突然少了這些ETF）。
     """
-    from fubon import trade_api
+    from fubon.intraday_tickers import update_tickers
 
-    sdk, _ = trade_api.login()
-    try:
-        trade_api.init_market_data(sdk)
-        stocks: dict[str, str] = {}
-        for exchange in ("TWSE", "TPEx"):
-            for item in trade_api.intraday_tickers(sdk, exchange):
-                sid = item["symbol"]
-                name = item.get("name", "")
-                if _is_bond(sid, name) or _is_junk(sid):
-                    continue
-                if only_4digit and not _is_4digit_stock(sid):
-                    continue
-                stocks[sid] = name
-        return stocks
-    finally:
-        trade_api.logout(sdk)
+    df = update_tickers()
+    if df.empty:
+        return {}
+    if only_4digit:
+        df = df[df["stock_id"].apply(_is_4digit_stock)]
+    return dict(zip(df["stock_id"], df["name"]))
 
 
 def all_normal_stocks(only_4digit: bool = False) -> list[str]:
