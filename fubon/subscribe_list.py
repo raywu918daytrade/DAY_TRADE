@@ -60,6 +60,18 @@ def _is_bond(stock_id: str, name: str) -> bool:
     return bool(_BOND_ETF_PATTERN.match(stock_id)) or "債" in name
 
 
+def _is_junk(stock_id: str) -> bool:
+    """富邦 intraday.tickers() 回傳的清單裡混了一批非個股代號（例如 A00104、
+    A01102，industry 欄位是 A1/A2 這種產業分類代碼，不是真正的股票/ETF）。
+    台股股票/ETF代號一律數字開頭（4碼股票、00開頭ETF、含字母尾碼的特別股如
+    2887Z1 也是數字開頭），這批垃圾代號則是字母開頭，用這個規則排除。
+    2026-07-14 實測：這批代號在日K historical/candles 一律 404（Fugle/富邦
+    共用同一套底層資料源，兩邊都查不到），會讓 update_day() 每天重複打一樣
+    的失敗請求；也實測過跟「name==symbol」這個較脆弱的判斷法比對，兩者篩出
+    的集合完全一致，改用代號開頭是不是數字判斷。"""
+    return not stock_id[0].isdigit()
+
+
 def _is_4digit_stock(stock_id: str) -> bool:
     return bool(_STOCK_CODE_PATTERN.match(stock_id))
 
@@ -87,7 +99,7 @@ def _fubon_normal_tickers(only_4digit: bool = False) -> dict[str, str]:
             for item in trade_api.intraday_tickers(sdk, exchange):
                 sid = item["symbol"]
                 name = item.get("name", "")
-                if _is_bond(sid, name):
+                if _is_bond(sid, name) or _is_junk(sid):
                     continue
                 if only_4digit and not _is_4digit_stock(sid):
                     continue
