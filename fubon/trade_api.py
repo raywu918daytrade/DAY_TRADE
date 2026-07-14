@@ -63,6 +63,16 @@ def intraday_tickers(sdk: FubonSDK, exchange: str, type_: str = "EQUITY", is_nor
     return r.get("data", [])
 
 
+def intraday_ticker(sdk: FubonSDK, symbol: str) -> dict:
+    """REST 行情 API：取得單一股票的即時交易狀態（intraday/ticker/{symbol}），
+    含 canDayTrade/canBuyDayTrade/isAttention/isDisposition/securityStatus 等欄位
+    ——比 intraday_tickers() 清單端的 isNormal 更直接反映「能不能當沖」。呼叫前
+    須先 init_market_data()。Rate limit 300次/分鐘（富邦官方文件），呼叫端要
+    自行節流。"""
+    reststock = sdk.marketdata.rest_client.stock
+    return reststock.intraday.ticker(symbol=symbol)
+
+
 def intraday_candles(sdk: FubonSDK, symbol: str, timeframe: int = 1) -> list[dict]:
     """REST 行情 API：取得單一股票當日分K（intraday/candles/{symbol}）。呼叫前須先
     init_market_data()。Rate limit 300次/分鐘（富邦官方文件），呼叫端要自行節流。"""

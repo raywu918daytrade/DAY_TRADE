@@ -13,6 +13,8 @@
           底層資料源），濾掉可避免 update_day()/update_m1() 每天重複打
           注定失敗的請求。
         - 債券型ETF／固定收益基金（見 _is_bond()）：只留股票和一般權益類ETF。
+        - 現金增資股權批次（見 _is_tranche()）：名稱結尾中文數字一~十、代號
+          5碼以上，這批 historical/candles 一律404。
     存到 db/tickers/tickers.parquet 供其他模組使用。
 
 這裡是唯一的股票清單過濾源頭：
@@ -45,9 +47,24 @@ _TICKERS_PATH = _ROOT / "db/tickers/tickers.parquet"
 # 避免名稱被 API 截斷看不出後面有「債」的漏網之魚。
 _BOND_ETF_PATTERN = re.compile(r"^00\d{3}[BD]$")
 
+# 現金增資股權批次代號（例如「中砂一」15601、「和大四」15364、KY股的
+# 「鮮活果汁一KY」12561、「廣華二KY」13382），名稱結尾是中文數字一~十
+# （KY股則是中文數字接在"KY"前面），代號都是5碼以上（2026-07-14 實測：
+# securityType="02"，historical/candles 一律404，跟正常股票的
+# securityType="01"/特別股"04"/ETF"24"不同）。只限代號5碼以上，避免誤殺
+# 「統一」(1216)這種名稱剛好結尾是中文數字、但本身是正常4碼股票的公司。
+_TRANCHE_SUFFIX = set("一二三四五六七八九十")
+_TRANCHE_KY_PATTERN = re.compile(r"[一二三四五六七八九十]KY$")
+
 
 def _is_bond(stock_id: str, name: str) -> bool:
     return bool(_BOND_ETF_PATTERN.match(stock_id)) or "債" in name
+
+
+def _is_tranche(stock_id: str, name: str) -> bool:
+    if len(stock_id) < 5 or not name:
+        return False
+    return name[-1] in _TRANCHE_SUFFIX or bool(_TRANCHE_KY_PATTERN.search(name))
 
 
 def update_tickers() -> pd.DataFrame:
@@ -71,6 +88,8 @@ def update_tickers() -> pd.DataFrame:
                 if not str(industry).isdigit():
                     continue
                 if _is_bond(sid, name):
+                    continue
+                if _is_tranche(sid, name):
                     continue
                 rows.append({
                     "stock_id": sid,

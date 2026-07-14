@@ -1,6 +1,9 @@
 """
-富邦當沖候選股清單：從富邦 REST 行情 API 抓「正常交易」股票，依 20日均量
-排序取前 N 支，切成每組 ≤200 支、最多 5 組（對應富邦 WebSocket rate limit：
+富邦當沖候選股清單，三步驟篩選（見 subscription_batches()）：
+    1. isNormal + industry數字過濾 + 排除債券ETF（fubon/intraday_tickers.py::update_tickers()）
+    2. 20日均量排序，取前 N 支（ranked_candidates()，最多 MAX_SUBSCRIPTIONS 支）
+    3. canDayTrade/canBuyDayTrade 逐支確認（_filter_day_tradable()）
+   最後切成每組 ≤200 支、最多 5 組（對應富邦 WebSocket rate limit：
 200 檔/連線、5 條連線 → 上限 1000 檔）。
 
 這份清單是「唯一」的當沖候選股來源：
@@ -28,7 +31,7 @@
         stocks = all_normal_stocks()    # 每次呼叫都現抓，不經過存檔的候選清單
 """
 import os
-import re
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -43,44 +46,30 @@ load_dotenv(_ROOT / ".env", override=True)
 _TW = timezone(timedelta(hours=8))
 _SUBSCRIBE_PATH = _ROOT / "db/fubon_subscribe/subscribe_list.parquet"
 
-# 一般股票代號固定4碼數字；5碼以上（例如00631L槓桿ETF、00632R反向ETF）都是
-# ETF，不是個股。只取4碼的話連 0050 這種4碼ETF也留著沒濾掉（main/live_trader.py
-# 的 idx_* 特徵需要 0050，見 _get_stocks() 固定補進候選清單那段），這裡的
-# 4碼過濾只是額外把5碼以上的槓桿/反向/主動型ETF擋掉，不是要把ETF全部濾乾淨。
-_STOCK_CODE_PATTERN = re.compile(r"^\d{4}$")
 
-
-def _is_4digit_stock(stock_id: str) -> bool:
-    return bool(_STOCK_CODE_PATTERN.match(stock_id))
-
-
-def _fubon_normal_tickers(only_4digit: bool = False) -> dict[str, str]:
+def _fubon_normal_tickers() -> dict[str, str]:
     """股票清單（垃圾代號、債券ETF已經在 fubon/intraday_tickers.py::update_tickers()
     這個唯一過濾源頭濾掉了），回傳 {stock_id: name}。
 
-    only_4digit: 選填，只留4碼代號（見 _is_4digit_stock()），把5碼以上的槓桿/反向/
-    主動型ETF（例如00631L、00632R）也濾掉。預設 False，不改變既有行為（例如即時
-    交易候選股清單、其他呼叫端不會突然少了這些ETF）。
-    """
+    不額外用代號碼數濾槓桿/反向/主動型ETF（曾經這樣做過，2026-07-14 發現這是錯的：
+    台股ETF代號是「00+3碼」＝5碼才是現行規則，00878/00919這類完全正常、成交量
+    很大的高股息ETF也是5碼，用碼數過濾會連這些一起誤殺）。是否進候選股完全交給
+    isNormal=true（intraday_tickers.py 呼叫 API 時已經濾過）+ ranked_candidates()
+    的成交量排序決定，槓桿/反向ETF成交量高就會排前面，不特別排除。"""
     from fubon.intraday_tickers import update_tickers
 
     df = update_tickers()
     if df.empty:
         return {}
-    if only_4digit:
-        df = df[df["stock_id"].apply(_is_4digit_stock)]
     return dict(zip(df["stock_id"], df["name"]))
 
 
-def all_normal_stocks(only_4digit: bool = False) -> list[str]:
+def all_normal_stocks() -> list[str]:
     """完整股票母體（isNormal=true、排除債券ETF，不做均量排序/上限），給訓練資料
     批次下載器用（data/day_data_loader.py、data/m1_data_loader.py）——那兩支不受
     WebSocket 訂閱數限制，不需要 ranked_candidates() 的排序/截斷，只要「今天有哪些
-    股票可以交易」這個母體即可。
-
-    only_4digit: 選填，見 _fubon_normal_tickers() 的說明，只留4碼個股代號，濾掉
-    5碼以上的槓桿/反向/主動型ETF。"""
-    return list(_fubon_normal_tickers(only_4digit=only_4digit).keys())
+    股票可以交易」這個母體即可。"""
+    return list(_fubon_normal_tickers().keys())
 
 
 def ranked_candidates(names: dict[str, str]) -> list[str]:
@@ -93,10 +82,42 @@ def ranked_candidates(names: dict[str, str]) -> list[str]:
     return _volume_filter(set(names.keys()), day[["stock_id", "date", "volume"]])
 
 
+def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
+    """用 intraday/ticker/{symbol}（單支查詢，見 fubon/intraday_ticker.py 的
+    診斷測試）逐支確認 canDayTrade/canBuyDayTrade 皆為 true，比 isNormal 更直接
+    反映「能不能當沖」，2026-07-14 實測連垃圾代碼（industry非數字那批）也會被
+    這兩個欄位抓到 canDayTrade=false。
+
+    放在 ranked_candidates() 之後（均量排序+截斷到 MAX_SUBSCRIPTIONS 之後）才做，
+    只查最後入選的候選股，不用對全市場 ~2700 支都查一次（300次/分鐘的話要
+    9分鐘，候選股通常只有 1000 支內，約 4 分鐘內）。"""
+    from fubon import trade_api
+
+    sdk, _ = trade_api.login()
+    tradable = []
+    try:
+        trade_api.init_market_data(sdk)
+        for sid in stock_ids:
+            try:
+                info = trade_api.intraday_ticker(sdk, sid)
+                if info.get("canDayTrade") and info.get("canBuyDayTrade"):
+                    tradable.append(sid)
+            except Exception as e:
+                print(f"  警告：{sid} intraday_ticker 查詢失敗，略過: {e}", flush=True)
+            time.sleep(0.25)  # 300次/分鐘上限，留緩衝
+    finally:
+        trade_api.logout(sdk)
+    return tradable
+
+
 def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     """把候選股切成 ≤MAX_PER_CONNECTION 支一組，最多 MAX_CONNECTIONS 組
-    （富邦 WebSocket 連線本身的 rate limit，定義在 fubon/config.py）。"""
+    （富邦 WebSocket 連線本身的 rate limit，定義在 fubon/config.py）。
+
+    順序：均量排序＋截斷（ranked_candidates） → canDayTrade/canBuyDayTrade
+    逐支確認（_filter_day_tradable） → 分連線。"""
     candidates = ranked_candidates(names)
+    candidates = _filter_day_tradable(candidates)
     batches = [
         candidates[i : i + MAX_PER_CONNECTION]
         for i in range(0, len(candidates), MAX_PER_CONNECTION)
@@ -104,16 +125,11 @@ def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     return batches[:MAX_CONNECTIONS]
 
 
-def build_and_save_subscribe_list(only_4digit: bool = False) -> pd.DataFrame:
+def build_and_save_subscribe_list() -> pd.DataFrame:
     """算好分連線的候選股清單（含名稱），存到 db/fubon_subscribe/。
     main/premarket.py::refresh_tickers() 開機、每天 06:00 都會呼叫這個，
-    不用另外排程。
-
-    only_4digit: 選填，見 _fubon_normal_tickers() 的說明，濾掉5碼以上的槓桿/
-    反向/主動型ETF——這類ETF成交量常常很大，會擠掉均量排序裡真正的個股
-    （2026-07-14 實測：現有清單前幾名就有00685L/00631L/00403A這幾支ETF）。
-    """
-    names = _fubon_normal_tickers(only_4digit=only_4digit)
+    不用另外排程。"""
+    names = _fubon_normal_tickers()
     if not names:
         print("  警告：富邦 API 沒回傳任何股票（非盤中？），清單維持空白", flush=True)
         return pd.DataFrame()
