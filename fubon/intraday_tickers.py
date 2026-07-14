@@ -48,12 +48,13 @@ _TICKERS_PATH = _ROOT / "db/tickers/tickers.parquet"
 _BOND_ETF_PATTERN = re.compile(r"^00\d{3}[BD]$")
 
 # 現金增資股權批次代號（例如「中砂一」15601、「和大四」15364、KY股的
-# 「鮮活果汁一KY」12561、「廣華二KY」13382），名稱結尾是中文數字一~十
-# （KY股則是中文數字接在"KY"前面），代號都是5碼以上（2026-07-14 實測：
-# securityType="02"，historical/candles 一律404，跟正常股票的
+# 「鮮活果汁一KY」12561、「廣華二KY」13382、永續特別股批次的「台泥一永」
+# 11011、「遠東新E1永」140202），名稱結尾是中文數字一~十、中文數字接在
+# "KY"前面、或結尾是"永"，代號都是5碼以上（2026-07-14 實測：
+# securityType="02"/"03"，historical/candles 一律404，跟正常股票的
 # securityType="01"/特別股"04"/ETF"24"不同）。只限代號5碼以上，避免誤殺
 # 「統一」(1216)這種名稱剛好結尾是中文數字、但本身是正常4碼股票的公司。
-_TRANCHE_SUFFIX = set("一二三四五六七八九十")
+_TRANCHE_SUFFIX = set("一二三四五六七八九十") | {"永"}
 _TRANCHE_KY_PATTERN = re.compile(r"[一二三四五六七八九十]KY$")
 
 
