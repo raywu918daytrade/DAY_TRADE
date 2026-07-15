@@ -21,7 +21,7 @@
     - fubon/subscribe_list.py 在這份清單上再做均量排序/WebSocket分組
     - data/day_data_loader.py、data/m1_data_loader.py 的訓練資料母體
       （經 fubon/subscribe_list.py::all_normal_stocks()）
-    - scripts/push_day_to_hf.py、push_m1_to_hf.py、backfill_inference_log.py
+    - scripts/push_day_to_hf.py、push_m1_to_hf.py
 
 主要函式：
     update_tickers()  每日開盤前呼叫一次，更新並回傳清單

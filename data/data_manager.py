@@ -2,13 +2,12 @@
 DataManager：統一三個交易時段的資料載入介面。
 
 Phase（時段）：
-    PRE_MARKET  盤前  — 載入 D1 日K + 均量過濾（HF Hub 或本機）
+    PRE_MARKET  盤前  — 載入 D1 日K + 均量過濾（本機 db/fugle_day/）
     IN_MARKET   盤中  — M1 由 fubon/marketdata_ws.py 的富邦 WebSocket 推送，D1 已在盤前載好
     POST_MARKET 盤後  — 持續收 WebSocket 資料到收盤，D1 不變
 
 上層規則：
-    - 不直接判斷 HF Hub vs 本機路徑，一律呼叫 load_d1(stocks)
-    - 盤前啟動和每日 06:00 refresh 呼叫同一個函式，不再各自寫 if/else
+    - 盤前啟動和每日 06:00 refresh 呼叫同一個函式 load_d1(stocks)，不再各自寫 if/else
 """
 
 from __future__ import annotations
@@ -17,8 +16,6 @@ import os
 from enum import Enum
 
 import pandas as pd
-
-_HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
 
 
 class Phase(Enum):
@@ -31,70 +28,14 @@ def load_d1(stocks: set) -> tuple[pd.DataFrame, set]:
     """
     載入日K並做均量過濾，回傳 (day_df, filtered_stocks)。
 
-    資料來源自動判斷：
-        有 HF_REPO_ID → HF Hub 最近 2 個月月份檔
-        沒有          → 本機 db/fugle_day/
+    目前固定讀本機 db/fugle_day/。
 
     盤前啟動和每日 06:00 refresh 都呼叫這一個函式。
     """
     if not stocks:
         return pd.DataFrame(), set()
 
-    if _HF_REPO_ID:
-        return _load_d1_from_hf(stocks)
-    else:
-        return _load_d1_local(stocks)
-
-
-# ── 內部：HF Hub ──────────────────────────────────────────────────────────────
-
-def _load_d1_from_hf(stocks: set) -> tuple[pd.DataFrame, set]:
-    import re as _re
-    import pyarrow.parquet as pq
-    import pyarrow as pa
-    from huggingface_hub import HfApi, hf_hub_download
-
-    months_to_load = int(os.environ.get("DAY_MONTHS_TO_LOAD", "2"))
-    token = os.environ.get("HF_TOKEN") or None
-
-    day_files = sorted([
-        f for f in HfApi().list_repo_files(
-            repo_id=_HF_REPO_ID, repo_type="dataset", token=token)
-        if _re.match(r"day_trade/day/\d{4}_\d+\.parquet$", f)
-    ])
-    if not day_files:
-        print("  [D1] HF Hub 無月份日K檔", flush=True)
-        return pd.DataFrame(), set()
-
-    targets = day_files[-months_to_load:]
-    paths = []
-    for fname in targets:
-        p = hf_hub_download(repo_id=_HF_REPO_ID, filename=fname,
-                            repo_type="dataset", token=token)
-        print(f"  [D1] → {p}", flush=True)
-        paths.append(p)
-
-    # 第 1 次：只讀 volume 欄位做均量過濾
-    tables_vol = [pq.read_table(p, columns=["stock_id", "date", "volume"]) for p in paths]
-    df_vol = pa.concat_tables(tables_vol).to_pandas()
-    del tables_vol
-    top = set(_volume_filter(stocks, df_vol))
-    del df_vol
-    if not top:
-        return pd.DataFrame(), set()
-
-    # 第 2 次：只讀過濾後股票的完整資料。額外帶上 0050——它不是當沖候選股
-    # （update_tickers() 用 type=EQUITY 過濾，ETF 本來就不會進 _day_trade_stocks），
-    # 但 rally 策略的 idx_day_* 特徵（大盤日K相對強弱）需要它，回傳的候選股集合
-    # top 仍然不含 0050，不會被當成可下單標的。
-    read_ids = top | {"0050"}
-    tables = [pq.read_table(p, filters=[("stock_id", "in", list(read_ids))]) for p in paths]
-    df = pa.concat_tables(tables).to_pandas()
-    del tables
-    df["date"] = pd.to_datetime(df["date"])
-    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
-    print(f"  [D1] {len(df):,} 筆，{df['stock_id'].nunique():,} 支（均量過濾後 + 0050）", flush=True)
-    return df, top
+    return _load_d1_local(stocks)
 
 
 # ── 內部：本機 ────────────────────────────────────────────────────────────────
