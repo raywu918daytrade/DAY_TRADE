@@ -247,7 +247,7 @@ def compute_m3(m1: pd.DataFrame) -> pd.DataFrame:
     從 1 分K 現算 rolling-3 OHLCV（量用 sum）。
 
     輸入需先有 stock_id / date / day_date 欄位並依 stock_id、date 排序。
-    train/live 共用同一份邏輯：scripts/build_m3_m5.py 批次預算 db/m3/ 給訓練用
+    train/live 共用同一份邏輯：data/build_m3_m5.py 批次預算 db/m3/ 給訓練用
     （load_features() 走 cache，走的是這支函式批次算好存檔的結果）；
     predict_live() 則是直接對當天的 m1_live 呼叫這支函式現算——db/m3/ 是批次
     產物，不包含「今天」的資料，即時推論不能拿它 merge，否則 m3_* 全部變 NaN。
@@ -319,7 +319,7 @@ def make_features(
     m1["m1_atr"] = _degroup(g_day["_tr"].rolling(14, min_periods=14).mean(), m1.index) / day_open
 
     # ── 載入預先聚合的 db/m3、db/m5（訓練走 cache，效能考量）───────────
-    # db/m3、db/m5 是批次預算（scripts/build_m3_m5.py 從 db/m1/ 算好存檔），
+    # db/m3、db/m5 是批次預算（data/build_m3_m5.py 從 db/m1/ 算好存檔），
     # 只有訓練用的完整歷史 m1 才會跟它對得上。即時推論的 m1（當天 m1_live）
     # 不在這個 cache 裡，呼叫端必須自己用 compute_m3()/compute_m5() 現算後
     # 明確傳進來，不能依賴這裡的 fallback，否則 merge 完全對不上、m3_*/m5_*

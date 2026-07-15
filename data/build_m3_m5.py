@@ -7,8 +7,8 @@
 每分鐘一筆（rolling 聚合），不是獨立 K 線週期。
 
 用法：
-  python scripts/build_m3_m5.py              # 完整重建（全部月份）
-  python scripts/build_m3_m5.py --incremental # 只重建比 m1 舊的月份
+  python -m data.build_m3_m5              # 完整重建（全部月份）
+  python -m data.build_m3_m5 --incremental # 只重建比 m1 舊的月份
 """
 
 import argparse

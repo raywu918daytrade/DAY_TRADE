@@ -17,8 +17,6 @@ ReDoc      : http://localhost:8000/redoc
     GET  /trades                     下方成交記錄
     GET  /api/inference/history/dates        可回放日期清單（HF Hub 上實際有資料的日期）
     GET  /api/inference/history      每分鐘推論歷史記錄（給前端分析用，今日記憶體/過去日期 HF Hub）
-    GET  /api/inference/evaluation           推論訊號事後驗證明細（Triple Barrier 逐筆勝負）
-    GET  /api/inference/evaluation/summary   推論訊號事後驗證摘要（勝率/損益/高信心度股票排行）
     WS   /ws                         即時推送
 """
 
@@ -183,34 +181,6 @@ class InferenceRecord(BaseModel):
     price: Optional[float] = None
     direction: str = "buy"
     is_signal: bool = False
-
-
-class InferenceEvalRecord(BaseModel):
-    date: str
-    time: str
-    stock_id: str
-    name: str
-    proba: float
-    entry_price: float
-    outcome: str  # win / loss / timeout_win / timeout_loss / unresolved
-    exit_price: Optional[float] = None
-    pnl_pct: Optional[float] = None
-    bars_to_exit: Optional[int] = None
-
-
-class InferenceEvalSummary(BaseModel):
-    date: str
-    total_signals: int
-    resolved_signals: int
-    unresolved_signals: int
-    win_count: int
-    loss_count: int
-    win_rate: Optional[float] = None
-    avg_pnl_pct: Optional[float] = None
-    total_pnl_pct: Optional[float] = None
-    by_confidence: list[dict] = []
-    by_time: list[dict] = []
-    top_signal_stocks: list[dict] = []
 
 
 # ── 使用者設定（settings.json + HF Hub 備份，覆蓋 .env 預設值）─────────────
@@ -594,112 +564,6 @@ def _load_inference_day(date_str: str):
     while len(_inference_hf_cache) > _INFERENCE_HF_CACHE_MAX:
         _inference_hf_cache.popitem(last=False)
     return df
-
-
-# ── 推論訊號事後驗證（scripts/evaluate_inference_log.py 產出，純讀取，不做即時計算）───
-
-_HF_EVAL_PREFIX = "day_trade/inference_eval"
-_eval_hf_cache: _OrderedDict = _OrderedDict()
-_EVAL_HF_CACHE_MAX = 14
-
-
-def _load_inference_eval_day(date_str: str):
-    """取得指定日期的推論驗證明細 DataFrame（HF Hub，含 LRU cache）。
-    這份資料是收盤後用 scripts/evaluate_inference_log.py 事後算好才上傳的，
-    沒有像 _load_inference_day 那樣的「今日走記憶體」分支。
-    """
-    import pandas as pd
-
-    if date_str in _eval_hf_cache:
-        _eval_hf_cache.move_to_end(date_str)
-        return _eval_hf_cache[date_str]
-
-    repo_id = _os.environ.get("HF_REPO_ID", "")
-    token = _os.environ.get("HF_TOKEN", "") or None
-    df = pd.DataFrame()
-    if repo_id:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            local = hf_hub_download(
-                repo_id=repo_id,
-                filename=f"{_HF_EVAL_PREFIX}/{date_str}.parquet",
-                repo_type="dataset",
-                token=token,
-            )
-            df = pd.read_parquet(local)
-        except Exception as e:
-            print(f"[推論驗證] {date_str} HF Hub 無資料: {e}", flush=True)
-
-    _eval_hf_cache[date_str] = df
-    _eval_hf_cache.move_to_end(date_str)
-    while len(_eval_hf_cache) > _EVAL_HF_CACHE_MAX:
-        _eval_hf_cache.popitem(last=False)
-    return df
-
-
-def _build_eval_summary(df) -> dict:
-    """從逐筆驗證明細算出摘要統計：整體勝率/損益、依信心度分組勝率、高頻訊號股票排行"""
-    total = len(df)
-    resolved = df[df["outcome"] != "unresolved"]
-    win_mask = resolved["outcome"].isin(["win", "timeout_win"])
-    win_count = int(win_mask.sum())
-    loss_count = int(len(resolved) - win_count)
-    win_rate = round(win_count / len(resolved) * 100, 1) if len(resolved) else None
-    avg_pnl = round(resolved["pnl_pct"].mean(), 4) if len(resolved) else None
-    total_pnl = round(resolved["pnl_pct"].sum(), 4) if len(resolved) else None
-
-    by_confidence = []
-    for min_proba in (0.5, 0.55, 0.6, 0.7, 0.8, 0.85, 0.9):
-        subset = resolved[resolved["proba"] >= min_proba]
-        if subset.empty:
-            continue
-        sub_win = int(subset["outcome"].isin(["win", "timeout_win"]).sum())
-        by_confidence.append({
-            "min_proba": min_proba,
-            "count": int(len(subset)),
-            "win_rate": round(sub_win / len(subset) * 100, 1),
-        })
-
-    top_signal_stocks = []
-    if not df.empty:
-        grouped = df.groupby(["stock_id", "name"]).agg(
-            signal_count=("proba", "size"),
-            avg_proba=("proba", "mean"),
-        ).reset_index()
-        win_by_stock = resolved.groupby("stock_id")["outcome"].apply(
-            lambda s: round(s.isin(["win", "timeout_win"]).sum() / len(s) * 100, 1) if len(s) else None
-        )
-        grouped["win_rate"] = grouped["stock_id"].map(win_by_stock)
-        grouped["avg_proba"] = grouped["avg_proba"].round(4)
-        grouped = grouped.sort_values(["signal_count", "avg_proba"], ascending=False).head(10)
-        top_signal_stocks = grouped.astype(object).where(grouped.notna(), None).to_dict("records")
-
-    # 依分鐘分組勝率/訊號數（每分鐘一筆，涵蓋當天完整訊號時段，不只 09:00~10:00 主要交易時段）
-    by_time = []
-    if not resolved.empty:
-        for minute, subset in resolved.groupby("time"):
-            sub_win = int(subset["outcome"].isin(["win", "timeout_win"]).sum())
-            by_time.append({
-                "time": minute,
-                "count": int(len(subset)),
-                "win_rate": round(sub_win / len(subset) * 100, 1),
-            })
-        by_time.sort(key=lambda x: x["time"])
-
-    return {
-        "total_signals": total,
-        "resolved_signals": int(len(resolved)),
-        "unresolved_signals": int(total - len(resolved)),
-        "win_count": win_count,
-        "loss_count": loss_count,
-        "win_rate": win_rate,
-        "avg_pnl_pct": avg_pnl,
-        "total_pnl_pct": total_pnl,
-        "by_confidence": by_confidence,
-        "by_time": by_time,
-        "top_signal_stocks": top_signal_stocks,
-    }
 
 
 def push_signals(minute_str: str, signals: list, strategy: str = ""):
@@ -1275,81 +1139,6 @@ def inference_history(
         flush=True,
     )
     return df.to_dict("records")
-
-
-@app.get(
-    "/api/inference/evaluation",
-    response_model=list[InferenceEvalRecord],
-    tags=["分析"],
-    summary="推論訊號事後驗證明細（Triple Barrier 逐筆勝負，給前端分析使用）",
-)
-def inference_evaluation(
-    date: str,
-    stock_id: Optional[str] = None,
-    outcome: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    limit: int = 5000,
-):
-    """date: 必填，格式 YYYY-MM-DD，須是已執行過 scripts/evaluate_inference_log.py 的日期。
-    stock_id: 選填，只回傳單一股票。
-    outcome: 選填，win / loss / timeout_win / timeout_loss / unresolved。
-    start_time / end_time: 選填，格式 HH:MM，篩選時間區間（含頭尾），例如 09:00~09:30。
-    limit: 回傳筆數上限，預設 5000，依 time 排序後截斷。
-    """
-    df = _load_inference_eval_day(date)
-    if df.empty:
-        return []
-    if stock_id:
-        df = df[df["stock_id"] == stock_id]
-    if outcome:
-        df = df[df["outcome"] == outcome]
-    if start_time:
-        df = df[df["time"] >= start_time]
-    if end_time:
-        df = df[df["time"] <= end_time]
-    df = df.sort_values(["time", "stock_id"]).head(limit)
-    df = df.astype(object).where(df.notna(), None)
-    print(
-        f"[GET /api/inference/evaluation] date={date} stock_id={stock_id} outcome={outcome} "
-        f"start_time={start_time} end_time={end_time} 回傳 {len(df)} 筆",
-        flush=True,
-    )
-    return df.to_dict("records")
-
-
-@app.get(
-    "/api/inference/evaluation/summary",
-    response_model=InferenceEvalSummary,
-    tags=["分析"],
-    summary="推論訊號事後驗證摘要（勝率/損益/高信心度股票排行，給前端分析使用）",
-)
-def inference_evaluation_summary(date: str, start_time: Optional[str] = None, end_time: Optional[str] = None):
-    """date: 必填，格式 YYYY-MM-DD，須是已執行過 scripts/evaluate_inference_log.py 的日期。
-    start_time / end_time: 選填，格式 HH:MM，只計算這段時間內的訊號（例如只看主要交易時段 09:00~10:00）；
-    不帶則計算當天完整訊號時段。
-    """
-    df = _load_inference_eval_day(date)
-    if df.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=f"找不到 {date} 的推論驗證資料，請先執行 scripts/evaluate_inference_log.py --date {date}",
-        )
-    if start_time:
-        df = df[df["time"] >= start_time]
-    if end_time:
-        df = df[df["time"] <= end_time]
-    if df.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=f"{date} 在 {start_time or '00:00'}~{end_time or '23:59'} 這段時間內沒有任何訊號",
-        )
-    summary = _build_eval_summary(df)
-    print(
-        f"[GET /api/inference/evaluation/summary] date={date} start_time={start_time} end_time={end_time} 回傳摘要",
-        flush=True,
-    )
-    return {"date": date, **summary}
 
 
 @app.get("/failed_orders", tags=["成交"], summary="今日失敗委託（含錯誤訊息）")

@@ -524,7 +524,7 @@ def make_features(
     m1 = m1.drop(columns=["_tr", "_cum_vol", "_pv", "_cum_pv", "_hourly_tr_baseline"])
 
     # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷 ─────────────
-    # db/m3、db/m5 是批次預算（scripts/build_m3_m5.py 從 db/m1/ 算好存檔，
+    # db/m3、db/m5 是批次預算（data/build_m3_m5.py 從 db/m1/ 算好存檔，
     # 用的是 strategy/rally/features.py 的 compute_m3()/compute_m5()），
     # 只有訓練用的完整歷史 m1 才會跟它對得上，即時推論要呼叫端傳 m3/m5 進來。
     if m3 is None:

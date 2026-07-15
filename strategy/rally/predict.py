@@ -129,7 +129,7 @@ def predict_live(
             day["date"] = pd.to_datetime(day["date"])
             day = day.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
-    # m3/m5 現算：db/m3、db/m5 是批次預算（scripts/build_m3_m5.py 從歷史
+    # m3/m5 現算：db/m3、db/m5 是批次預算（data/build_m3_m5.py 從歷史
     # db/m1/ 算好存檔），不包含「今天」的資料。make_features() 若沒收到
     # m3/m5 會 fallback 去讀那兩個批次 cache，merge 會完全對不上、
     # m3_*/m5_*（連帶靠 m5_ret 算出來的 breakout_signal）整批變 NaN。
