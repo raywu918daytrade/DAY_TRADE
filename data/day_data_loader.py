@@ -10,8 +10,9 @@ Fugle + 富邦同時下載：
     429 交給 Retry-After 被動重試）；富邦那一半用單一執行緒依序下載（比照
     data/m1_data_loader.py 的作法，1.05秒/支留在 60次/分鐘以內）。富邦
     historical/candles 不帶 timeframe 就是日K，from/to 用法跟 Fugle 一致
-    （同一套底層 fugle_marketdata 元件，2026-07-13 實測過），SDK 呼叫都透過
-    fubon/fubon_api.py，這裡不直接碰 fubon_neo。
+    （同一套底層 fugle_marketdata 元件，2026-07-13 實測過），富邦 SDK 呼叫都透過
+    fubon/fubon_api.py，Fugle REST 呼叫都透過 fugle/fugle_api.py，這裡不直接
+    碰 fubon_neo 或組 Fugle 的 URL/header。
 
 主要函式：
     update_day(start_date, stocks, workers)
@@ -33,14 +34,13 @@ import pyarrow.dataset as ds
 import requests
 from dotenv import load_dotenv
 
+from fugle import fugle_api
+
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 
-token = os.environ.get("FUGLE", "")
-
-_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 _FLAG_PATH = _ROOT / "db/fugle_day_flags/day_flag.parquet"
 
 # _save_day()/_update_flag() 都是「讀舊檔→merge→寫回去」，Fugle 執行緒池、富邦
@@ -95,18 +95,10 @@ def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     _download_day() 的年度迴圈會被中斷，之後年份（明明有資料）也不會再嘗試，
     整支股票這次直接算失敗。例外只保留給真正的請求失敗（限流、逾時、其他
     錯誤）。"""
-    headers = {"X-API-KEY": token}
-    params = {
-        "from": from_date,
-        "to": to_date,
-        "fields": "open,high,low,close,volume",
-        "sort": "asc",
-        "adjusted": "true",
-    }
-    r = requests.get(f"{_BASE_URL}/historical/candles/{stock_id}", params=params, headers=headers, timeout=10)
-    if r.status_code == 429:
-        time.sleep(float(r.headers.get("Retry-After", 60)) + 1)
-        r = requests.get(f"{_BASE_URL}/historical/candles/{stock_id}", params=params, headers=headers, timeout=10)
+    r = fugle_api.historical_candles(
+        stock_id,
+        **{"from": from_date, "to": to_date, "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"},
+    )
     if r.status_code == 404:
         return pd.DataFrame()
     r.raise_for_status()
@@ -297,7 +289,7 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     （各自獨立 rate limit）。
     workers: Fugle 那一半的並發執行緒數（預設 5，約 5 分鐘下載 1500 支）
     """
-    if not token:
+    if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
 
     now = datetime.now(_TW)

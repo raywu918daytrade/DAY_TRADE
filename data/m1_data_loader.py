@@ -15,7 +15,8 @@ Fugle + 富邦同時下載：
     兩邊的 historical/candles 都已實測確認本身就含「今天」的資料（2026-07-13
     20:30 實測，update_m1.yml 排程在台北18:00跑，遠晚於13:30收盤），一支
     股票各自只需要呼叫一次，不用再另外呼叫 intraday/candles 補今天。
-    富邦 SDK 呼叫都透過 fubon/fubon_api.py，這裡不直接碰 fubon_neo。
+    富邦 SDK 呼叫都透過 fubon/fubon_api.py，Fugle REST 呼叫都透過
+    fugle/fugle_api.py，這裡不直接碰 fubon_neo 或組 Fugle 的 URL/header。
 
 主要函式：
     update_m1(stocks)
@@ -32,14 +33,13 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from fugle import fugle_api
+
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 
-token = os.environ.get("FUGLE", "")
-
-_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 _FLAG_PATH = _ROOT / "db/m1_flags/m1_flag.parquet"
 
 # _save_m1()/_update_flag() 都是「讀舊檔→merge→寫回去」，Fugle、富邦兩條
@@ -71,12 +71,9 @@ def _download_m1(stock_id: str) -> pd.DataFrame:
     當天13:30收盤），不是舊註解講的「僅到昨日」——update_m1.yml 排程在台北
     18:00 跑，永遠晚於收盤，所以不需要再另外呼叫 intraday/candles 補今天。
     """
-    params = {"timeframe": "1", "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"}
-    headers = {"X-API-KEY": token}
-    r = requests.get(f"{_BASE_URL}/historical/candles/{stock_id}", params=params, headers=headers, timeout=10)
-    if r.status_code == 429:
-        time.sleep(float(r.headers.get("Retry-After", 60)) + 1)
-        r = requests.get(f"{_BASE_URL}/historical/candles/{stock_id}", params=params, headers=headers, timeout=10)
+    r = fugle_api.historical_candles(
+        stock_id, timeframe="1", fields="open,high,low,close,volume", sort="asc", adjusted="true"
+    )
     r.raise_for_status()
     data = r.json()
     if "data" not in data or not data["data"]:
@@ -210,7 +207,7 @@ def _update_m1_fubon(stocks: list, date_str: str, sdk):
 def update_m1(stocks: list = None):
     """1分鐘K線，flag避免同日重複下載。待下載清單拆一半，Fugle 跟富邦
     同時下載（各自獨立 rate limit），約可把時間壓到單一資料源的一半。"""
-    if not token:
+    if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
 
     now = datetime.now(_TW)
