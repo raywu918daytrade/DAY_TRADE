@@ -148,12 +148,16 @@ def _download_m1_fubon(sdk, stock_id: str) -> pd.DataFrame:
 
 
 def _all_stocks() -> list:
-    """股票母體，統一走富邦（跟即時交易的候選股同一個資料源，見
-    fubon/subscribe_list.py::all_normal_stocks()），不再用 Fugle 的清單。
-    母體來源改了不影響下載邏輯本身，Fugle/富邦兩邊還是各自下載一半。"""
-    from fubon.subscribe_list import all_normal_stocks
+    """股票母體：讀 db/tickers/tickers.parquet 現有內容（見
+    fubon/intraday_tickers.py::load_tickers()），不觸發即時富邦API重新查詢——
+    這裡要的是「現在 db/tickers 裡有記錄的全部股票」，不是「這一刻盤中報的
+    最新清單」，兩者通常一致，但即時查詢還要多一次富邦API往返、且非盤中會
+    回傳空資料，沒必要。db/tickers 由 fubon/intraday_tickers.py::update_tickers()
+    每天更新一次（見 main/premarket.py::refresh_tickers()）。母體來源改了不
+    影響下載邏輯本身，Fugle/富邦兩邊還是各自下載一半。"""
+    from fubon.intraday_tickers import load_tickers
 
-    return all_normal_stocks()
+    return load_tickers()["stock_id"].tolist()
 
 
 def _get_done_stocks(date_str: str) -> set:

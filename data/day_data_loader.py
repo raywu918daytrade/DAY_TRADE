@@ -88,7 +88,13 @@ def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
 
 
 def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
-    """單次請求（區間 < 1 年）"""
+    """單次請求（區間 < 1 年）。404 代表這支股票在這段區間還沒有資料（例如
+    尚未上市／尚未開始交易），回傳空 DataFrame，不當例外處理——2026-07-15
+    實測：對現在才被列入候選清單、但更早以前還沒上市的股票回補歷史時很常見
+    （例如某支股票2016年404、2023年正常有資料），如果讓它往上拋例外，
+    _download_day() 的年度迴圈會被中斷，之後年份（明明有資料）也不會再嘗試，
+    整支股票這次直接算失敗。例外只保留給真正的請求失敗（限流、逾時、其他
+    錯誤）。"""
     headers = {"X-API-KEY": token}
     params = {
         "from": from_date,
@@ -101,6 +107,8 @@ def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     if r.status_code == 429:
         time.sleep(float(r.headers.get("Retry-After", 60)) + 1)
         r = requests.get(f"{_BASE_URL}/historical/candles/{stock_id}", params=params, headers=headers, timeout=10)
+    if r.status_code == 404:
+        return pd.DataFrame()
     r.raise_for_status()
     data = r.json()
     if "data" not in data or not data["data"]:
@@ -111,10 +119,12 @@ def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     return df
 
 
-def _download_day(stock_id: str, start_date: str) -> pd.DataFrame:
-    """自動切割成年度區間（Fugle 限制每次 < 1 年）"""
+def _download_day(stock_id: str, start_date: str, end_date: str | None = None) -> pd.DataFrame:
+    """自動切割成年度區間（Fugle 限制每次 < 1 年）。end_date 選填，預設到今天；
+    data/backfill_day_history.py 回補歷史缺口時會指定成「現有資料最早日期的
+    前一天」，避免重複下載已經有的部分。"""
     now = datetime.now(_TW)
-    end = now.date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else now.date()
     cur = datetime.strptime(start_date, "%Y-%m-%d").date()
     chunks = []
     while cur <= end:
@@ -123,19 +133,30 @@ def _download_day(stock_id: str, start_date: str) -> pd.DataFrame:
         if not df.empty:
             chunks.append(df)
         cur = chunk_end + timedelta(days=1)
+        if cur <= end:
+            time.sleep(0.2)  # 2026-07-15：跨好幾年會切成好幾個請求，年度區間之間留點間隔，不要瞬間連發
     return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
 def _fetch_year_fubon(sdk, stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     """單次請求（區間 < 1 年），富邦 historical/candles 不帶 timeframe 就是日K，
-    from/to 用法跟 Fugle 一致（見 fubon/trade_api.py::historical_candles()）。"""
+    from/to 用法跟 Fugle 一致（見 fubon/trade_api.py::historical_candles()）。
+
+    這支股票在這段區間還沒有資料時（例如尚未上市），把 SDK 拋出的例外當成
+    「這段沒資料」處理、回傳空 DataFrame，不往上拋——理由同 _fetch_year() 的
+    說明，避免中斷 _download_day_fubon() 的年度迴圈，讓後面明明有資料的年份
+    也抓不到。"""
     from fubon import trade_api
 
-    bars = trade_api.historical_candles(
-        sdk, stock_id, **{"from": from_date, "to": to_date,
-                          "fields": "open,high,low,close,volume",
-                          "sort": "asc", "adjusted": "true"},
-    )
+    try:
+        bars = trade_api.historical_candles(
+            sdk,
+            stock_id,
+            **{"from": from_date, "to": to_date, "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"},
+        )
+    except Exception as e:
+        print(f"    {stock_id} {from_date}~{to_date} 富邦查詢失敗（視為這段沒資料）: {e}")
+        return pd.DataFrame()
     if not bars:
         return pd.DataFrame()
     df = pd.DataFrame(bars)
@@ -144,10 +165,10 @@ def _fetch_year_fubon(sdk, stock_id: str, from_date: str, to_date: str) -> pd.Da
     return df
 
 
-def _download_day_fubon(sdk, stock_id: str, start_date: str) -> pd.DataFrame:
-    """自動切割成年度區間，比照 _download_day()。"""
+def _download_day_fubon(sdk, stock_id: str, start_date: str, end_date: str | None = None) -> pd.DataFrame:
+    """自動切割成年度區間，比照 _download_day()。end_date 選填，用法同 _download_day()。"""
     now = datetime.now(_TW)
-    end = now.date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else now.date()
     cur = datetime.strptime(start_date, "%Y-%m-%d").date()
     chunks = []
     while cur <= end:
@@ -156,6 +177,8 @@ def _download_day_fubon(sdk, stock_id: str, start_date: str) -> pd.DataFrame:
         if not df.empty:
             chunks.append(df)
         cur = chunk_end + timedelta(days=1)
+        if cur <= end:
+            time.sleep(1.05)  # 2026-07-15：跟 _update_day_fubon() 既有的請求間隔一致，維持 60 req/min 以內
     return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
@@ -199,11 +222,15 @@ def _update_flag(stock_id: str, date_str: str):
 
 
 def _all_stocks() -> list:
-    """股票母體，統一走富邦（跟即時交易的候選股同一個資料源，見
-    fubon/subscribe_list.py::all_normal_stocks()），不再用 Fugle 的清單。"""
-    from fubon.subscribe_list import all_normal_stocks
+    """股票母體：讀 db/tickers/tickers.parquet 現有內容（見
+    fubon/intraday_tickers.py::load_tickers()），不觸發即時富邦API重新查詢——
+    這裡要的是「現在 db/tickers 裡有記錄的全部股票」，不是「這一刻盤中報的
+    最新清單」，兩者通常一致，但即時查詢還要多一次富邦API往返、且非盤中會
+    回傳空資料，沒必要。db/tickers 由 fubon/intraday_tickers.py::update_tickers()
+    每天更新一次（見 main/premarket.py::refresh_tickers()）。"""
+    from fubon.intraday_tickers import load_tickers
 
-    return all_normal_stocks()
+    return load_tickers()["stock_id"].tolist()
 
 
 def _get_done_stocks(date_str: str) -> set:
@@ -287,8 +314,10 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
 
     half = len(wait_stocks) // 2
     fugle_half, fubon_half = wait_stocks[:half], wait_stocks[half:]
-    print(f"start_date={start_date}，Fugle {len(fugle_half)} 支（{workers} 並發）、"
-          f"富邦 {len(fubon_half)} 支，同時下載...")
+    print(
+        f"start_date={start_date}，Fugle {len(fugle_half)} 支（{workers} 並發）、"
+        f"富邦 {len(fubon_half)} 支，同時下載..."
+    )
 
     from fubon import trade_api
 
