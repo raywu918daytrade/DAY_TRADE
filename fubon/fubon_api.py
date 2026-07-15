@@ -19,7 +19,7 @@ load_dotenv(Path(__file__).parents[1] / ".env", override=True)
 def _resolve_cert_path() -> str:
     """憑證路徑：.p12 檔案不進版控，一律用 FUBON_CERT_B64（憑證 base64 編碼）
     在執行期寫一個暫存檔，本機、雲端（Render）都走同一條路，比照
-    trade/trade_api.py 對永豐 .pfx 的處理方式。
+    sinopac/sinopac_api.py 對永豐 .pfx 的處理方式。
     產生 FUBON_CERT_B64：base64 -i 憑證.p12 | tr -d '\\n'
     """
     cert_data = base64.b64decode(os.environ["FUBON_CERT_B64"])

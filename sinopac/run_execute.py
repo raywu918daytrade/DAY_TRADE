@@ -10,16 +10,16 @@ if str(Path(__file__).parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
-    from trade import trade_api  # 相對於項目根目錄
+    from sinopac import sinopac_api as trade_api  # 相對於項目根目錄
 except (ImportError, ModuleNotFoundError):
     try:
-        import trade_api  # 相對於 trade/ 目錄
+        import sinopac_api as trade_api  # 相對於 sinopac/ 目錄
     except (ImportError, ModuleNotFoundError) as e:
         print(f"[ERROR] 永豐模組無法載入: {e}", flush=True)
         trade_api = None
 
 try:
-    from trade.broker_client import BrokerClient
+    from sinopac.broker_client import BrokerClient
 except (ImportError, ModuleNotFoundError):
     try:
         from broker_client import BrokerClient

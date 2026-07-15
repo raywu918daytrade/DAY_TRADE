@@ -11,7 +11,7 @@ Fugle + 富邦同時下載：
     data/m1_data_loader.py 的作法，1.05秒/支留在 60次/分鐘以內）。富邦
     historical/candles 不帶 timeframe 就是日K，from/to 用法跟 Fugle 一致
     （同一套底層 fugle_marketdata 元件，2026-07-13 實測過），SDK 呼叫都透過
-    fubon/trade_api.py，這裡不直接碰 fubon_neo。
+    fubon/fubon_api.py，這裡不直接碰 fubon_neo。
 
 主要函式：
     update_day(start_date, stocks, workers)
@@ -140,13 +140,13 @@ def _download_day(stock_id: str, start_date: str, end_date: str | None = None) -
 
 def _fetch_year_fubon(sdk, stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     """單次請求（區間 < 1 年），富邦 historical/candles 不帶 timeframe 就是日K，
-    from/to 用法跟 Fugle 一致（見 fubon/trade_api.py::historical_candles()）。
+    from/to 用法跟 Fugle 一致（見 fubon/fubon_api.py::historical_candles()）。
 
     這支股票在這段區間還沒有資料時（例如尚未上市），把 SDK 拋出的例外當成
     「這段沒資料」處理、回傳空 DataFrame，不往上拋——理由同 _fetch_year() 的
     說明，避免中斷 _download_day_fubon() 的年度迴圈，讓後面明明有資料的年份
     也抓不到。"""
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     try:
         bars = trade_api.historical_candles(
@@ -319,7 +319,7 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
         f"富邦 {len(fubon_half)} 支，同時下載..."
     )
 
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)

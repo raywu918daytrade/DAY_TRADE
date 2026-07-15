@@ -48,7 +48,7 @@ from dotenv import load_dotenv
 
 from data.m1_utils import _atomic_save, _parse_rest_bars
 from data.query import load_m1_live
-from fubon import trade_api
+from fubon import fubon_api as trade_api
 from fubon.subscribe_list import load_subscribe_batches
 
 try:

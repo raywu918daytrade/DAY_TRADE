@@ -4,7 +4,7 @@ FinMind 分K 補齊 — 全部股票，不限前N支。
 薄wrapper，核心邏輯全部在 finmind/backfill_history.py，這支只是固定好預設
 範圍（2019-01 ~ 2026-05，FinMind TaiwanStockKBar 資料起點到現在），不帶
 top_n_by_volume，補完整股票母體。跟 finmind/backfill_top1000.py 是分開的
-兩支腳本，用同一套續傳邏輯（見 finmind/api.py::_existing_pairs()），互不
+兩支腳本，用同一套續傳邏輯（見 finmind/finmind_api.py::_existing_pairs()），互不
 衝突：backfill_top1000.py 先跑過的 (股票,日期) 組合，這支執行時會自動跳過，
 只補剩下沒補到的股票，不會重複下載。
 

@@ -43,7 +43,7 @@ from data.day_data_loader import _ROOT, _all_stocks, _download_day, _download_da
 
 _TW = timezone(timedelta(hours=8))
 
-# 加時間戳記 + 強制 flush（比照 finmind/api.py 同樣的 monkey-patch 做法）。
+# 加時間戳記 + 強制 flush（比照 finmind/finmind_api.py 同樣的 monkey-patch 做法）。
 # 這支腳本要跑很久（背景 nohup），Python 對非終端機輸出預設 block-buffered，
 # 不這樣做的話 log 檔案會長時間看起來是空的，即使其實在正常運作。
 _orig_print = _builtins.print
@@ -161,7 +161,7 @@ def backfill_day_history(
     fugle_targets, fubon_targets = targets[:split], targets[split:]
     print(f"Fugle {len(fugle_targets)} 支（{workers} 並發）、富邦 {len(fubon_targets)} 支，同時下載...")
 
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)

@@ -4,7 +4,7 @@ FinMind 分K 補齊 — 只補前1000支（依當月平均日成交量排序）�
 薄wrapper，核心邏輯全部在 finmind/backfill_history.py，這支只是固定好範圍跟
 top_n_by_volume=1000，不用每次執行都記得帶對參數。跟 finmind/backfill_all.py
 是分開的兩支腳本，範圍/股票數不同，但用同一套續傳邏輯（見
-finmind/api.py::_existing_pairs()），互不衝突：這支跑過的 (股票,日期) 組合，
+finmind/finmind_api.py::_existing_pairs()），互不衝突：這支跑過的 (股票,日期) 組合，
 backfill_all.py 之後執行會自動跳過，只補剩下的股票，不會重複下載。
 
 用 run_forever()（不是 backfill_history()）：撞到400（token無效）或402

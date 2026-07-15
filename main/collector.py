@@ -10,7 +10,7 @@ Fugle 日內行情 API 官方就是 60次/分鐘，本來就跟不上「每分�
 當備援意義不大，維護它本身也有成本（不同資料源、獨立的 bug 歷史）。
 真正該防的是「我們自己的富邦 WebSocket 程式碼出包」（2026-07-13 實際發生
 過一次），不是換一個更慢的資料源，而是用富邦自己的 REST intraday（
-300次/分鐘，見 fubon/trade_api.py::intraday_candles()）當備援——這個還沒
+300次/分鐘，見 fubon/fubon_api.py::intraday_candles()）當備援——這個還沒
 做，是已知的 TODO（見 memory）。
 """
 import os

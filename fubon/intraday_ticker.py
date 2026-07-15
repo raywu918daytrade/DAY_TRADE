@@ -1,5 +1,5 @@
 """
-診斷用：呼叫 fubon/trade_api.py::intraday_ticker()（單支股票明細，
+診斷用：呼叫 fubon/fubon_api.py::intraday_ticker()（單支股票明細，
 intraday/ticker/{symbol}），檢查 canDayTrade/canBuyDayTrade 這兩個欄位，
 確認能不能拿來取代 fubon/intraday_tickers.py 目前用的 isNormal 篩選。
 
@@ -17,13 +17,13 @@ import pandas as pd
 
 
 def fetch_one(sdk, symbol: str) -> dict:
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     return trade_api.intraday_ticker(sdk, symbol)
 
 
 if __name__ == "__main__":
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     symbols = sys.argv[1:] or ["2330"]
     sdk, _ = trade_api.login()

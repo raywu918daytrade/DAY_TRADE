@@ -91,7 +91,7 @@ def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
     放在 ranked_candidates() 之後（均量排序+截斷到 MAX_SUBSCRIPTIONS 之後）才做，
     只查最後入選的候選股，不用對全市場 ~2700 支都查一次（300次/分鐘的話要
     9分鐘，候選股通常只有 1000 支內，約 4 分鐘內）。"""
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     sdk, _ = trade_api.login()
     tradable = []

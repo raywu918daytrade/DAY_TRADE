@@ -158,7 +158,7 @@ print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...", flush=True)
 
 if TRADE_MODE != "off":
     try:
-        from trade.run_execute import make_executor
+        from sinopac.run_execute import make_executor
 
         state.executor = make_executor(
             TRADE_MODE,

@@ -1,11 +1,11 @@
 """
 FinMind 分K 一次性歷史補齊 — 從 2019-01-01（FinMind TaiwanStockKBar 資料起點）
-補到指定月份為止，逐月呼叫 finmind/api.py 的 backfill_month()，核心邏輯只有
-一份（見 finmind/api.py），這支只負責「跑哪些月份、依序跑、印跨月進度」。
+補到指定月份為止，逐月呼叫 finmind/finmind_api.py 的 backfill_month()，核心邏輯只有
+一份（見 finmind/finmind_api.py），這支只負責「跑哪些月份、依序跑、印跨月進度」。
 
-跟 finmind/api.py 的 __main__（一次補一個月，像 Fugle 的 update_m1() 那種
+跟 finmind/finmind_api.py 的 __main__（一次補一個月，像 Fugle 的 update_m1() 那種
 「今天缺哪幾天就補哪幾天」用法）是分開的兩支腳本：
-    finmind/api.py             日常用，一次補一個月（例如剛好發現某個月缺資料）
+    finmind/finmind_api.py             日常用，一次補一個月（例如剛好發現某個月缺資料）
     finmind/backfill_history.py 一次性用，把很久以前的歷史全部補起來
 
 ⚠️ 規模警告（2026-07-14 實測 db/fugle_day 估算）：2019-01-01 ~ 2026-05 全部
@@ -15,7 +15,7 @@ FinMind 分K 一次性歷史補齊 — 從 2019-01-01（FinMind TaiwanStockKBar 
 持續執行的程序，能撐過電腦睡眠/斷線中斷（見下面用法）。
 
 中斷續傳：每個月呼叫 backfill_month() 時，都會先讀那個月 db/m1 現有的
-(股票,交易日) 組合、只補缺的部分（見 finmind/api.py::_existing_pairs()），
+(股票,交易日) 組合、只補缺的部分（見 finmind/finmind_api.py::_existing_pairs()），
 所以任何時候中斷、重新執行這支腳本，會自動跳過已經完成的月份/組合，不會
 重新請求已經有的資料，不會浪費 rate limit 額度。
 
@@ -30,7 +30,7 @@ import asyncio
 
 import pandas as pd
 
-from finmind.api import FatalAPIError, backfill_month, check_quota, reload_token, sync_rate_limiter
+from finmind.finmind_api import FatalAPIError, backfill_month, check_quota, reload_token, sync_rate_limiter
 
 _DEFAULT_START = "2019-01"
 _DEFAULT_END = "2026-05"
@@ -51,7 +51,7 @@ async def backfill_history(
     top_n_by_volume: int | None = None,
 ):
     """top_n_by_volume: 選填，每個月只補平均日成交量最高的前N支（見
-    finmind/api.py::backfill_month() 的說明）。之後想補剩下的股票，直接不帶
+    finmind/finmind_api.py::backfill_month() 的說明）。之後想補剩下的股票，直接不帶
     這個參數對同一個範圍再呼叫一次即可，已經有的會自動跳過。"""
     months = _month_range(start_ym, end_ym)
     print(f"歷史補齊範圍：{start_ym} ~ {end_ym}，共 {len(months)} 個月")
@@ -92,8 +92,8 @@ async def run_forever(
     人工重新執行）。
 
     撞到 FatalAPIError（TokenError/QuotaError/IPBannedError/OtherFatalError，
-    見 finmind/api.py 的說明）時不會讓程式結束，而是每 check_interval 秒
-    呼叫一次 finmind.api.check_quota()（FinMind官方帳號用量查詢API）：
+    見 finmind/finmind_api.py 的說明）時不會讓程式結束，而是每 check_interval 秒
+    呼叫一次 finmind.finmind_api.check_quota()（FinMind官方帳號用量查詢API）：
         - TokenError：使用者要自己去 FinMind 官網重新登入拿新token、更新
           .env 的 FINMIND_TOKEN，這裡等待期間每次重試前都會 reload_token()
           撿到新值，不用手動重啟這支程式。

@@ -74,7 +74,7 @@ def update_tickers() -> pd.DataFrame:
     industry 非數字的垃圾代碼和債券型ETF，存到 db/tickers/tickers.parquet。
     建議每日開盤前呼叫一次。
     """
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     date_str = datetime.now(_TW).strftime("%Y-%m-%d")
     sdk, _ = trade_api.login()

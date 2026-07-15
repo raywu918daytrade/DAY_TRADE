@@ -15,7 +15,7 @@ Fugle + 富邦同時下載：
     兩邊的 historical/candles 都已實測確認本身就含「今天」的資料（2026-07-13
     20:30 實測，update_m1.yml 排程在台北18:00跑，遠晚於13:30收盤），一支
     股票各自只需要呼叫一次，不用再另外呼叫 intraday/candles 補今天。
-    富邦 SDK 呼叫都透過 fubon/trade_api.py，這裡不直接碰 fubon_neo。
+    富邦 SDK 呼叫都透過 fubon/fubon_api.py，這裡不直接碰 fubon_neo。
 
 主要函式：
     update_m1(stocks)
@@ -133,7 +133,7 @@ def _update_flag(stock_id: str, date_str: str):
 def _download_m1_fubon(sdk, stock_id: str) -> pd.DataFrame:
     """近30日+今日分K，富邦 historical/candles 一次就含今天，不用另外呼叫
     intraday/candles。"""
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     bars = trade_api.historical_candles(sdk, stock_id, timeframe=1)
     if not bars:
@@ -226,7 +226,7 @@ def update_m1(stocks: list = None):
     fugle_half, fubon_half = wait_stocks[:half], wait_stocks[half:]
     print(f"Fugle {len(fugle_half)} 支、富邦 {len(fubon_half)} 支，同時下載...")
 
-    from fubon import trade_api
+    from fubon import fubon_api as trade_api
 
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)

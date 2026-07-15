@@ -18,10 +18,10 @@ from __future__ import annotations
 import time as _time
 
 try:
-    from trade import trade_api
+    from sinopac import sinopac_api as trade_api
 except (ImportError, ModuleNotFoundError):
     try:
-        import trade_api  # noqa: F401
+        import sinopac_api as trade_api  # noqa: F401
     except (ImportError, ModuleNotFoundError):
         trade_api = None  # type: ignore
 
