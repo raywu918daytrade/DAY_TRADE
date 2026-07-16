@@ -13,6 +13,7 @@ ReDoc      : http://localhost:8000/redoc
     GET  /signals/{stock_id}/detail  右邊訊號詳情
     GET  /chart/{stock_id}/candles   中間 K 圖
     GET  /chart/{stock_id}/candles/history   歷史K線（任意過去日期，交易回放用）
+    GET  /quote/{stock_id}           固定追蹤清單股票的最新報價/漲跌幅（見 push_quote()）
     GET  /positions                  下方持倉區
     GET  /trades                     下方成交記錄
     GET  /api/inference/history/dates        可回放日期清單（HF Hub 上實際有資料的日期）
@@ -302,6 +303,7 @@ _positions: dict = {}  # {stock_id: Position dict}
 _trades: list = []  # 今日原始成交事件（買/賣各一筆）
 _completed_trades: list = []  # 今日完整回合（進出配對，含損益）
 _candles: dict = {}  # {stock_id: [Candle dict, ...]}
+_quotes: dict = {}  # {stock_id: {stock_id, price, prev_close, change_pct, minute}}，見 push_quote()
 _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
 _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 _consensus_signals: list = []  # 今日「多個策略的前N名重疊」記錄，見 push_consensus_signals()
@@ -398,7 +400,7 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _signal_detail, _positions, _monitoring, _consensus_signals
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -406,6 +408,7 @@ def _reset_if_new_day():
         _trades.clear()
         _completed_trades.clear()
         _candles.clear()
+        _quotes.clear()
         _signal_detail.clear()
         _positions.clear()
         _system_logs.clear()
@@ -639,6 +642,23 @@ def push_candles(stock_id: str, candles: list):
     with _lock:
         _candles[stock_id] = candles
         _broadcast({"type": "candles", "stock_id": stock_id})
+
+
+def push_quote(stock_id: str, price: float, prev_close: float | None, minute_str: str = ""):
+    """推入單一股票的即時報價與漲跌幅，給頁首固定追蹤清單用（例如0050這種ETF，
+    不經過策略推論篩選）。change_pct 基準是 prev_close（前一交易日收盤），不是
+    當日開盤，跟大盤/新聞看到的算法一致。由 main/live_trader.py 的 on_minute()
+    針對 WATCHLIST_QUOTES（見 main/config.py）逐一呼叫。"""
+    change_pct = (price - prev_close) / prev_close * 100 if prev_close else None
+    with _lock:
+        _quotes[stock_id] = {
+            "stock_id": stock_id,
+            "price": price,
+            "prev_close": prev_close,
+            "change_pct": change_pct,
+            "minute": minute_str,
+        }
+        _broadcast({"type": "quote", "stock_id": stock_id, "data": _quotes[stock_id]})
 
 
 def push_position(position: dict):
@@ -982,6 +1002,19 @@ def chart_candles(stock_id: str):
         candles = list(_candles.get(stock_id, []))
     print(f"[GET /chart/{stock_id}/candles] 回傳 {len(candles)} 根 K 線", flush=True)
     return {"stock_id": stock_id, "candles": candles}
+
+
+@app.get(
+    "/quote/{stock_id}",
+    tags=["圖表"],
+    summary="固定追蹤清單股票的最新報價與漲跌幅（不經過策略候選篩選，如0050，見 push_quote()）",
+)
+def get_quote(stock_id: str):
+    with _lock:
+        q = _quotes.get(stock_id)
+    if q is None:
+        raise HTTPException(status_code=404, detail=f"尚無 {stock_id} 的報價資料（可能還沒開盤或非追蹤清單）")
+    return q
 
 
 @app.get(

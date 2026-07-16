@@ -36,6 +36,12 @@ CONSENSUS_TOP_N = int(os.environ.get("CONSENSUS_TOP_N", "10"))
 # 只有開機當下會算一次，之後每天06:00不會再重算，清單會維持開機時那份不變。
 DAILY_REFRESH_TICKERS = os.environ.get("DAILY_REFRESH_TICKERS", "true").lower() == "true"
 
+# 頁首固定追蹤股票（不經過策略候選篩選，例如 ETF 0050）：on_minute() 每分鐘
+# 收到這些股票的 m1 就查前一交易日收盤價、算漲跌幅，push_quote() 推給前端。
+WATCHLIST_QUOTES = [
+    s.strip() for s in os.environ.get("WATCHLIST_QUOTES", "0050").split(",") if s.strip()
+]
+
 TRADE_MODE = os.environ.get("TRADE_MODE", "off")  # off | paper | sim | live
 THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
 FORCE_CLOSE_HOUR = int(os.environ.get("FORCE_CLOSE_HOUR", "13"))

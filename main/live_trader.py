@@ -54,6 +54,7 @@ from api import (
     push_consensus_signals,
     push_inference_log,
     push_monitoring,
+    push_quote,
     push_signals,
     set_strategies,
     tw_naive_to_epoch,
@@ -71,6 +72,7 @@ from main.config import (
     THRESHOLD,
     TOTAL_CAPITAL,
     TRADE_MODE,
+    WATCHLIST_QUOTES,
 )
 from main.state import AppState, StrategyState
 from main.strategy_loader import load_strategies
@@ -219,6 +221,30 @@ def _daily_refresh():
         time.sleep(60)
 
 
+_prev_close_cache: dict[str, tuple[str, float]] = {}  # {stock_id: (date_str, prev_close)}
+
+
+def _watchlist_prev_close(stock_id: str, date_str: str) -> float | None:
+    """前一交易日收盤價，一天只查一次本機 db/fugle_day/（不是每分鐘都重讀 parquet）。
+    跟策略候選股的均量篩選/當沖資格判斷無關，0050 這種 ETF 不會進策略候選池，
+    也要能查得到，所以直接查 data/query.py 的日K，不依賴 state.day。"""
+    cached = _prev_close_cache.get(stock_id)
+    if cached and cached[0] == date_str:
+        return cached[1]
+
+    from data.query import load_day_by_stock
+
+    df = load_day_by_stock(stock_id)
+    if df.empty:
+        return None
+    df = df[df["date"] < pd.Timestamp(date_str)]
+    if df.empty:
+        return None
+    val = float(df.iloc[-1]["close"])
+    _prev_close_cache[stock_id] = (date_str, val)
+    return val
+
+
 def on_minute(minute_str: str, df: pd.DataFrame):
     """分K收集器每分鐘回呼：每個策略各自推論、推送監控/訊號，並觸發下單。
 
@@ -257,6 +283,13 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                     }
                 )
             push_candles(str(sid), candles)
+
+            # 頁首固定追蹤清單（WATCHLIST_QUOTES，如 0050）：跟策略候選股無關，
+            # 收到 m1 就先查昨收、算漲跌幅，傳到前端之前先算好（不是前端自己拉
+            # candles 再算），見 main/config.py 的說明與 api.py 的 push_quote()。
+            if str(sid) in WATCHLIST_QUOTES and candles:
+                prev_close = _watchlist_prev_close(str(sid), date_str)
+                push_quote(str(sid), candles[-1]["close"], prev_close, minute_str)
 
     # 每分鐘從 settings 讀信心度，允許前端即時調整
     from api import get_setting
