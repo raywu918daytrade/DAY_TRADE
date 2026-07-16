@@ -11,6 +11,11 @@ TP_PCT = 0.03
 SL_PCT = 0.03
 HOLD_BARS = 30
 
+# ── 要用哪個模型（rfc / xgb / lgbm） ──────────────────────────────────────
+# run_backtest.py（回測）跟 live.py（即時交易）都讀這個，只改這裡一個地方
+# 就能同時切換兩邊要用的模型，不用分別改兩個檔案。
+MODEL_TYPE = os.environ.get("RALLY_MODEL_TYPE", "xgb")
+
 # ── 交易時段（早盤過濾範圍） ──────────────────────────────────────────────────
 SESSION_START = (9, 1)
 _end_h = int(os.environ.get("SESSION_END_HOUR", "10"))

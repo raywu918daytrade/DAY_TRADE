@@ -49,30 +49,72 @@ _CACHE_PATH = _ROOT / "cache/m1_orb_features.parquet"
 # ── Cache 管理 ───────────────────────────────────────────────────────────────
 
 
-def _m1_mtime() -> float:
-    """db/m1/ 中最新檔案的修改時間戳。"""
-    mtimes = [f.stat().st_mtime for f in _M1_DIR.iterdir() if f.suffix == ".parquet"]
+def _relevant_m1_files(_dir: Path, since) -> list:
+    """篩出檔名（YYYY_MM.parquet）月份 >= since 所在月份的檔案。
+
+    since=None 時回傳全部檔案（跟以前行為一樣，全部月份都要比對 mtime）。
+    db/m1/、db/fugle_day/ 都是按月分檔，只要月份早於 since，那個檔案不可能
+    包含 since 之後的資料，即使那個檔案的 mtime 變動（例如背景
+    finmind.backfill_history 在補很久以前的歷史），也跟「since 之後這段
+    測試窗口的特徵新不新鮮」無關，不該讓它觸發整批重算。檔名不符
+    YYYY_MM 格式的話保守起見還是列進來比對。
+    """
+    files = [f for f in _dir.iterdir() if f.suffix == ".parquet"]
+    if since is None:
+        return files
+    cutoff_ym = (since.year, since.month)
+    out = []
+    for f in files:
+        try:
+            y, m = f.stem.split("_")
+            if (int(y), int(m)) >= cutoff_ym:
+                out.append(f)
+        except ValueError:
+            out.append(f)
+    return out
+
+
+def _m1_mtime(since=None) -> float:
+    """db/m1/ 中（since 之後月份的）最新檔案修改時間戳。"""
+    mtimes = [f.stat().st_mtime for f in _relevant_m1_files(_M1_DIR, since)]
     return max(mtimes) if mtimes else 0
 
 
-def _day_mtime() -> float:
-    """db/fugle_day/ 中最新檔案的修改時間戳。"""
+def _day_mtime(since=None) -> float:
+    """db/fugle_day/ 中（since 之後月份的）最新檔案修改時間戳。"""
     if not _DAY_DIR.exists():
         return 0
-    mtimes = [f.stat().st_mtime for f in _DAY_DIR.iterdir() if f.suffix == ".parquet"]
+    mtimes = [f.stat().st_mtime for f in _relevant_m1_files(_DAY_DIR, since)]
     return max(mtimes) if mtimes else 0
 
 
-def _cache_is_fresh() -> bool:
+def _cache_is_fresh(since=None) -> bool:
     if not _CACHE_PATH.exists():
         return False
     cache_mtime = _CACHE_PATH.stat().st_mtime
-    return cache_mtime >= _m1_mtime() and cache_mtime >= _day_mtime()
+    return cache_mtime >= _m1_mtime(since) and cache_mtime >= _day_mtime(since)
 
 
-def load_features(force_rebuild: bool = False) -> pd.DataFrame:
-    """載入特徵（自動使用 / 重建 cache）。"""
-    if not force_rebuild and _cache_is_fresh():
+def load_features(force_rebuild: bool = False, since=None, skip_staleness_check: bool = False) -> pd.DataFrame:
+    """載入特徵（自動使用 / 重建 cache）。
+
+    since: 選填，只比對「since 所在月份之後」的 db/m1、db/fugle_day 檔案
+    mtime——呼叫端知道實際只會用到最近 N 天資料時（例如 predict() 的
+    test_days 窗口）可以傳進來，避免背景程式（例如 finmind.backfill_history）
+    補很久以前的歷史資料時，動到舊月份檔案的 mtime 就讓整批特徵被判定
+    「過期」而重算一次（很慢，且跟真正要用的窗口無關）。留空則比對全部
+    月份檔案（跟以前行為一樣，最保守）。
+
+    skip_staleness_check: 預設 False。True 時完全不比對 mtime，只要 cache
+    檔案存在、欄位齊全就直接用，即使 db/m1/db/fugle_day 有更新也不重算。
+    train.py 用的是全歷史當訓練集（不是只有最近幾天），資料被背景程式
+    補進/修正到任何舊月份，理論上都該讓模型重新訓練，所以不能像
+    predict() 一樣用 since 篩掉「無關月份」；這個參數是給你明確知道
+    「我現在要犧牲正確性換速度」時的手動開關（例如背景 backfill 還在跑、
+    你只是想先跑一版模型測試程式碼邏輯），不是預設行為，訓練出的模型
+    可能沒吃到最新/修正過的資料，正式要用的模型還是要關掉這個參數重跑一次。
+    """
+    if not force_rebuild and _CACHE_PATH.exists() and (skip_staleness_check or _cache_is_fresh(since)):
         cached = pd.read_parquet(_CACHE_PATH)
         missing = [c for c in FEATURES + ["hour", "vol_ma20"] if c not in cached.columns]
         if not missing:

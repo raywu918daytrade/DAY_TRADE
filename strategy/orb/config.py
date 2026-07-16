@@ -36,7 +36,7 @@ BREAKOUT_SEARCH_MINUTES = 30  # 找突破事件的搜尋窗口終點：9:10~9:30
 # 看過的資料，指標虛高卻不知道（2026-07-10 實測過這個 bug，AUC 從 0.65
 # 假漲到 0.73）。validate.py 另外有 _warn_if_train_test_overlap() 會在真的
 # 傳了不一致的 test_days 時印警告，這裡的統一預設是從源頭降低發生機率。
-DEFAULT_TEST_DAYS = 10
+DEFAULT_TEST_DAYS = 30
 
 # ── 流動性篩選 ────────────────────────────────────────────────────────────
 # 20日均量（股數，用「昨天為止」算，見 features.py 的 vol_ma20）門檻，只留

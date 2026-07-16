@@ -62,7 +62,11 @@ def _prepare_data(top_n: int = 100, hour: int = 9, minute_max: int = 10) -> pd.D
     return df
 
 
-def train(test_days: int = 10):
+def train(test_days: int = 20):
+    # test_days=20（2026-07-16 從10調大）：0050歷史資料補齊後，訓練資料從
+    # 約1.5個月變成6個月以上，但漲/跌是很稀有的類別（各僅佔2~5%），test_days
+    # 太小的話測試集裡稀有類別樣本數太少、precision/recall算出來不穩定，
+    # 不是「訓練資料變多就要按比例放大測試集」的邏輯。
     df = _prepare_data()
 
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)

@@ -15,6 +15,6 @@ train.py/validate.py/features.py 這些訓練/驗證用的東西，live_trader.p
 
 from strategy.orb.config import SESSION_END, SESSION_START
 from strategy.orb.predict import build_prewarm_cache, predict_live
-from strategy.orb.train import load_model_lgbm as load_model
+from strategy.orb.train import load_model_xgb as load_model
 
 __all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "build_prewarm_cache"]

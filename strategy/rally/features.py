@@ -14,6 +14,7 @@
 import sys
 from pathlib import Path
 
+import numba
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -30,7 +31,7 @@ load_dotenv(_ROOT / ".env", override=True)
 
 _M1_DIR = _ROOT / "db/m1"
 _DAY_DIR = _ROOT / "db/fugle_day"
-_CACHE_PATH = _ROOT / "cache/m1_rfc_features.parquet"
+_CACHE_PATH = _ROOT / "cache/m1_rally_features.parquet"
 
 
 # ── Cache 管理 ───────────────────────────────────────────────────────────────
@@ -58,18 +59,22 @@ def _cache_is_fresh() -> bool:
     return cache_mtime >= _m1_mtime() and cache_mtime >= _day_mtime()
 
 
-def load_features(force_rebuild: bool = False) -> pd.DataFrame:
+def load_features(force_rebuild: bool = False, force_cache: bool = False) -> pd.DataFrame:
     """
     載入特徵（自動使用 / 重建 cache）。
 
     若 cache 存在且 db/m1/ 與 db/fugle_day/ 都沒有新檔案，直接讀取 cache parquet。
     否則重新執行 make_features() 並更新 cache。
+
+    force_cache=True：只要 cache 存在且欄位齊全就直接讀，略過新鮮度檢查（db/m1 被
+    背景中的資料下載流程動到檔案時間戳、但資料內容其實沒變時用得到，可以跳過不必要
+    的重算）。跟 force_rebuild 同時為 True 時 force_rebuild 優先。
     """
-    if not force_rebuild and _cache_is_fresh():
+    if not force_rebuild and _CACHE_PATH.exists() and (force_cache or _cache_is_fresh()):
         cached = pd.read_parquet(_CACHE_PATH)
         missing = [c for c in FEATURES if c not in cached.columns]
         if not missing:
-            print("  讀取 cache 特徵...")
+            print("  讀取 cache 特徵" + ("（force_cache，略過新鮮度檢查）" if force_cache else "") + "...")
             return cached
         print(f"  cache 缺少欄位 {missing}，重新計算...")
 
@@ -95,35 +100,65 @@ def load_features(force_rebuild: bool = False) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _barrier_label_group(closes: np.ndarray) -> np.ndarray:
-    """每日每股，逐 bar 往前看最多 HOLD_BARS 根，判斷先碰到 tp 或 sl。"""
+@numba.njit(cache=True)
+def _barrier_label_numba(
+    closes: np.ndarray,
+    group_id: np.ndarray,
+    hold_bars: int,
+    tp_pct: float,
+    sl_pct: float,
+) -> np.ndarray:
+    """單一 pass 掃過整個（已依 stock_id/day_date 排序）陣列，逐 bar 往前看最多
+    hold_bars 根，判斷先碰到 tp 或 sl；group_id 不同代表跨股票或跨日，視同沒有
+    future bar 可看。取代原本 groupby(...).apply() 逐組呼叫 Python function 的寫法
+    ——40~50萬個 stock×day 分組，.apply() 本身的 per-group overhead 加上內層
+    純 Python 迴圈，是 make_features() 裡唯一沒有走 pandas 向量化路徑的地方，
+    也是特徵計算最慢的部分。JIT 編譯成單一迴圈後可以省掉這兩層 overhead。
+
+    掃描時只要碰到第一個滿足 tp 或 sl 的 bar 就能立刻判定先後（因為是依時間
+    順序往前掃，先出現的就是先碰到的那個），不需要像原本那樣分別對整段
+    future 陣列各做一次 argmax。
+    """
     n = len(closes)
     labels = np.full(n, np.nan)
     for i in range(n - 1):
+        gid = group_id[i]
         entry = closes[i]
-        tp_price = entry * (1 + TP_PCT)
-        sl_price = entry * (1 - SL_PCT)
-        future = closes[i + 1 : i + HOLD_BARS + 1]
-        tp_idx = np.argmax(future >= tp_price) if (future >= tp_price).any() else len(future)
-        sl_idx = np.argmax(future <= sl_price) if (future <= sl_price).any() else len(future)
-        if tp_idx < sl_idx:
-            labels[i] = 1
-        elif sl_idx < tp_idx:
-            labels[i] = 0
-        elif len(future) == HOLD_BARS:
-            labels[i] = 1 if future[-1] > entry else 0
+        tp_price = entry * (1.0 + tp_pct)
+        sl_price = entry * (1.0 - sl_pct)
+        max_j = i + hold_bars
+        if max_j >= n:
+            max_j = n - 1
+        hit = -1  # 1=tp 先到, 0=sl 先到, -1=都沒碰到
+        last_j = i
+        for j in range(i + 1, max_j + 1):
+            if group_id[j] != gid:
+                break
+            last_j = j
+            c = closes[j]
+            if c >= tp_price:
+                hit = 1
+                break
+            if c <= sl_price:
+                hit = 0
+                break
+        if hit == 1:
+            labels[i] = 1.0
+        elif hit == 0:
+            labels[i] = 0.0
+        elif last_j - i == hold_bars:
+            labels[i] = 1.0 if closes[last_j] > entry else 0.0
+        # else：當日剩餘 bar 數不足 hold_bars 且都沒碰到，維持 NaN
     return labels
 
 
 def _make_barrier_labels(m1: pd.DataFrame) -> pd.Series:
-    result = m1.groupby(["stock_id", "day_date"], group_keys=False).apply(
-        lambda g: pd.Series(
-            _barrier_label_group(g["close"].values),
-            index=g.index,
-        ),
-        include_groups=False,
-    )
-    return result
+    """m1 需已依 ["stock_id", "date"] 排序（make_features() 一開始就排好）。"""
+    keys = m1[["stock_id", "day_date"]]
+    group_id = (keys != keys.shift()).any(axis=1).cumsum().to_numpy(dtype=np.int64)
+    closes = m1["close"].to_numpy(dtype=np.float64)
+    labels = _barrier_label_numba(closes, group_id, HOLD_BARS, TP_PCT, SL_PCT)
+    return pd.Series(labels, index=m1.index)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

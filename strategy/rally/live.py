@@ -8,12 +8,17 @@ live_trader.py 本身的程式碼。以後如果又新增別的策略模組，�
 train.py/validate.py/features.py 這些訓練/驗證用的東西，live_trader.py 完全
 不會碰到，依賴方向永遠是單向的：live_trader → live.py → predict.py/train.py。
 
-目前 live 用的是 XGBoost（m1_xgb.pkl）——三個模型裡目前表現最好的一個，
-之後想換 RFC/LGBM 就改這裡的 import。
+要用哪個模型（rfc/xgb/lgbm）由 config.MODEL_TYPE 決定，跟 run_backtest.py
+共用同一個參數，改 config.py 一個地方兩邊就會一起換。
 """
 
-from strategy.rally.config import SESSION_END, SESSION_START
+from strategy.rally.config import MODEL_TYPE, SESSION_END, SESSION_START
 from strategy.rally.predict import predict_live
-from strategy.rally.train import load_model_xgb as load_model
+from strategy.rally.train import load_model_by_type
+
+
+def load_model():
+    return load_model_by_type(MODEL_TYPE)
+
 
 __all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END"]

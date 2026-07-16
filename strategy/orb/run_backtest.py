@@ -77,9 +77,9 @@ def run(
 
 if __name__ == "__main__":
     run(
-        model_name="lgbm",
+        model_name="xgb",
         test_days=DEFAULT_TEST_DAYS,
-        threshold=0.8,
+        threshold=0.7,
         first_entry_time="09:10",
         last_entry_time="09:30",
     )

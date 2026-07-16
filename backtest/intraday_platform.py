@@ -83,8 +83,20 @@ def run_backtest(
 
     print("載入分K...")
     m1 = load_m1()
-    price = prepare_price(m1)
 
+    # 只保留 df_proba 涵蓋的日期範圍（+ 幾天緩衝給 rolling volume 暖機用），
+    # 不要整段歷史都拿去 pivot/回測——df_proba 通常只有最後 test_days 天
+    # （見 strategy/*/predict.py 的 test_only 篩選），只交易得到這個窗口，
+    # 但 gen_entries() 的 `entries & (avg_vol >= ...)` 是兩個布林 DataFrame
+    # 做 & 運算，index 不同時 pandas 會取聯集而不是交集，若這裡不先篩，
+    # entries 的 index 會被 avg_vol（全歷史）撐大，intraday_backtest() 的
+    # 主迴圈就會跑遍全部歷史分K，而不是只跑實際可能交易的這幾十天
+    # （2026-07-17 發現：ORB 回測因此多跑 10 個月分K，慢了10倍以上）。
+    start = df_proba.index.min() - pd.Timedelta(days=5)
+    end = df_proba.index.max()
+    m1 = m1[(m1["date"] >= start) & (m1["date"] <= end)]
+
+    price = prepare_price(m1)
     volume = m1.pivot(index="date", columns="stock_id", values="volume")
 
     print("產生進場訊號...")
@@ -167,6 +179,9 @@ def optimize_optuna(df_proba: pd.DataFrame, n_trials: int = 50):
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     m1 = load_m1()
+    start = df_proba.index.min() - pd.Timedelta(days=5)
+    end = df_proba.index.max()
+    m1 = m1[(m1["date"] >= start) & (m1["date"] <= end)]
     price = prepare_price(m1)
     volume = m1.pivot(index="date", columns="stock_id", values="volume")
 

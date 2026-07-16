@@ -43,6 +43,7 @@ def main(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
+    skip_cache_check: bool = False,
 ):
     """
     當沖策略 ORB + LightGBM 主程式。
@@ -50,6 +51,12 @@ def main(
     支援兩種用法：
       1. 直接傳參數：main(mode="train_lgbm")
       2. CLI 執行：python strategy/orb/entry.py train_lgbm
+
+    skip_cache_check: 只影響 train_lgbm/train_xgb，見 train.py
+    _prepare_train_test() 的說明——預設 False（正式訓練用最嚴格的 cache
+    新鮮度檢查）；True 時不管 db/m1 有沒有更新都直接吃現成 cache，只適合
+    背景資料補齊程式還在跑、你只是想先跑一版測試程式碼/參數邏輯的情境，
+    不要拿這樣訓練出來的模型正式上場。
     """
     if not mode:
         parser = argparse.ArgumentParser(
@@ -61,17 +68,23 @@ def main(
         parser.add_argument("--test_days", type=int, default=DEFAULT_TEST_DAYS, help="測試集天數")
         parser.add_argument("--start_date", type=str, default="", help="資料起日 YYYY-MM-DD")
         parser.add_argument("--end_date", type=str, default="", help="資料迄日 YYYY-MM-DD")
+        parser.add_argument(
+            "--skip_cache_check",
+            action="store_true",
+            help="train_lgbm/train_xgb 專用：不管 db/m1 有沒有更新都直接用現成特徵 cache（犧牲正確性換速度，不要拿來訓練正式模型）",
+        )
         args = parser.parse_args()
         mode = args.mode
         test_days = args.test_days
         start_date = args.start_date
         end_date = args.end_date
+        skip_cache_check = args.skip_cache_check
 
     if mode == "train_lgbm":
-        train_lgbm(test_days=test_days, start_date=start_date, end_date=end_date)
+        train_lgbm(test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=skip_cache_check)
 
     elif mode == "train_xgb":
-        train_xgb(test_days=test_days, start_date=start_date, end_date=end_date)
+        train_xgb(test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=skip_cache_check)
 
     elif mode == "validate":
         for name, model in available_models().items():
@@ -108,5 +121,6 @@ if __name__ == "__main__":
     test_days = DEFAULT_TEST_DAYS  # 統一用 config.py 的預設值，不要在這裡另外寫死數字
     start_date = ""
     end_date = ""
+    force_cache = False  # True 時 train_lgbm/train_xgb 不管 db/m1 有沒有更新都直接用現成特徵 cache（犧牲正確性換速度，見 train.py skip_cache_check 說明，不要拿來訓練正式模型）
 
-    main(mode=mode, test_days=test_days, start_date=start_date, end_date=end_date)
+    main(mode=mode, test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=force_cache)
