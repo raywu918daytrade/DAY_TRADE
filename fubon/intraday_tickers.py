@@ -27,6 +27,7 @@
     update_tickers()  每日開盤前呼叫一次，更新並回傳清單
     load_tickers()     讀取已存的清單（不重算）
 """
+
 import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -40,6 +41,15 @@ load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 _TICKERS_PATH = _ROOT / "db/tickers/tickers.parquet"
+
+# 手動黑名單：確認不要的個別代號，直接加代號字串即可
+_BLACKLIST: set[str] = {
+    "66451",
+    "67711",
+    "68541",
+    "76101",
+    "811211",
+}
 
 # 台股 ETF 代號後綴慣例：00XXXB＝債券型ETF，00XXXD＝主動式債券/固定收益基金
 # （實測這批代號的名稱都帶「非投」「債」「入息」）。只要股票跟一般/槓桿/反向/
@@ -88,17 +98,21 @@ def update_tickers() -> pd.DataFrame:
                 industry = item.get("industry", "")
                 if not str(industry).isdigit():
                     continue
+                if sid in _BLACKLIST:
+                    continue
                 if _is_bond(sid, name):
                     continue
                 if _is_tranche(sid, name):
                     continue
-                rows.append({
-                    "stock_id": sid,
-                    "exchange": exchange,
-                    "name": name,
-                    "industry": industry,
-                    "date": date_str,
-                })
+                rows.append(
+                    {
+                        "stock_id": sid,
+                        "exchange": exchange,
+                        "name": name,
+                        "industry": industry,
+                        "date": date_str,
+                    }
+                )
     finally:
         trade_api.logout(sdk)
 
