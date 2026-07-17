@@ -167,10 +167,12 @@ def _predict_with_threshold(model, test_df, threshold: float | None):
     return y_pred, f"信心度門檻={threshold:.2f}"
 
 
-_DEFAULT_THRESHOLDS = [0.5, 0.6, 0.7, 0.8]
+_DEFAULT_THRESHOLDS = [None, 0.5, 0.6, 0.7, 0.8]  # None = 完全沒有信心度門檻（model.predict()原本判法）
 
 
-def evaluate(model=None, test_days: int = 30, threshold: float | list[float] | None = _DEFAULT_THRESHOLDS):
+def evaluate(
+    model=None, test_days: int = 30, threshold: float | None | list[float | None] = _DEFAULT_THRESHOLDS
+):
     """單獨印混淆矩陣/分類報告，用已存的模型評估，不用重新跑一次 train()
     （2026-07-17 討論：之前混淆矩陣只有 train() 裡才有，每次要看都要重訓
     一次，浪費時間）。
@@ -178,9 +180,11 @@ def evaluate(model=None, test_days: int = 30, threshold: float | list[float] | N
     threshold：預設掃 _DEFAULT_THRESHOLDS 這組門檻，各自印一次混淆矩陣，
     方便一次比較不同門檻下漲/平/跌互相誤判的狀況怎麼變化（2026-07-18
     討論，跟 confidence_report() 的門檻掃描表是互補視角：那支只看單一漲
-    或跌類別的precision/recall，這支是選定門檻後完整的3x3矩陣）。想看單一
-    門檻就傳一個數字（例如 threshold=0.6）；想看 model.predict() 原本沒有
-    門檻概念的判法（機率最高的類別勝出），明確傳 threshold=None。
+    或跌類別的precision/recall，這支是選定門檻後完整的3x3矩陣）。list裡的
+    None代表完全沒有信心度門檻（model.predict()原本判法，機率最高的類別
+    勝出），跟其他數字門檻放在同一組掃描結果裡方便直接比較。想看單一門檻
+    就傳一個數字（例如 threshold=0.6）；只想看沒有門檻的版本就傳
+    threshold=None。
     """
     if model is None:
         model = load_model()
@@ -342,7 +346,7 @@ if __name__ == "__main__":
         python -m strategy.mkt_idx.train evaluate --threshold 0.6
         python -m strategy.mkt_idx.train confidence
     """
-    mode = "train"  # F5時改這裡：train / importance / evaluate / confidence
+    mode = "evaluate"  # F5時改這裡：train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
     main(mode=mode, test_days=test_days, threshold=threshold)
