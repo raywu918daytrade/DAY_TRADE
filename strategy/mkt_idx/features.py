@@ -62,6 +62,9 @@ def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
         ret_1m          這一分鐘收盤 vs 前一分鐘收盤的變化率
         range_pct       這一分鐘 high-low 寬度 / 當日開盤價
         body_pct        這一分鐘 close-open 變化率 / 當日開盤價
+        bullish_volume_surge 這一分鐘收紅K + 量至少是前一分鐘1.5倍的旗標
+                        （0/1，2026-07-19 討論，「單一K棒翻轉」試過沒訊號後
+                        改成這個更簡單的版本）
 
     range_pct/body_pct 特意不是「除以 high-low」的比值（不是 close_pos 那種
     寫法）——分子就是 high-low / close-open 本身，平盤（high=low）時這兩個
@@ -99,6 +102,17 @@ def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
     m1["ret_1m"] = g_day["close"].pct_change(1, fill_method=None)
     m1["range_pct"] = (m1["high"] - m1["low"]) / day_open
     m1["body_pct"] = (m1["close"] - m1["open"]) / day_open
+
+    # 2026-07-19 討論：「前跌+這漲+range放大+量放大」四條件AND試過兩次
+    # （單條件版importance 0.47%、四條件版 0.22%，條件越嚴格越沒用，代表
+    # 「單一K棒翻轉」這個角度本身沒訊號，不是門檻不夠嚴格的問題），已經
+    # 放棄「翻轉」這個框架。改成更簡單的「這一分鐘收紅K + 量放大1.5倍以上」
+    # ——不看前一分鐘是不是跌，單純看「這一分鐘是不是有量能明顯佐證的
+    # 上漲」。量的條件直接重用上面已經算好的 vol_ratio_prev（這一分鐘量/
+    # 前一分鐘量-1），>=0.5 代表量至少是前一分鐘的1.5倍。第一分鐘沒有
+    # 「前一分鐘」，vol_ratio_prev 是 NaN，比較結果會是 False（0），不會是
+    # NaN。
+    m1["bullish_volume_surge"] = ((m1["body_pct"] > 0) & (m1["vol_ratio_prev"] >= 0.5)).astype(int)
 
     return m1
 
@@ -195,8 +209,15 @@ def make_barrier_labels_3class(
 # 它6根K棒的暖機期，9:00~9:05樣本回來了）發現 range_pct 頂上去變成主導
 # （51.12%），同樣的問題重演，尤其「漲」這個類別recall掉到只剩0.03——
 # range_pct跟atr7是同一種東西（K棒振幅大小，不帶方向），所以也拿掉了。
-# 目前只留 ret_vs_idx + 4個量能相關特徵，還沒重新驗證這個組合的precision
-# 有沒有回升。
+# 拿掉atr7/range_pct後重新驗證：feature_importance() 顯示 ret_vs_idx(31.16%)
+# 拿回主導地位，precision回升到接近原始1特徵版本（漲23%、跌26%，threshold
+# =0.5），確認方向正確。目前「漲」還是比「跌」弱（threshold=0.6時漲recall
+# 掉到0，跌還有38%precision），想針對性提升漲的precision試了「單一K棒
+# 翻轉」（bullish_reversal：前跌+這漲+range放大+量放大），單條件版
+# importance 0.47%、疊到四條件版反而更低（0.22%）——條件越嚴格越沒用，
+# 代表「翻轉」這個框架本身沒訊號，不是門檻不夠嚴格。已改成更簡單的
+# bullish_volume_surge（這分鐘收紅K+量放大1.5倍以上，不看前一分鐘方向），
+# 還沒驗證有沒有效。
 FEATURES = [
     "ret_vs_idx",
     "vol_ratio_cum",
@@ -205,4 +226,5 @@ FEATURES = [
     # "range_pct",
     # "atr7",
     "body_pct",
+    "bullish_volume_surge",
 ]

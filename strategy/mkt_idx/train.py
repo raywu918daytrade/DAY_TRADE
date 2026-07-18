@@ -367,7 +367,7 @@ if __name__ == "__main__":
         python -m strategy.mkt_idx.train evaluate --threshold 0.6
         python -m strategy.mkt_idx.train confidence
     """
-    mode = "evaluate"  # train / importance / evaluate / confidence
+    mode = "train"  # train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
     main(mode=mode, test_days=test_days, threshold=threshold)
