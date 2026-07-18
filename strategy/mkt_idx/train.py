@@ -1,12 +1,13 @@
 """
-mkt_idx 模型訓練 — RandomForest（先用最精簡的設定：只有 ret_vs_idx 一個特徵）
+mkt_idx 模型訓練 — RandomForest
 
 2026-07-14 討論：先用最簡單的設定跑一次，確認整條 pipeline（特徵→標籤→
 流動性過濾→時段過濾→訓練）真的串得起來、看得懂結果，之後再逐步加特徵、
 調參數（先精簡、慢慢加，避免一次寫太多debug不動）。
 
 目前設定（都是前面幾支 experiments/ 腳本驗證出來的結論）：
-    FEATURES = ["ret_vs_idx"]     單一特徵，個股跟0050累積報酬率差
+    FEATURES        見 strategy/mkt_idx/features.py（單一事實來源，這裡
+                    不重複列一份，避免兩邊各自維護一份不一致）
     流動性過濾：前一日量前100名   訊號密度提升最明顯的門檻
     時段：只留9:00~9:10           訊號集中在開盤頭10分鐘，之後快速衰退
     3分類標籤：漲/平/跌           HOLD_BARS=10、TP_PCT=SL_PCT=3%（見config.py）
@@ -46,12 +47,16 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 
 from data.query import load_m1
 from strategy.mkt_idx.config import IDX_SYMBOL
-from strategy.mkt_idx.features import add_ret_vs_idx, make_barrier_labels_3class, top_n_by_prev_day_volume
+from strategy.mkt_idx.features import (
+    FEATURES,
+    add_bar_features,
+    add_ret_vs_idx,
+    make_barrier_labels_3class,
+    top_n_by_prev_day_volume,
+)
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH = _ROOT / "models/mkt_idx_rfc.pkl"
-
-FEATURES = ["ret_vs_idx"]  # 先精簡，只用這一個特徵
 
 
 def _prepare_data(top_n: int = 100, hour: int = 9, minute_max: int = 10) -> pd.DataFrame:
@@ -70,6 +75,9 @@ def _prepare_data(top_n: int = 100, hour: int = 9, minute_max: int = 10) -> pd.D
     before = df["stock_id"].nunique()
     df = top_n_by_prev_day_volume(df, n=top_n)
     print(f"  股票數: {before} → {df['stock_id'].nunique()}（依日期各自篩選）")
+
+    print("算當根K棒量能/波動特徵...")
+    df = add_bar_features(df)
 
     print("計算3分類標籤（漲=2/平=1/跌=0）...")
     df["target"] = make_barrier_labels_3class(df)
@@ -130,7 +138,15 @@ def train(test_days: int = 20):
     print("\n混淆矩陣（列=實際，欄=預測，順序 跌/平/漲）:")
     print(confusion_matrix(test_df["target"], y_pred, labels=[0, 1, 2]))
     print("\n分類報告:")
-    print(classification_report(test_df["target"], y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"]))
+    # zero_division=0：高門檻時模型可能對某類別完全不預測（例如threshold=0.8
+    # 時漲/跌都沒半筆），precision算出來是0/0，sklearn預設會噴
+    # UndefinedMetricWarning警告——這種情況語意上就是「0%」，明確設定
+    # zero_division=0 讓它安靜地回報0.0，不用每次都跳一堆警告訊息。
+    print(
+        classification_report(
+            test_df["target"], y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"], zero_division=0
+        )
+    )
 
     _MODEL_PATH.parent.mkdir(exist_ok=True)
     joblib.dump(model, _MODEL_PATH)
@@ -170,9 +186,7 @@ def _predict_with_threshold(model, test_df, threshold: float | None):
 _DEFAULT_THRESHOLDS = [None, 0.5, 0.6, 0.7, 0.8]  # None = 完全沒有信心度門檻（model.predict()原本判法）
 
 
-def evaluate(
-    model=None, test_days: int = 30, threshold: float | None | list[float | None] = _DEFAULT_THRESHOLDS
-):
+def evaluate(model=None, test_days: int = 30, threshold: float | None | list[float | None] = _DEFAULT_THRESHOLDS):
     """單獨印混淆矩陣/分類報告，用已存的模型評估，不用重新跑一次 train()
     （2026-07-17 討論：之前混淆矩陣只有 train() 裡才有，每次要看都要重訓
     一次，浪費時間）。
@@ -204,7 +218,15 @@ def evaluate(
         print("\n混淆矩陣（列=實際，欄=預測，順序 跌/平/漲）:")
         print(confusion_matrix(test_df["target"], y_pred, labels=[0, 1, 2]))
         print("\n分類報告:")
-        print(classification_report(test_df["target"], y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"]))
+        # zero_division=0：高門檻時模型可能對某類別完全不預測（例如threshold=0.8
+        # 時漲/跌都沒半筆），precision算出來是0/0，sklearn預設會噴
+        # UndefinedMetricWarning警告——這種情況語意上就是「0%」，明確設定
+        # zero_division=0 讓它安靜地回報0.0，不用每次都跳一堆警告訊息。
+        print(
+            classification_report(
+                test_df["target"], y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"], zero_division=0
+            )
+        )
         results.append(y_pred)
 
     return test_df, (results[0] if len(results) == 1 else results)
@@ -251,9 +273,8 @@ def confidence_report(model=None, test_days: int = 30, thresholds: list[float] |
 
 
 def feature_importance(model=None, top_n: int = 10):
-    """顯示 RandomForest 特徵重要性。目前 FEATURES 只有 ret_vs_idx 一個
-    （見檔頭說明：先精簡、慢慢加），這裡會顯示 100%——先把這支函式準備好，
-    之後陸續加特徵時直接能用，不用等特徵變多才回頭補。"""
+    """顯示 RandomForest 特徵重要性，FEATURES 清單見 features.py（單一事實
+    來源，這裡不重複列一份）。"""
     if model is None:
         model = load_model()
 
@@ -346,7 +367,7 @@ if __name__ == "__main__":
         python -m strategy.mkt_idx.train evaluate --threshold 0.6
         python -m strategy.mkt_idx.train confidence
     """
-    mode = "evaluate"  # F5時改這裡：train / importance / evaluate / confidence
+    mode = "evaluate"  # train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
     main(mode=mode, test_days=test_days, threshold=threshold)

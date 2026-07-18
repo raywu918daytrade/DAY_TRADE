@@ -46,6 +46,63 @@ def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFra
     return m1
 
 
+def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
+    """
+    當根1分鐘K棒自己的量能/波動特徵（2026-07-19 討論，先精簡加一批基本
+    盤中特徵）：
+        vol_ratio_cum   這一分鐘成交量 / 今日累積到目前為止的平均每分鐘量
+                        - 1（pct_change形式，0=沒變、正=比今天平常放量、
+                        負=縮量，反映「這分鐘是不是比今天平常還爆量」）——
+                        原始股數（volume）不同股票量級差很多沒辦法跨股票
+                        比較，這裡直接用比例，不另外存一份原始股數的欄位
+        vol_ratio_prev  這一分鐘成交量 / 前一分鐘量 - 1（同樣是pct_change
+                        形式，對短期急拉/急縮量比較敏感）
+        atr7            1分鐘K ATR(7) 相對波動（True Range 7根滾動平均 / 當日
+                        開盤價，比照 strategy/orb/features.py 的 atr7 算法）
+        ret_1m          這一分鐘收盤 vs 前一分鐘收盤的變化率
+        range_pct       這一分鐘 high-low 寬度 / 當日開盤價
+        body_pct        這一分鐘 close-open 變化率 / 當日開盤價
+
+    range_pct/body_pct 特意不是「除以 high-low」的比值（不是 close_pos 那種
+    寫法）——分子就是 high-low / close-open 本身，平盤（high=low）時這兩個
+    自然算出 0，不會產生 0/0 的 NaN，不會被 dropna(subset=FEATURES) 濾掉
+    （見 2026-07-14 close_pos 那次討論的教訓）。
+
+    m1 需已有 stock_id/date/day_date/open/high/low/close/volume 欄位，
+    date 需為 datetime，day_date 為 date（不是 datetime）。
+    """
+    m1 = m1.copy()
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    day_open = g_day["open"].transform("first").replace(0, np.nan)
+
+    # pct_change形式（0=沒變、正負=放量/縮量%），跟 ret_1m 的「0點」意義一致，
+    # 方便對照著看（對RandomForest本身沒差——樹模型對整體平移不敏感，比值
+    # 形式跟pct_change形式切出來的結果一樣，純粹是可讀性考量，2026-07-19討論）。
+    cum_vol = g_day["volume"].transform("cumsum")
+    bar_count = g_day["volume"].transform("cumcount") + 1
+    m1["vol_ratio_cum"] = m1["volume"] / (cum_vol / bar_count).replace(0, np.nan) - 1
+
+    vol_shift1 = g_day["volume"].shift(1)
+    # 防止，為 0
+    m1["vol_ratio_prev"] = m1["volume"] / vol_shift1.replace(0, np.nan) - 1
+
+    # True Range（首根用開盤價當前收，理由同 rally/orb 的 m1_atr 寫法）
+    prev_close = g_day["close"].shift(1).fillna(m1["open"])
+    m1["_tr"] = np.maximum(
+        np.maximum((m1["high"] - m1["low"]).abs(), (m1["high"] - prev_close).abs()),
+        (m1["low"] - prev_close).abs(),
+    )
+    g_tr = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    m1["atr7"] = g_tr["_tr"].transform(lambda x: x.rolling(7, min_periods=7).mean()) / day_open
+    m1 = m1.drop(columns=["_tr"])
+
+    m1["ret_1m"] = g_day["close"].pct_change(1, fill_method=None)
+    m1["range_pct"] = (m1["high"] - m1["low"]) / day_open
+    m1["body_pct"] = (m1["close"] - m1["open"]) / day_open
+
+    return m1
+
+
 def top_n_by_prev_day_volume(m1: pd.DataFrame, n: int = 500) -> pd.DataFrame:
     """
     只留每天「依前一交易日全天成交量排序」前 n 名的股票（流動性過濾的簡易
@@ -125,3 +182,27 @@ def make_barrier_labels_3class(
         ),
         include_groups=False,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 模型實際用哪些特徵（train.py 從這裡匯入，不要在 train.py 裡另外定義一份）
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 2026-07-19：加了 add_bar_features() 這6個當根K棒特徵後，
+# feature_importance() 顯示 atr7(45.69%)主導了樹的分割，把驗證過真的有
+# 方向性訊號的 ret_vs_idx 重要性稀釋到只剩10.31%，precision/recall全面
+# 變差——atr7本質上是「波動幅度」指標，不帶方向資訊。拿掉atr7後（順便拿掉
+# 它6根K棒的暖機期，9:00~9:05樣本回來了）發現 range_pct 頂上去變成主導
+# （51.12%），同樣的問題重演，尤其「漲」這個類別recall掉到只剩0.03——
+# range_pct跟atr7是同一種東西（K棒振幅大小，不帶方向），所以也拿掉了。
+# 目前只留 ret_vs_idx + 4個量能相關特徵，還沒重新驗證這個組合的precision
+# 有沒有回升。
+FEATURES = [
+    "ret_vs_idx",
+    "vol_ratio_cum",
+    "vol_ratio_prev",
+    "ret_1m",
+    # "range_pct",
+    # "atr7",
+    "body_pct",
+]
