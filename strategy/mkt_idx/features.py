@@ -21,10 +21,15 @@ def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFra
     """
     算「個股從今日開盤累積到現在的報酬率」減去「0050從今日開盤累積到現在
     的報酬率」，逐分鐘更新，回傳加了 ret_vs_idx 欄位的 m1（複本，不動傳
-    進來的原始 df）。
+    進來的原始 df）。順便廣播 0050 自己「這一分鐘」的報酬率（idx_ret_1m，
+    不是累積型），給 add_bar_features() 算「0050漲個股跌」這種分鐘級的
+    背離旗標用（2026-07-20 討論）。
 
     >0 代表這支股票從開盤到現在，漲得比大盤多（相對強勢）；
     <0 代表跑輸大盤（相對弱勢）。
+
+    這支函式一定要在 top_n_by_prev_day_volume()（流動性過濾，會把0050濾掉）
+    之前呼叫，理由見下面 idx_symbol 那段——濾掉之後就沒有0050的列可以算了。
 
     m1 需已有 stock_id/date/day_date/open/close 欄位，date 需為 datetime，
     day_date 為 date（不是 datetime）。
@@ -33,16 +38,17 @@ def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFra
     g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
     day_open = g_day["open"].transform("first").replace(0, np.nan)
     m1["_ret_since_open"] = m1["close"] / day_open - 1
+    m1["_ret_1m"] = g_day["close"].pct_change(1, fill_method=None)
 
     idx = (
-        m1[m1["stock_id"] == idx_symbol][["date", "_ret_since_open"]]
-        .rename(columns={"_ret_since_open": "_idx_ret_since_open"})
+        m1[m1["stock_id"] == idx_symbol][["date", "_ret_since_open", "_ret_1m"]]
+        .rename(columns={"_ret_since_open": "_idx_ret_since_open", "_ret_1m": "idx_ret_1m"})
         .drop_duplicates("date")
     )
 
     m1 = m1.merge(idx, on="date", how="left")
     m1["ret_vs_idx"] = m1["_ret_since_open"] - m1["_idx_ret_since_open"]
-    m1 = m1.drop(columns=["_ret_since_open", "_idx_ret_since_open"])
+    m1 = m1.drop(columns=["_ret_since_open", "_idx_ret_since_open", "_ret_1m"])
     return m1
 
 
@@ -65,6 +71,15 @@ def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
         bullish_volume_surge 這一分鐘收紅K + 量至少是前一分鐘1.5倍的旗標
                         （0/1，2026-07-19 討論，「單一K棒翻轉」試過沒訊號後
                         改成這個更簡單的版本）
+        bullish_reversal 前一分鐘收黑K、這一分鐘收紅K的翻轉旗標（0/1，
+                        2026-07-20 在新時段9:11~9:30重新測，之前在
+                        9:00~9:10測過沒訊號，但那個時段已經棄用）
+        bearish_divergence 這一分鐘0050漲、但個股跌的背離旗標（0/1，
+                        2026-07-20討論。需要先呼叫過 add_ret_vs_idx()
+                        算出 idx_ret_1m 這個欄位才能用這支函式）
+
+    m1 若沒有先呼叫過 add_ret_vs_idx()、缺少 idx_ret_1m 欄位，
+    bearish_divergence 那一行會直接 KeyError，不會安靜地產生錯的結果。
 
     range_pct/body_pct 特意不是「除以 high-low」的比值（不是 close_pos 那種
     寫法）——分子就是 high-low / close-open 本身，平盤（high=low）時這兩個
@@ -113,6 +128,22 @@ def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
     # 「前一分鐘」，vol_ratio_prev 是 NaN，比較結果會是 False（0），不會是
     # NaN。
     m1["bullish_volume_surge"] = ((m1["body_pct"] > 0) & (m1["vol_ratio_prev"] >= 0.5)).astype(int)
+
+    # 翻轉訊號（最單純版本：只有「前一分鐘跌、這一分鐘漲」兩個條件，不加
+    # range/量的限制）：2026-07-19 在9:00~9:10這個時段測過importance只有
+    # 0.47%，但那時候測的時段後來被判定是雜訊時段、已經棄用（改成
+    # 9:11~9:30，見 config.py 的說明）。2026-07-20 在新時段下重新測一次，
+    # 不能直接沿用舊時段的結論。
+    g_day2 = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    body_pct_lag1 = g_day2["body_pct"].shift(1)
+    m1["bullish_reversal"] = ((body_pct_lag1 < 0) & (m1["body_pct"] > 0)).astype(int)
+
+    # 大盤漲、個股跌的分鐘級背離旗標（0/1，2026-07-20討論）：跟 ret_vs_idx
+    # 不同——ret_vs_idx 是「從開盤累積到現在」的差距，這裡是「這一分鐘」
+    # 兩者方向是不是相反，是更即時、不受累積效應影響的版本。idx_ret_1m 是
+    # add_ret_vs_idx() 廣播過來的0050這一分鐘報酬率，一定要先呼叫過
+    # add_ret_vs_idx() 才會有這個欄位。
+    m1["bearish_divergence"] = ((m1["idx_ret_1m"] > 0) & (m1["ret_1m"] < 0)).astype(int)
 
     return m1
 
@@ -223,8 +254,10 @@ FEATURES = [
     "vol_ratio_cum",
     "vol_ratio_prev",
     "ret_1m",
-    # "range_pct",
-    # "atr7",
+    "range_pct",
+    "atr7",
     "body_pct",
     "bullish_volume_surge",
+    "bullish_reversal",
+    "bearish_divergence",
 ]
