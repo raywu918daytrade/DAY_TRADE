@@ -9,12 +9,18 @@ orb 策略對外的即時交易介面 — live_trader.py 只透過這支檔案�
 train.py/validate.py/features.py 這些訓練/驗證用的東西，live_trader.py 完全
 不會碰到，依賴方向永遠是單向的：live_trader → live.py → predict.py/train.py。
 
-目前 live 用的是 LightGBM（m1_orb_lgbm.pkl）——見 strategy/orb/validate.py
-的 compare_report()，同一份測試集上表現比 XGB 好。
+要用哪個模型（lgbm/xgb）由 config.MODEL_TYPE 決定（讀 .env 的
+ORB_MODEL_TYPE，預設 lgbm），跟 run_backtest.py 共用同一個參數，比照
+strategy/rally/live.py 的做法，改 config.py/.env 一個地方兩邊就會一起換。
 """
 
-from strategy.orb.config import SESSION_END, SESSION_START
+from strategy.orb.config import MODEL_TYPE, SESSION_END, SESSION_START
 from strategy.orb.predict import build_prewarm_cache, predict_live
-from strategy.orb.train import load_model_xgb as load_model
+from strategy.orb.train import load_model_by_type
+
+
+def load_model():
+    return load_model_by_type(MODEL_TYPE)
+
 
 __all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "build_prewarm_cache"]

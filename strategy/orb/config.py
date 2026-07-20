@@ -1,8 +1,18 @@
 """
-交易相關設定 — orb 策略 LGBM 模型與 entry.py 共用的常數
+交易相關設定 — orb 策略 LGBM/XGB 模型與 entry.py 共用的常數
 
 只放常數，不放邏輯，比照 strategy/rally/config.py 的作法。
 """
+
+import os
+
+# ── 要用哪個模型（lgbm / xgb） ─────────────────────────────────────────────
+# run_backtest.py（回測）跟 live.py（即時交易）都讀這個，只改這裡（或 .env 的
+# ORB_MODEL_TYPE）一個地方就能同時切換兩邊要用的模型，比照 rally 的做法
+# （strategy/rally/config.py 的 MODEL_TYPE）。預設 lgbm——見
+# strategy/orb/validate.py 的 compare_report()，同一份測試集上 AUC、精確率
+# 門檻表現都比 XGB 好。
+MODEL_TYPE = os.environ.get("ORB_MODEL_TYPE", "lgbm")
 
 # ── Triple Barrier 參數（標籤怎麼定義，沿用 rally 的定義） ──────────────────
 # 2026-07-11 測過改成 2%：test_days=10 AUC 幾乎沒變（0.4925→0.4916），

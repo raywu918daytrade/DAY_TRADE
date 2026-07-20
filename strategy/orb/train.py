@@ -175,3 +175,17 @@ def load_model_xgb():
     if not _MODEL_PATH_XGB.exists():
         raise FileNotFoundError("找不到 XGB 模型，請先執行 train_xgb()")
     return joblib.load(_MODEL_PATH_XGB)
+
+
+_MODEL_LOADERS = {
+    "lgbm": load_model_lgbm,
+    "xgb": load_model_xgb,
+}
+
+
+def load_model_by_type(model_type: str):
+    """依 config.MODEL_TYPE（"lgbm"/"xgb"）載入對應模型，
+    run_backtest.py 跟 live.py 共用這支，切換模型只要改 config.py/.env 一個地方。"""
+    if model_type not in _MODEL_LOADERS:
+        raise ValueError(f"未知 model_type: {model_type!r}，可用: {list(_MODEL_LOADERS)}")
+    return _MODEL_LOADERS[model_type]()

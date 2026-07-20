@@ -13,13 +13,12 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backtest.intraday_platform import print_trades, run_backtest
-from strategy.orb.config import DEFAULT_TEST_DAYS, HOLD_BARS, SL_PCT, TP_PCT
+from strategy.orb.config import DEFAULT_TEST_DAYS, HOLD_BARS, MODEL_TYPE, SL_PCT, TP_PCT
 from strategy.orb.predict import predict
-from strategy.orb.train import load_model_lgbm, load_model_xgb
+from strategy.orb.train import load_model_by_type
 
 
 def run(
-    model_name: str = "lgbm",
     test_days: int = DEFAULT_TEST_DAYS,
     threshold: float = 0.70,
     top_n: int = 999,
@@ -30,8 +29,10 @@ def run(
     """
     跑一次 ORB 回測。
 
-    model_name: "lgbm" 或 "xgb"——見 strategy/orb/validate.py 的 compare_report()，
-        LGBM 目前表現比較好，預設用它。
+    要用哪個模型（lgbm/xgb）由 config.MODEL_TYPE 決定（讀 .env 的
+    ORB_MODEL_TYPE，預設 lgbm），跟 live.py 共用同一個參數，比照 rally 的
+    run_backtest.py 做法——只改 config.py/.env 一個地方，回測跟即時交易就會
+    一起換模型，不用兩邊分別改。
     threshold: 信心度門檻，只有 proba >= threshold 的候選才會進場。
     top_n: 同一分鐘最多取幾支（999 等於不限制，因為候選本來就稀疏，見
         strategy/orb/features.py 的候選篩選邏輯）。
@@ -51,8 +52,7 @@ def run(
         內）誤濾掉。改用 rolling(10)——跟 OPENING_RANGE_MINUTES=10 對齊，
         搜尋窗口一開始（第10分鐘）就有滿10根K棒，不會有暖機期問題。
     """
-    loader = load_model_lgbm if model_name == "lgbm" else load_model_xgb
-    model = loader()
+    model = load_model_by_type(MODEL_TYPE)
 
     df_proba = predict(model=model, test_days=test_days)
     print(f"機率矩陣: {df_proba.shape}，非空值 {df_proba.notna().sum().sum()} 筆")
@@ -77,7 +77,6 @@ def run(
 
 if __name__ == "__main__":
     run(
-        model_name="xgb",
         test_days=DEFAULT_TEST_DAYS,
         threshold=0.7,
         first_entry_time="09:10",
