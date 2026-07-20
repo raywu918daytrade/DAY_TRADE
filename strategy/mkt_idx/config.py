@@ -16,9 +16,14 @@ SL_PCT = 0.03
 HOLD_BARS = 10
 
 # ── 交易時段 ──────────────────────────────────────────────────────────────
-SESSION_START = (9, 1)
-_end_h = int(os.environ.get("MKT_IDX_SESSION_END_HOUR", "13"))
-_end_m = int(os.environ.get("MKT_IDX_SESSION_END_MIN", "25"))
+# 2026-07-20 討論：9:00~9:10排除不用——開盤集合競價剛結束，波動雖大
+# （strategy/mkt_idx/experiments/opening_hour_10min_distribution.py 測過這
+# 段訊號密度最高），但被認為是雜訊、沒有方向性，不是要進場的時機。實際
+# 交易時段改成9:11~9:30，跟 train.py::_prepare_data() 的 minute_min/
+# minute_max 要保持一致。
+SESSION_START = (9, 11)
+_end_h = int(os.environ.get("MKT_IDX_SESSION_END_HOUR", "9"))
+_end_m = int(os.environ.get("MKT_IDX_SESSION_END_MIN", "30"))
 SESSION_END = (_end_h, _end_m)
 
 # ── 大盤代理股票代號 ───────────────────────────────────────────────────────
