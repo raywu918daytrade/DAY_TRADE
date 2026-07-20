@@ -148,6 +148,44 @@ def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
     return m1
 
 
+def add_m3_m5_features(m1: pd.DataFrame, m3: pd.DataFrame, m5: pd.DataFrame) -> pd.DataFrame:
+    """
+    加 m3（3分鐘K）、m5（5分鐘K）的收盤價、成交量特徵（2026-07-20討論），
+    比照 strategy/rally/features.py 的 m3_ret/m3_volume 算法：
+        m3_ret          3分鐘K收盤價，跟3分鐘前比的報酬率
+        m3_vol_ratio    3分鐘K成交量，跟3分鐘前比的變化率（pct_change形式）
+        m5_ret          5分鐘K收盤價，跟5分鐘前比的報酬率
+        m5_vol_ratio    5分鐘K成交量，跟5分鐘前比的變化率
+
+    db/m3、db/m5（build_m3_m5_rolling.py 預先聚合，見 data/query.py 的
+    load_m3()/load_m5()）是「每分鐘一列」的滾動視窗（例如db/m3的09:05那列，
+    是09:03~09:05這3根1分K滾動聚合的結果，close就是當下這一分鐘的收盤價，
+    volume是這3根的量加總），不是每3分鐘存一列的固定區間——所以能直接用
+    stock_id+date跟m1逐列對齊merge，不用另外做時間戳對齊/resample。
+
+    m3/m5需要3/5根K棒才有值，09:00開盤後m3從第3分鐘（約09:02）、m5從第5
+    分鐘（約09:04）才開始有值，都在現在的訓練時段9:11~9:30之前，不會
+    像atr7那樣犧牲掉時段內的樣本（2026-07-19 atr7暖機期的教訓）。
+
+    m1 需已有 stock_id/day_date/date 欄位，date 需為 datetime。
+    """
+    m1 = m1.copy()
+
+    m3 = m3[["stock_id", "date", "close", "volume"]].rename(columns={"close": "_m3_close", "volume": "_m3_volume"})
+    m5 = m5[["stock_id", "date", "close", "volume"]].rename(columns={"close": "_m5_close", "volume": "_m5_volume"})
+    m1 = m1.merge(m3, on=["stock_id", "date"], how="left")
+    m1 = m1.merge(m5, on=["stock_id", "date"], how="left")
+
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    m1["m3_ret"] = g_day["_m3_close"].pct_change(3, fill_method=None)
+    m1["m3_vol_ratio"] = g_day["_m3_volume"].pct_change(3, fill_method=None)
+    m1["m5_ret"] = g_day["_m5_close"].pct_change(5, fill_method=None)
+    m1["m5_vol_ratio"] = g_day["_m5_volume"].pct_change(5, fill_method=None)
+
+    m1 = m1.drop(columns=["_m3_close", "_m3_volume", "_m5_close", "_m5_volume"])
+    return m1
+
+
 def top_n_by_prev_day_volume(m1: pd.DataFrame, n: int = 500) -> pd.DataFrame:
     """
     只留每天「依前一交易日全天成交量排序」前 n 名的股票（流動性過濾的簡易
@@ -254,10 +292,14 @@ FEATURES = [
     "vol_ratio_cum",
     "vol_ratio_prev",
     "ret_1m",
-    "range_pct",
-    "atr7",
     "body_pct",
     "bullish_volume_surge",
     "bullish_reversal",
     "bearish_divergence",
+    "m3_ret",
+    "m3_vol_ratio",
+    "m5_ret",
+    "m5_vol_ratio",
+    # "range_pct",
+    # "atr7",
 ]

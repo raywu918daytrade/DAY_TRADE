@@ -467,9 +467,7 @@ def make_features(
         m1["minutes_since_open"] < BREAKOUT_SEARCH_MINUTES
     )
     _prev_close_for_breakout = g_day["close"].shift(1)
-    m1["_is_breakout"] = (
-        _search_window & (m1["close"] > _or_high) & (_prev_close_for_breakout <= _or_high)
-    )
+    m1["_is_breakout"] = _search_window & (m1["close"] > _or_high) & (_prev_close_for_breakout <= _or_high)
 
     # ── True Range / ATR(7) / VWAP偏離（逐日重算，不跨日）───────────────────
     # 2026-07-11：vol_surge(需20根)/m1_atr(需14根)/adx(需28根) 拿掉了，因為跟
@@ -534,7 +532,7 @@ def make_features(
     m1 = m1.drop(columns=["_tr", "_cum_vol", "_pv", "_cum_pv", "_hourly_tr_baseline"])
 
     # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷 ─────────────
-    # db/m3、db/m5 是批次預算（data/build_m3_m5.py 從 db/m1/ 算好存檔，用的是
+    # db/m3、db/m5 是批次預算（data/build_m3_m5_rolling.py 從 db/m1/ 算好存檔，用的是
     # data/resample.py 的 compute_m3()/compute_m5()），只有訓練用的完整歷史
     # m1 才會跟它對得上，即時推論要呼叫端傳 m3/m5 進來。
     if m3 is None:
@@ -599,9 +597,7 @@ def make_features(
             open_vol_summary[col] = osg[raw_col].shift(lag)
             open_vol_cols.append(col)
 
-    m1 = m1.merge(
-        open_vol_summary[["stock_id", "day_date"] + open_vol_cols], on=["stock_id", "day_date"], how="left"
-    )
+    m1 = m1.merge(open_vol_summary[["stock_id", "day_date"] + open_vol_cols], on=["stock_id", "day_date"], how="left")
 
     # ── 個股日K 背景特徵（過去5天報酬率、ATR、5/10/20日均線乖離）─────────────
     if day is None:
@@ -665,9 +661,7 @@ def make_features(
         day[col] = dg["close"].shift(lag)
         close_lag_ref_cols.append(col)
 
-    day_feat_cols = (
-        ["stock_id", "day_date"] + day_ret_cols + ["day_atr", "vol_ma20"] + ma_cols + close_lag_ref_cols
-    )
+    day_feat_cols = ["stock_id", "day_date"] + day_ret_cols + ["day_atr", "vol_ma20"] + ma_cols + close_lag_ref_cols
     m1 = m1.merge(day[day_feat_cols], on=["stock_id", "day_date"], how="left")
 
     # 目前價格 vs 過去1~5天各自收盤價的漲跌幅：逐分鐘更新，代表「今天到目前
@@ -712,9 +706,7 @@ def make_features(
         idx_dg = idx_day.groupby("stock_id")
         idx_day["_idx_prev_close"] = idx_dg["close"].shift(1)
         idx_day["_idx_day_tr"] = np.maximum(
-            np.maximum(
-                (idx_day["high"] - idx_day["low"]).abs(), (idx_day["high"] - idx_day["_idx_prev_close"]).abs()
-            ),
+            np.maximum((idx_day["high"] - idx_day["low"]).abs(), (idx_day["high"] - idx_day["_idx_prev_close"]).abs()),
             (idx_day["low"] - idx_day["_idx_prev_close"]).abs(),
         )
         idx_dg = idx_day.groupby("stock_id")

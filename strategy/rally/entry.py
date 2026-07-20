@@ -32,7 +32,7 @@ from pathlib import Path
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from data.build_m3_m5 import build as build_m3_m5
+from data.build_m3_m5_rolling import build as build_m3_m5
 from strategy.rally.config import (  # noqa: F401  (re-export：交易參數一眼看到全部)
     BREAKOUT_TRADE_END,
     BREAKOUT_TRADE_START,

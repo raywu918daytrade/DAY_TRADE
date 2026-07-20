@@ -64,7 +64,8 @@ def load_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
 
 
 def load_m3() -> pd.DataFrame:
-    """載入 db/m3/ 全部 3 分鐘K（由 build_m3_m5.py 預先聚合）"""
+    """載入 db/m3/ 全部 3 分鐘K，rolling 版本，每分鐘一列（由
+    build_m3_m5_rolling.py 預先聚合）"""
     path = _ROOT / "db/m3"
     if not path.exists():
         return pd.DataFrame()
@@ -74,8 +75,31 @@ def load_m3() -> pd.DataFrame:
 
 
 def load_m5() -> pd.DataFrame:
-    """載入 db/m5/ 全部 5 分鐘K（由 build_m3_m5.py 預先聚合）"""
+    """載入 db/m5/ 全部 5 分鐘K，rolling 版本，每分鐘一列（由
+    build_m3_m5_rolling.py 預先聚合）"""
     path = _ROOT / "db/m5"
+    if not path.exists():
+        return pd.DataFrame()
+    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def load_m3_std() -> pd.DataFrame:
+    """載入 db/m3_std/ 全部標準獨立 3 分K棒，一根K棒一列（由
+    build_m3_m5_std.py 預先聚合）"""
+    path = _ROOT / "db/m3_std"
+    if not path.exists():
+        return pd.DataFrame()
+    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def load_m5_std() -> pd.DataFrame:
+    """載入 db/m5_std/ 全部標準獨立 5 分K棒，一根K棒一列（由
+    build_m3_m5_std.py 預先聚合）"""
+    path = _ROOT / "db/m5_std"
     if not path.exists():
         return pd.DataFrame()
     df = ds.dataset(str(path), format="parquet").to_table().to_pandas()

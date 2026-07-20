@@ -323,7 +323,7 @@ def make_features(
     m1["m1_atr"] = _degroup(g_day["_tr"].rolling(14, min_periods=14).mean(), m1.index) / day_open
 
     # ── 載入預先聚合的 db/m3、db/m5（訓練走 cache，效能考量）───────────
-    # db/m3、db/m5 是批次預算（data/build_m3_m5.py 從 db/m1/ 算好存檔），
+    # db/m3、db/m5 是批次預算（data/build_m3_m5_rolling.py 從 db/m1/ 算好存檔），
     # 只有訓練用的完整歷史 m1 才會跟它對得上。即時推論的 m1（當天 m1_live）
     # 不在這個 cache 裡，呼叫端必須自己用 compute_m3()/compute_m5() 現算後
     # 明確傳進來，不能依賴這裡的 fallback，否則 merge 完全對不上、m3_*/m5_*
