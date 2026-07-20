@@ -22,8 +22,8 @@ _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from data.query import load_m1
-from strategy.rally.features import compute_m3 as _compute_m3
-from strategy.rally.features import compute_m5 as _compute_m5
+from data.resample import compute_m3 as _compute_m3
+from data.resample import compute_m5 as _compute_m5
 
 _M1_DIR = _ROOT / "db/m1"
 _M3_DIR = _ROOT / "db/m3"

@@ -31,6 +31,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.query import load_day, load_m1, load_m3, load_m5
+from data.resample import compute_m3, compute_m5
 from strategy.orb.config import (
     BREAKOUT_SEARCH_MINUTES,
     HOLD_BARS,
@@ -372,39 +373,6 @@ def build_history_tables(m1: pd.DataFrame) -> tuple:
     return _open_vol_ratios(m1), _hourly_tr_summary(m1)
 
 
-def compute_m3(m1: pd.DataFrame) -> pd.DataFrame:
-    """
-    從 1 分K 現算 rolling-3 OHLCV（量用 sum）。跟 strategy/rally/features.py
-    的 compute_m3() 是同一份邏輯，複製過來維持 orb/ 自成一個獨立模組
-    （不跨 strategy 資料夾互相 import，理由見 [[feedback_isolate_experiments]]
-    同一套「模組互相獨立」原則）。
-
-    輸入需先有 stock_id / date / day_date 欄位並依 stock_id、date 排序。
-    predict_live() 對當天的 m1_live 現算用——db/m3/ 是批次產物，不含「今天」
-    的資料，即時推論不能拿它 merge，否則 m3_* 全部變 NaN。
-    """
-    g = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    out = m1[["stock_id", "date"]].copy()
-    out["open"] = g["open"].shift(2)
-    out["high"] = _degroup(g["high"].rolling(3).max(), m1.index)
-    out["low"] = _degroup(g["low"].rolling(3).min(), m1.index)
-    out["close"] = m1["close"].values
-    out["volume"] = _degroup(g["volume"].rolling(3).sum(), m1.index)
-    return out
-
-
-def compute_m5(m1: pd.DataFrame) -> pd.DataFrame:
-    """從 1 分K 現算 rolling-5 OHLCV（量用 sum）。用法同 compute_m3()。"""
-    g = m1.groupby(["stock_id", "day_date"], group_keys=False)
-    out = m1[["stock_id", "date"]].copy()
-    out["open"] = g["open"].shift(4)
-    out["high"] = _degroup(g["high"].rolling(5).max(), m1.index)
-    out["low"] = _degroup(g["low"].rolling(5).min(), m1.index)
-    out["close"] = m1["close"].values
-    out["volume"] = _degroup(g["volume"].rolling(5).sum(), m1.index)
-    return out
-
-
 def make_features(
     m1: pd.DataFrame,
     m3: pd.DataFrame | None = None,
@@ -566,9 +534,9 @@ def make_features(
     m1 = m1.drop(columns=["_tr", "_cum_vol", "_pv", "_cum_pv", "_hourly_tr_baseline"])
 
     # ── 3分K（過去3根）/ 5分K（過去2根）—— 中期動能當多空判斷 ─────────────
-    # db/m3、db/m5 是批次預算（data/build_m3_m5.py 從 db/m1/ 算好存檔，
-    # 用的是 strategy/rally/features.py 的 compute_m3()/compute_m5()），
-    # 只有訓練用的完整歷史 m1 才會跟它對得上，即時推論要呼叫端傳 m3/m5 進來。
+    # db/m3、db/m5 是批次預算（data/build_m3_m5.py 從 db/m1/ 算好存檔，用的是
+    # data/resample.py 的 compute_m3()/compute_m5()），只有訓練用的完整歷史
+    # m1 才會跟它對得上，即時推論要呼叫端傳 m3/m5 進來。
     if m3 is None:
         m3 = load_m3()
     if m5 is None:
