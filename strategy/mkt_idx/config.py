@@ -15,6 +15,20 @@ TP_PCT = 0.03
 SL_PCT = 0.03
 HOLD_BARS = 10
 
+# ── 要用哪個模型（rfc / xgb / lgbm） ──────────────────────────────────────
+# run_backtest.py（回測）跟 live.py（即時交易）都讀這個，只改這裡一個地方
+# 就能同時切換兩邊要用的模型，比照 strategy/rally/config.py、strategy/orb/
+# config.py 的做法。
+MODEL_TYPE = os.environ.get("MKT_IDX_MODEL_TYPE", "lgbm")
+
+# ── 即時交易信心度門檻預設值 ──────────────────────────────────────────────
+# main/live_trader.py 每分鐘先查前端 settings 裡的全域 threshold，沒設定才
+# fallback 這裡（見 main/state.py::StrategyState、main/live_trader.py 的
+# 說明）——原本 main/config.py 有一個全域 THRESHOLD 給所有策略共用，但
+# orb/rally/mkt_idx 三個模型的機率校準跟最佳門檻不一定一樣，2026-07-21 拆成
+# 各策略自己一個。跟 predict.py::predict_live() 的 threshold 參數預設值一致。
+THRESHOLD = float(os.environ.get("MKT_IDX_THRESHOLD", "0.6"))
+
 # ── 交易時段 ──────────────────────────────────────────────────────────────
 # 2026-07-20 討論：9:00~9:10排除不用——開盤集合競價剛結束，波動雖大
 # （strategy/mkt_idx/experiments/opening_hour_10min_distribution.py 測過這

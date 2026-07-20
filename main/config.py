@@ -43,7 +43,10 @@ WATCHLIST_QUOTES = [
 ]
 
 TRADE_MODE = os.environ.get("TRADE_MODE", "off")  # off | paper | sim | live
-THRESHOLD = float(os.environ.get("THRESHOLD", "0.55"))
+# 2026-07-21：原本這裡有一個全域 THRESHOLD 給所有策略共用，拆成各策略自己
+# 一個（見 strategy/{orb,rally,mkt_idx}/config.py 的 THRESHOLD、
+# main/state.py::StrategyState 的說明），前端 settings 的 threshold 設定仍是
+# 全域覆蓋值（未設定時才各自 fallback 各策略的預設值）。
 FORCE_CLOSE_HOUR = int(os.environ.get("FORCE_CLOSE_HOUR", "13"))
 FORCE_CLOSE_MIN = int(os.environ.get("FORCE_CLOSE_MIN", "25"))
 

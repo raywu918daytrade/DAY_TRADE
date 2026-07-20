@@ -1,20 +1,24 @@
 """
-mkt_idx 模型訓練 — RandomForest
+mkt_idx 模型訓練 — RandomForest / XGBoost / LightGBM
 
 2026-07-14 討論：先用最簡單的設定跑一次，確認整條 pipeline（特徵→標籤→
 流動性過濾→時段過濾→訓練）真的串得起來、看得懂結果，之後再逐步加特徵、
-調參數（先精簡、慢慢加，避免一次寫太多debug不動）。
+調參數（先精簡、慢慢加，避免一次寫太多debug不動）。2026-07-21 加了
+XGBoost/LightGBM，三個模型共用同一份 FEATURES/_split_data() 切分邏輯，
+比照 strategy/rally/train.py 的三模型設計。
 
 目前設定（都是前面幾支 experiments/ 腳本驗證出來的結論）：
     FEATURES        見 strategy/mkt_idx/features.py（單一事實來源，這裡
                     不重複列一份，避免兩邊各自維護一份不一致）
     流動性過濾：前一日量前100名   訊號密度提升最明顯的門檻
-    時段：只留9:00~9:10           訊號集中在開盤頭10分鐘，之後快速衰退
+    時段：9:11~9:30                9:00~9:10被判定為開盤集合競價剛結束的
+                    雜訊時段、沒有方向性，已棄用（見 config.py 的說明）
     3分類標籤：漲/平/跌           HOLD_BARS=10、TP_PCT=SL_PCT=3%（見config.py）
 
 == Main 模式 ==
 
-train        訓練模型（RandomForest），存至 models/mkt_idx_rfc.pkl
+train        訓練模型，存至 models/mkt_idx_{rfc,xgb,lgbm}.pkl（用
+             --model_type 選演算法，預設rfc）
 importance   顯示特徵重要性（讀已存的模型，不重訓）
 evaluate     單獨印混淆矩陣 + 分類報告（讀已存的模型 + 跟訓練時同一套切分
              邏輯重新切出測試集，不重訓）
@@ -23,7 +27,9 @@ confidence   漲/跌兩個稀有類別的信心度門檻掃描，看不同機率
 
 用法：
     python -m strategy.mkt_idx.train train
-    python -m strategy.mkt_idx.train importance
+    python -m strategy.mkt_idx.train train --model_type xgb
+    python -m strategy.mkt_idx.train train --model_type lgbm
+    python -m strategy.mkt_idx.train importance --model_type xgb
     python -m strategy.mkt_idx.train evaluate
     python -m strategy.mkt_idx.train confidence
 
@@ -45,11 +51,13 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from data.query import load_m1
+from data.query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
 from strategy.mkt_idx.config import IDX_SYMBOL
 from strategy.mkt_idx.features import (
     FEATURES,
     add_bar_features,
+    add_m3_m5_features,
+    add_m3_m5_std_features,
     add_ret_vs_idx,
     make_barrier_labels_3class,
     top_n_by_prev_day_volume,
@@ -57,9 +65,46 @@ from strategy.mkt_idx.features import (
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH = _ROOT / "models/mkt_idx_rfc.pkl"
+_MODEL_PATH_XGB = _ROOT / "models/mkt_idx_xgb.pkl"
+_MODEL_PATH_LGBM = _ROOT / "models/mkt_idx_lgbm.pkl"
+_CACHE_PATH = _ROOT / "cache/mkt_idx_prepared.parquet"
+_SOURCE_DIRS = [_ROOT / "db/m1", _ROOT / "db/m3", _ROOT / "db/m5", _ROOT / "db/m3_std", _ROOT / "db/m5_std"]
 
 
-def _prepare_data(top_n: int = 100, hour: int = 9, minute_max: int = 10) -> pd.DataFrame:
+def _source_mtime() -> float:
+    """db/m1、db/m3、db/m5 裡所有檔案中最新的修改時間戳，比照
+    strategy/rally/features.py 的 _m1_mtime() 寫法。"""
+    mtimes = [f.stat().st_mtime for d in _SOURCE_DIRS if d.exists() for f in d.iterdir() if f.suffix == ".parquet"]
+    return max(mtimes) if mtimes else 0
+
+
+def _cache_is_fresh() -> bool:
+    if not _CACHE_PATH.exists():
+        return False
+    return _CACHE_PATH.stat().st_mtime >= _source_mtime()
+
+
+def _prepare_data(
+    top_n: int = 100, hour: int = 9, minute_min: int = 11, minute_max: int = 30, use_cache: bool = False
+) -> pd.DataFrame:
+    """
+    use_cache（2026-07-21討論）：
+        True  = 不管 db/m1、db/m3、db/m5 有沒有更新，只要cache檔案存在
+                就直接用（最快，但可能用到過期資料，適合快速反覆測試
+                evaluate()/confidence_report() 這種下游邏輯、不在意資料
+                新不新的情境）
+        False（預設）= 自動判斷：cache存在且比三個來源資料夾裡最新的檔案
+                還新，就直接用cache；只要來源有任何檔案比cache新（例如
+                db/m1 今天寫進新的即時資料），就視為過期、重新跑一次完整
+                流程並覆蓋掉舊cache。不用手動清cache、不用設定過期時間。
+    """
+    if use_cache and _CACHE_PATH.exists():
+        print("use_cache=True，直接讀取cache（不檢查來源資料有沒有更新）...")
+        return pd.read_parquet(_CACHE_PATH)
+    if not use_cache and _cache_is_fresh():
+        print("cache比來源資料新，直接讀取cache...")
+        return pd.read_parquet(_CACHE_PATH)
+
     print("載入分K...")
     m1 = load_m1()
     m1["date"] = pd.to_datetime(m1["date"])
@@ -79,27 +124,47 @@ def _prepare_data(top_n: int = 100, hour: int = 9, minute_max: int = 10) -> pd.D
     print("算當根K棒量能/波動特徵...")
     df = add_bar_features(df)
 
+    print("算m3/m5收盤價/成交量特徵...")
+    # load_m3()/load_m5() 是 db/m3、db/m5 全部歷史（build_m3_m5_rolling.py 預先聚合，
+    # 見 data/query.py 的說明），這裡在流動性過濾之後才merge，減少資料量。
+    df = add_m3_m5_features(df, load_m3(), load_m5())
+
+    print("算m3_std/m5_std收盤價/成交量特徵...")
+    # db/m3_std、db/m5_std（build_m3_m5_std.py 預先聚合）是標準獨立K棒，跟
+    # 上面 rolling 版意義不同，見 features.py::add_m3_m5_std_features() 的說明。
+    df = add_m3_m5_std_features(df, load_m3_std(), load_m5_std())
+
     print("計算3分類標籤（漲=2/平=1/跌=0）...")
     df["target"] = make_barrier_labels_3class(df)
 
-    print(f"時段過濾：{hour}:00~{hour}:{minute_max:02d}...")
-    df = df[(df["date"].dt.hour == hour) & (df["date"].dt.minute < minute_max)].copy()
+    print(f"時段過濾：{hour}:{minute_min:02d}~{hour}:{minute_max:02d}...")
+    # 2026-07-20 討論：9:00~9:10改成不用（開盤集合競價剛結束，波動雖大但
+    # 沒有方向性，不是要進場的時機），訓練/推論時段改成9:11~9:30。
+    df = df[
+        (df["date"].dt.hour == hour) & (df["date"].dt.minute >= minute_min) & (df["date"].dt.minute < minute_max)
+    ].copy()
 
     df = df.dropna(subset=FEATURES + ["target"])
     df["target"] = df["target"].astype(int)
     print(f"有效樣本: {len(df):,} 筆")
+
+    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_CACHE_PATH)
+    print(f"cache已存至 {_CACHE_PATH}")
     return df
 
 
-def _split_data(test_days: int = 30):
+def _split_data(test_days: int = 30, use_cache: bool = False):
     """跟 train() 共用同一套切分邏輯，讓 evaluate()/confidence_report() 能
     用「跟訓練時同一份」測試集去評估已存的模型，不用每次都重新訓練一次
     （2026-07-17 討論：混淆矩陣/信心度報表要能單獨印，不用綁著train()）。
 
     ⚠️ test_days 要跟當初訓練那個模型用的 test_days 一致，不然測試集會
     跟模型訓練時看過的資料重疊，評估結果不可信。
+
+    use_cache：見 _prepare_data() 的說明。
     """
-    df = _prepare_data()
+    df = _prepare_data(use_cache=use_cache)
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     return df[df["date"] <= cutoff], df[df["date"] > cutoff]
 
@@ -154,10 +219,130 @@ def train(test_days: int = 20):
     return model
 
 
+def train_xgb(test_days: int = 20):
+    """訓練 XGBoost 模型，跟 train()（RandomForest）共用 FEATURES/切分邏輯，
+    比照 strategy/rally/train.py 的 train_xgb() 寫法（2026-07-21 討論）。
+
+    XGBClassifier 沒有像 RandomForestClassifier 那樣的 class_weight="balanced"
+    參數（那個只支援二分類的 scale_pos_weight，這裡是3分類）——要達到
+    同樣「稀有類別權重加大」的效果，要自己用
+    sklearn.utils.class_weight.compute_sample_weight("balanced", y) 算出
+    每筆樣本的權重，再用 fit(..., sample_weight=...) 傳進去。
+    """
+    from sklearn.utils.class_weight import compute_sample_weight
+    from xgboost import XGBClassifier
+
+    train_df, test_df = _split_data(test_days)
+    print(
+        f"\n訓練: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')} ~ "
+        f"{train_df['date'].max().strftime('%Y-%m-%d')})"
+    )
+    print(
+        f"測試: {len(test_df):,} ({test_df['date'].min().strftime('%Y-%m-%d')} ~ "
+        f"{test_df['date'].max().strftime('%Y-%m-%d')})"
+    )
+    print(f"\n訓練集標籤分佈:\n{(train_df['target'].value_counts(normalize=True)*100).round(2)}")
+
+    sample_weight = compute_sample_weight("balanced", train_df["target"])
+    model = XGBClassifier(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=50,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+        eval_metric="mlogloss",
+        verbosity=0,
+    )
+    model.fit(train_df[FEATURES], train_df["target"], sample_weight=sample_weight)
+
+    y_pred = model.predict(test_df[FEATURES])
+    print(f"\nAccuracy: {accuracy_score(test_df['target'], y_pred):.4f}")
+    print("\n混淆矩陣（列=實際，欄=預測，順序 跌/平/漲）:")
+    print(confusion_matrix(test_df["target"], y_pred, labels=[0, 1, 2]))
+    print("\n分類報告:")
+    print(
+        classification_report(
+            test_df["target"], y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"], zero_division=0
+        )
+    )
+
+    _MODEL_PATH_XGB.parent.mkdir(exist_ok=True)
+    joblib.dump(model, _MODEL_PATH_XGB)
+    print(f"模型已存至 {_MODEL_PATH_XGB}")
+    return model
+
+
+def train_lgbm(test_days: int = 20):
+    """訓練 LightGBM 模型，跟 train()（RandomForest）共用 FEATURES/切分邏輯，
+    比照 strategy/rally/train.py 的 train_lgbm() 寫法（2026-07-21 討論）。
+    LGBMClassifier 的 class_weight="balanced" 是原生支援多分類的，跟
+    RandomForestClassifier 用法一致，不用像 XGBoost 那樣另外算sample_weight。
+    """
+    import lightgbm as lgb
+
+    train_df, test_df = _split_data(test_days)
+    print(
+        f"\n訓練: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')} ~ "
+        f"{train_df['date'].max().strftime('%Y-%m-%d')})"
+    )
+    print(
+        f"測試: {len(test_df):,} ({test_df['date'].min().strftime('%Y-%m-%d')} ~ "
+        f"{test_df['date'].max().strftime('%Y-%m-%d')})"
+    )
+    print(f"\n訓練集標籤分佈:\n{(train_df['target'].value_counts(normalize=True)*100).round(2)}")
+
+    model = lgb.LGBMClassifier(
+        n_estimators=300,
+        learning_rate=0.05,
+        num_leaves=31,
+        min_child_samples=50,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced",
+        verbosity=-1,
+    )
+    model.fit(train_df[FEATURES], train_df["target"])
+
+    y_pred = model.predict(test_df[FEATURES])
+    print(f"\nAccuracy: {accuracy_score(test_df['target'], y_pred):.4f}")
+    print("\n混淆矩陣（列=實際，欄=預測，順序 跌/平/漲）:")
+    print(confusion_matrix(test_df["target"], y_pred, labels=[0, 1, 2]))
+    print("\n分類報告:")
+    print(
+        classification_report(
+            test_df["target"], y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"], zero_division=0
+        )
+    )
+
+    _MODEL_PATH_LGBM.parent.mkdir(exist_ok=True)
+    joblib.dump(model, _MODEL_PATH_LGBM)
+    print(f"模型已存至 {_MODEL_PATH_LGBM}")
+    return model
+
+
 def load_model():
     if not _MODEL_PATH.exists():
         raise FileNotFoundError("找不到模型，請先執行 train()")
     return joblib.load(_MODEL_PATH)
+
+
+def load_model_xgb():
+    if not _MODEL_PATH_XGB.exists():
+        raise FileNotFoundError("找不到 XGB 模型，請先執行 train_xgb()")
+    return joblib.load(_MODEL_PATH_XGB)
+
+
+def load_model_lgbm():
+    if not _MODEL_PATH_LGBM.exists():
+        raise FileNotFoundError("找不到 LGBM 模型，請先執行 train_lgbm()")
+    return joblib.load(_MODEL_PATH_LGBM)
 
 
 def _predict_with_threshold(model, test_df, threshold: float | None):
@@ -186,7 +371,12 @@ def _predict_with_threshold(model, test_df, threshold: float | None):
 _DEFAULT_THRESHOLDS = [None, 0.5, 0.6, 0.7, 0.8]  # None = 完全沒有信心度門檻（model.predict()原本判法）
 
 
-def evaluate(model=None, test_days: int = 30, threshold: float | None | list[float | None] = _DEFAULT_THRESHOLDS):
+def evaluate(
+    model=None,
+    test_days: int = 30,
+    threshold: float | None | list[float | None] = _DEFAULT_THRESHOLDS,
+    use_cache: bool = False,
+):
     """單獨印混淆矩陣/分類報告，用已存的模型評估，不用重新跑一次 train()
     （2026-07-17 討論：之前混淆矩陣只有 train() 裡才有，每次要看都要重訓
     一次，浪費時間）。
@@ -199,10 +389,14 @@ def evaluate(model=None, test_days: int = 30, threshold: float | None | list[flo
     勝出），跟其他數字門檻放在同一組掃描結果裡方便直接比較。想看單一門檻
     就傳一個數字（例如 threshold=0.6）；只想看沒有門檻的版本就傳
     threshold=None。
+
+    use_cache：見 _prepare_data() 的說明。evaluate() 常常要反覆呼叫比較不同
+    門檻/模型，預設還是False（自動判斷新不新），想加速反覆測試時才設True
+    （2026-07-21討論）。
     """
     if model is None:
         model = load_model()
-    _, test_df = _split_data(test_days)
+    _, test_df = _split_data(test_days, use_cache=use_cache)
 
     print(
         f"測試: {len(test_df):,} 筆 ({test_df['date'].min().strftime('%Y-%m-%d')} ~ "
@@ -232,7 +426,7 @@ def evaluate(model=None, test_days: int = 30, threshold: float | None | list[flo
     return test_df, (results[0] if len(results) == 1 else results)
 
 
-def confidence_report(model=None, test_days: int = 30, thresholds: list[float] | None = None):
+def confidence_report(model=None, test_days: int = 30, thresholds: list[float] | None = None, use_cache: bool = False):
     """依信心度（模型算出來的機率）門檻掃描，分別看「漲」「跌」這兩個稀有
     類別在不同信心度下的 precision/recall，比照 strategy/rally/validate.py
     的 confidence_report() 概念，改成3分類版（要分開看漲/跌，不是單一
@@ -240,13 +434,15 @@ def confidence_report(model=None, test_days: int = 30, thresholds: list[float] |
 
     門檻越高，預測數越少，但理論上precision應該要越高——如果掃出來precision
     沒有隨門檻提升，代表模型的機率輸出沒有校準好、"信心度"不能拿來當篩選依據。
+
+    use_cache：見 _prepare_data() 的說明。
     """
     if model is None:
         model = load_model()
     if thresholds is None:
         thresholds = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 
-    _, test_df = _split_data(test_days)
+    _, test_df = _split_data(test_days, use_cache=use_cache)
     proba = model.predict_proba(test_df[FEATURES])
     class_idx = {c: i for i, c in enumerate(model.classes_)}
     test_df = test_df.copy()
@@ -283,10 +479,34 @@ def feature_importance(model=None, top_n: int = 10):
         print(f"  {name:20s}  {imp:.4f}")
 
 
-def main(mode: str = "", test_days: int = 30, threshold: float | list[float] | None = None):
+_LOAD_MODEL_BY_TYPE = {"rfc": load_model, "xgb": load_model_xgb, "lgbm": load_model_lgbm}
+_TRAIN_BY_TYPE = {"rfc": train, "xgb": train_xgb, "lgbm": train_lgbm}
+
+
+def load_model_by_type(model_type: str):
+    """依 config.MODEL_TYPE（"rfc"/"xgb"/"lgbm"）載入對應模型，
+    run_backtest.py 跟 live.py 共用這支，切換模型只要改 config.py 一個地方，
+    比照 strategy/rally/train.py、strategy/orb/train.py 的做法。"""
+    if model_type not in _LOAD_MODEL_BY_TYPE:
+        raise ValueError(f"未知 model_type: {model_type!r}，可用: {list(_LOAD_MODEL_BY_TYPE)}")
+    return _LOAD_MODEL_BY_TYPE[model_type]()
+
+
+def main(
+    mode: str = "",
+    test_days: int = 30,
+    threshold: float | list[float] | None = None,
+    model_type: str = "rfc",
+    use_cache: bool = False,
+):
     """CLI進入點，比照 strategy/rally/entry.py 的 mode 切換方式（mkt_idx
     目前只有 train.py，還沒有 predict.py/live.py/entry.py，等那些補齊了
     再考慮要不要拆成獨立的 entry.py）。可用模式見檔頭的「== Main 模式 ==」。
+
+    model_type：train 用哪個演算法（rfc/xgb/lgbm，預設rfc）；importance/
+    evaluate/confidence 則是讀哪個演算法已經訓練好的模型來評估（2026-07-21
+    討論：三個模型共用同一套 FEATURES/切分邏輯，只有這個參數決定要用哪個
+    演算法，比照 strategy/rally 的 train/train_xgb/train_lgbm 三選一設計）。
 
     兩種用法都支援，互不衝突（2026-07-18 討論）：
       1. VS Code按F5：__main__ 裡直接寫死 mode 變數，不帶任何CLI參數
@@ -301,7 +521,7 @@ def main(mode: str = "", test_days: int = 30, threshold: float | list[float] | N
     # 不要看mode是不是空字串來判斷（之前這樣寫，F5執行時只要mode沒填就會
     # 誤觸發argparse，去讀根本不存在的CLI參數而出錯或用到不對的預設值）。
     if len(sys.argv) > 1:
-        parser = argparse.ArgumentParser(description="mkt_idx 策略 — RandomForest")
+        parser = argparse.ArgumentParser(description="mkt_idx 策略 — RandomForest/XGBoost/LightGBM")
         parser.add_argument(
             "mode",
             nargs="?",
@@ -318,30 +538,41 @@ def main(mode: str = "", test_days: int = 30, threshold: float | list[float] | N
             help="evaluate專用：信心度門檻(0~1)，可帶多個一次比較（例：--threshold 0.5 0.6 0.7 0.8），"
             "留空=用predict()原本的判法（見evaluate()說明）",
         )
+        parser.add_argument(
+            "--model_type", type=str, default="rfc", choices=["rfc", "xgb", "lgbm"], help="模型演算法（預設rfc）"
+        )
+        parser.add_argument(
+            "--use_cache",
+            action="store_true",
+            help="不管來源資料有沒有更新，只要cache存在就直接用（見_prepare_data()說明）",
+        )
         args = parser.parse_args()
         mode = args.mode
         test_days = args.test_days
         # nargs="*" 沒帶值時是 None；帶一個值時是長度1的list，跟F5那邊
         # 「單一float」的用法一致傳進 evaluate() 就好，不用特別拆成純數字
         threshold = args.threshold
+        model_type = args.model_type
+        use_cache = args.use_cache
     elif not mode:
         mode = "train"  # F5執行、__main__也沒寫mode時的保底預設
 
     if mode == "train":
-        train(test_days=test_days)
+        _TRAIN_BY_TYPE[model_type](test_days=test_days)
     elif mode == "importance":
-        feature_importance()
+        feature_importance(model=_LOAD_MODEL_BY_TYPE[model_type]())
     elif mode == "evaluate":
         # threshold 沒特別指定（None）時不傳進去，讓 evaluate() 自己的預設值
         # （_DEFAULT_THRESHOLDS）生效，不要在這裡另外複製一份預設值
         # （2026-07-18 討論：預設值該由 evaluate() 自己負責，main()/CLI只在
         # 使用者真的想覆蓋時才傳）。
+        model = _LOAD_MODEL_BY_TYPE[model_type]()
         if threshold is not None:
-            evaluate(test_days=test_days, threshold=threshold)
+            evaluate(model=model, test_days=test_days, threshold=threshold, use_cache=use_cache)
         else:
-            evaluate(test_days=test_days)
+            evaluate(model=model, test_days=test_days, use_cache=use_cache)
     elif mode == "confidence":
-        confidence_report(test_days=test_days)
+        confidence_report(model=_LOAD_MODEL_BY_TYPE[model_type](), test_days=test_days, use_cache=use_cache)
     else:
         print(f"未知模式: {mode}，可用: train / importance / evaluate / confidence")
 
@@ -359,15 +590,27 @@ if __name__ == "__main__":
                     evaluate() 自己的預設值（見 _DEFAULT_THRESHOLDS）。
                     真的想覆蓋才在這裡改，例如單一數字 0.6，或自己的
                     list（例如 [0.5, 0.6, 0.7, 0.8, 0.9]）。
+        model_type  "rfc" / "xgb" / "lgbm"（2026-07-21新增，預設rfc）。
+                    train時決定訓練哪個演算法；importance/evaluate/
+                    confidence時決定讀哪個演算法已存的模型。
+        use_cache   True/False（2026-07-21新增，只有evaluate/confidence
+                    會用到，train不受影響）。見 _prepare_data() 的說明：
+                    True=不管來源資料新不新都直接用cache（快，適合反覆
+                    測試evaluate/confidence）；False=自動判斷，來源資料
+                    有更新才重算。
 
     2. 終端機帶參數（會覆蓋掉下面寫死的值）：
         python -m strategy.mkt_idx.train train
-        python -m strategy.mkt_idx.train importance
-        python -m strategy.mkt_idx.train evaluate
+        python -m strategy.mkt_idx.train train --model_type xgb
+        python -m strategy.mkt_idx.train train --model_type lgbm
+        python -m strategy.mkt_idx.train importance --model_type xgb
         python -m strategy.mkt_idx.train evaluate --threshold 0.6
+        python -m strategy.mkt_idx.train evaluate --use_cache
         python -m strategy.mkt_idx.train confidence
     """
     mode = "train"  # train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
-    main(mode=mode, test_days=test_days, threshold=threshold)
+    model_type = "lgbm"  # rfc / xgb / lgbm
+    use_cache = True  # 只有 mode="evaluate"/"confidence" 用得到
+    main(mode=mode, test_days=test_days, threshold=threshold, model_type=model_type, use_cache=use_cache)

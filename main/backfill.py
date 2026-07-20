@@ -9,13 +9,13 @@ REST 補「WebSocket 連線前」缺的原始分K（寫進 db/m1_live/），這�
 """
 from datetime import datetime, timezone, timedelta
 
-from api import push_monitoring
+from api import get_setting, push_monitoring
 from data.query import load_m1_live
 
 _TW = timezone(timedelta(hours=8))
 
 
-def run_startup_backfill(state, threshold: float) -> None:
+def run_startup_backfill(state) -> None:
     if state.day.empty:
         return
     try:
@@ -31,6 +31,10 @@ def run_startup_backfill(state, threshold: float) -> None:
             flush=True,
         )
         for s in state.strategies.values():
+            # 每個策略各自的門檻：先查前端 settings 的全域覆蓋值，沒設定才
+            # fallback 該策略自己的預設值（見 main/state.py::StrategyState 的
+            # 說明），跟 main/live_trader.py 的 on_minute() 用同一套邏輯。
+            threshold = float(get_setting("threshold") or s.threshold)
             init_results = s.predict_live(
                 last_min,
                 state.day,

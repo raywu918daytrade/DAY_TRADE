@@ -14,6 +14,14 @@ import os
 # 門檻表現都比 XGB 好。
 MODEL_TYPE = os.environ.get("ORB_MODEL_TYPE", "lgbm")
 
+# ── 即時交易信心度門檻預設值 ──────────────────────────────────────────────
+# main/live_trader.py 每分鐘先查前端 settings 裡的全域 threshold，沒設定才
+# fallback 這裡（見 main/state.py::StrategyState、main/live_trader.py 的
+# 說明）——原本 main/config.py 有一個全域 THRESHOLD 給所有策略共用，但
+# orb/rally/mkt_idx 三個模型的機率校準跟最佳門檻不一定一樣，2026-07-21 拆成
+# 各策略自己一個。跟 predict.py::predict_live() 的 threshold 參數預設值一致。
+THRESHOLD = float(os.environ.get("ORB_THRESHOLD", "0.55"))
+
 # ── Triple Barrier 參數（標籤怎麼定義，沿用 rally 的定義） ──────────────────
 # 2026-07-11 測過改成 2%：test_days=10 AUC 幾乎沒變（0.4925→0.4916），
 # test_days=5 有改善（0.5328→0.5732），但樣本量太小（430~1039筆測試）撐不住

@@ -186,6 +186,51 @@ def add_m3_m5_features(m1: pd.DataFrame, m3: pd.DataFrame, m5: pd.DataFrame) -> 
     return m1
 
 
+def add_m3_m5_std_features(m1: pd.DataFrame, m3_std: pd.DataFrame, m5_std: pd.DataFrame) -> pd.DataFrame:
+    """
+    加 m3_std（3分鐘標準獨立K棒）、m5_std（5分鐘標準獨立K棒）的收盤價、
+    成交量特徵（2026-07-21討論）。
+
+    跟 add_m3_m5_features() 用的 db/m3、db/m5（rolling版本）不同：db/m3_std、
+    db/m5_std（build_m3_m5_std.py 預先聚合，見 data/query.py 的
+    load_m3_std()/load_m5_std()）是「標準獨立K棒」——一根K棒對應3/5根1分K，
+    只在K棒收的那一分鐘有值（例如m5_std一根覆蓋09:10:00~09:14:59，標記在
+    09:15:00），中間分鐘是空的，所以要先算完K棒對K棒的漲跌幅/量變化，再
+    merge回m1後逐股逐日ffill，讓每一分鐘都能拿到「最近一根已收盤的獨立
+    K棒」的值。
+
+    m3_std_ret/m5_std_ret：目前這根已收盤獨立K棒的收盤價，跟上一根已收盤
+    獨立K棒收盤價的報酬率（pct_change(1)——不是像rolling版那樣pct_change
+    (3)/(5)，因為std版本本來就是不重疊的獨立K棒，差一根就是差一個完整
+    週期）。m3_std_vol_ratio/m5_std_vol_ratio：同上，換成成交量。
+
+    m1 需已有 stock_id/day_date/date 欄位，date 需為 datetime。
+    """
+    m1 = m1.copy()
+
+    def _bar_changes(bar: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        bar = bar.sort_values(["stock_id", "date"]).copy()
+        bar["_day"] = bar["date"].dt.date
+        g = bar.groupby(["stock_id", "_day"], group_keys=False)
+        bar[f"{prefix}_ret"] = g["close"].pct_change(1, fill_method=None)
+        bar[f"{prefix}_vol_ratio"] = g["volume"].pct_change(1, fill_method=None)
+        return bar[["stock_id", "date", f"{prefix}_ret", f"{prefix}_vol_ratio"]]
+
+    m3_chg = _bar_changes(m3_std, "m3_std")
+    m5_chg = _bar_changes(m5_std, "m5_std")
+
+    m1 = m1.merge(m3_chg, on=["stock_id", "date"], how="left")
+    m1 = m1.merge(m5_chg, on=["stock_id", "date"], how="left")
+
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    m1["m3_std_ret"] = g_day["m3_std_ret"].ffill()
+    m1["m3_std_vol_ratio"] = g_day["m3_std_vol_ratio"].ffill()
+    m1["m5_std_ret"] = g_day["m5_std_ret"].ffill()
+    m1["m5_std_vol_ratio"] = g_day["m5_std_vol_ratio"].ffill()
+
+    return m1
+
+
 def top_n_by_prev_day_volume(m1: pd.DataFrame, n: int = 500) -> pd.DataFrame:
     """
     只留每天「依前一交易日全天成交量排序」前 n 名的股票（流動性過濾的簡易
@@ -206,6 +251,28 @@ def top_n_by_prev_day_volume(m1: pd.DataFrame, n: int = 500) -> pd.DataFrame:
     daily_vol["rank"] = daily_vol.groupby("day_date")["prev_day_volume"].rank(ascending=False, method="first")
     keep = daily_vol[daily_vol["rank"] <= n][["stock_id", "day_date"]]
     return m1.merge(keep, on=["stock_id", "day_date"], how="inner")
+
+
+def top_n_stock_ids_by_latest_volume(m1_hist: pd.DataFrame, n: int = 100) -> set:
+    """給即時推論用：從歷史 m1（load_m1()，不含今天，因為 db/m1 是收盤後才
+    更新）取「最後一個交易日」全天成交量前 n 名股票代號，當作「今天」的
+    流動性篩選名單。
+
+    跟 top_n_by_prev_day_volume() 邏輯一致（都是用前一交易日的量排名），
+    那支是回測用、對整個多日 df 逐日 shift(1) 算出「每一天」各自的名單；
+    這支只需要算出「今天」單獨這一天要用的名單，開盤前算一次就整天沿用
+    （見 predict.py::build_prewarm_cache()），不用每分鐘重算一次。
+
+    m1_hist 需已有 stock_id/date/volume 欄位（day_date 若沒有會自動從 date
+    算，方便直接對 load_m1() 的原始輸出呼叫，不用呼叫端自己先加 day_date）。
+    """
+    if "day_date" not in m1_hist.columns:
+        m1_hist = m1_hist.assign(day_date=pd.to_datetime(m1_hist["date"]).dt.date)
+    daily_vol = m1_hist.groupby(["stock_id", "day_date"])["volume"].sum().reset_index()
+    latest_day = daily_vol["day_date"].max()
+    latest = daily_vol[daily_vol["day_date"] == latest_day]
+    top = latest.sort_values("volume", ascending=False).head(n)
+    return set(top["stock_id"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -300,6 +367,10 @@ FEATURES = [
     "m3_vol_ratio",
     "m5_ret",
     "m5_vol_ratio",
+    "m3_std_ret",
+    "m3_std_vol_ratio",
+    "m5_std_ret",
+    "m5_std_vol_ratio",
     # "range_pct",
     # "atr7",
 ]

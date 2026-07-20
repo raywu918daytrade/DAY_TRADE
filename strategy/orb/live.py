@@ -14,7 +14,7 @@ ORB_MODEL_TYPE，預設 lgbm），跟 run_backtest.py 共用同一個參數，�
 strategy/rally/live.py 的做法，改 config.py/.env 一個地方兩邊就會一起換。
 """
 
-from strategy.orb.config import MODEL_TYPE, SESSION_END, SESSION_START
+from strategy.orb.config import MODEL_TYPE, SESSION_END, SESSION_START, THRESHOLD
 from strategy.orb.predict import build_prewarm_cache, predict_live
 from strategy.orb.train import load_model_by_type
 
@@ -23,4 +23,4 @@ def load_model():
     return load_model_by_type(MODEL_TYPE)
 
 
-__all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "build_prewarm_cache"]
+__all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "build_prewarm_cache", "THRESHOLD"]

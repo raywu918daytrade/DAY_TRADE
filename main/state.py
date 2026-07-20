@@ -17,6 +17,12 @@ class StrategyState:
         self.session_end = module.SESSION_END
         self.load_model = module.load_model
         self.predict_live = module.predict_live
+        # 各策略自己的信心度門檻預設值（module.THRESHOLD，見各策略 config.py 的
+        # 說明）——main/live_trader.py 每分鐘先查前端 settings 的全域 threshold，
+        # 沒設定才 fallback 這個，取代原本全部策略共用一個 main/config.py 全域
+        # THRESHOLD 的做法（2026-07-21 討論：三個模型的機率校準不一定一樣，
+        # 共用同一個門檻可能對某些策略太鬆或太嚴）。
+        self.threshold = module.THRESHOLD
         self.model = None
         self.prewarm_cache: dict = {}
 

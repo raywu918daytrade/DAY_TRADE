@@ -69,7 +69,6 @@ from main.config import (
     FORCE_CLOSE_HOUR as _FORCE_CLOSE_HOUR,
     FORCE_CLOSE_MIN as _FORCE_CLOSE_MIN,
     STRATEGY_MODULES,
-    THRESHOLD,
     TOTAL_CAPITAL,
     TRADE_MODE,
     WATCHLIST_QUOTES,
@@ -154,9 +153,10 @@ except Exception as e:
     print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
 
 # 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
-run_startup_backfill(state, THRESHOLD)
+run_startup_backfill(state)
 
-print(f"就緒，等待盤中訊號（門檻={THRESHOLD}）...", flush=True)
+_threshold_str = ", ".join(f"{s.name}={s.threshold}" for s in state.strategies.values())
+print(f"就緒，等待盤中訊號（各策略門檻預設：{_threshold_str}）...", flush=True)
 
 if TRADE_MODE != "off":
     try:
@@ -291,10 +291,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                 prev_close = _watchlist_prev_close(str(sid), date_str)
                 push_quote(str(sid), candles[-1]["close"], prev_close, minute_str)
 
-    # 每分鐘從 settings 讀信心度，允許前端即時調整
     from api import get_setting
-
-    threshold = float(get_setting("threshold") or THRESHOLD)
 
     # price_map 先用這分鐘全部收到的分K收盤價打底（涵蓋所有目前有持倉的股票，
     # 不受任何策略候選清單過濾影響），下面各策略的 predict_live 結果再疊上去
@@ -314,6 +311,12 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     for s in state.strategies.values():
         if (h, m) < s.session_start or (h, m) > s.session_end:
             continue  # 這個策略還沒開始/已經過了進場窗口，不產生新訊號（既有持倉SL/TP由下面reconcile統一監控，不受這裡影響）
+
+        # 每分鐘從 settings 讀信心度，允許前端即時調整；沒設定才 fallback 該
+        # 策略自己的預設值（見 main/state.py::StrategyState 的說明——三個
+        # 模型的機率校準不一定一樣，2026-07-21 從全域共用一個門檻拆成各策略
+        # 各自一個）。
+        threshold = float(get_setting("threshold") or s.threshold)
 
         all_results = s.predict_live(
             minute_str,
