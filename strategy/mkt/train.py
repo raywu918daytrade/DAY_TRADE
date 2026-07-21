@@ -228,6 +228,17 @@ def train_xgb(test_days: int = 20):
     同樣「稀有類別權重加大」的效果，要自己用
     sklearn.utils.class_weight.compute_sample_weight("balanced", y) 算出
     每筆樣本的權重，再用 fit(..., sample_weight=...) 傳進去。
+
+    2026-07-21 第二輪：window_days拉大到45天（約30個交易日）重新tune+walk-
+    forward，比第一輪的20天窗口更穩定（val/test落差從13個百分點縮小到5個
+    百分點）。5個45天窗口下，新參數在0.5/0.6/0.7/0.8全部門檻都贏（0.5~0.7
+    各4/5、0.8滿貫5/5），而且門檻越高贏越多（0.8：14.69%→21.26%），第一輪
+    參數在0.7/0.8這兩個高信心度門檻其實是輸給最原始參數的，這輪明確修正
+    了這個問題。第一輪參數（n_estimators=600/max_depth=10/learning_rate≈
+    0.100/subsample≈0.923/colsample_bytree≈0.556/min_child_weight=74/
+    reg_lambda≈1.926/gamma≈0.396）、最原始參數（n_estimators=300/max_depth=6/
+    learning_rate=0.05/subsample=0.8/colsample_bytree=0.8/min_child_weight=50/
+    reg_lambda=1.0，沒有gamma）都紀錄在這裡以防之後要retune時當對照組。
     """
     from sklearn.utils.class_weight import compute_sample_weight
     from xgboost import XGBClassifier
@@ -245,13 +256,14 @@ def train_xgb(test_days: int = 20):
 
     sample_weight = compute_sample_weight("balanced", train_df["target"])
     model = XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=50,
-        reg_lambda=1.0,
+        n_estimators=500,
+        max_depth=10,
+        learning_rate=0.12770505395846093,
+        subsample=0.9541586311700712,
+        colsample_bytree=0.9978337571109724,
+        min_child_weight=22,
+        reg_lambda=1.847987791882633,
+        gamma=0.2824283269109099,
         random_state=42,
         n_jobs=-1,
         eval_metric="mlogloss",
@@ -611,6 +623,6 @@ if __name__ == "__main__":
     mode = "evaluate"  # train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
-    model_type = "lgbm"  # rfc / xgb / lgbm
+    model_type = "xgb"  # rfc / xgb / lgbm
     use_cache = True  # 只有 mode="evaluate"/"confidence" 用得到
     main(mode=mode, test_days=test_days, threshold=threshold, model_type=model_type, use_cache=use_cache)
