@@ -64,15 +64,18 @@ def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
     os.replace(tmp_path, file_path)
 
 
-def _download_m1(stock_id: str) -> pd.DataFrame:
+def _download_m1(stock_id: str, token: str = None) -> pd.DataFrame:
     """取得近30日1分鐘K線（Fugle分K無法指定 from/to，一律回傳近30日資料）。
 
     2026-07-13 實測（20:30）：這個端點本身就含「今天」的資料（最後一筆是
     當天13:30收盤），不是舊註解講的「僅到昨日」——update_m1.yml 排程在台北
     18:00 跑，永遠晚於收盤，所以不需要再另外呼叫 intraday/candles 補今天。
+
+    token：不帶用預設 FUGLE 帳號，第二條 Fugle 執行緒（_update_m1_fugle2）
+    會傳入 fugle_api.TOKEN_DAYTRADE 走另一組獨立 rate limit。
     """
     r = fugle_api.historical_candles(
-        stock_id, timeframe="1", fields="open,high,low,close,volume", sort="asc", adjusted="true"
+        stock_id, token=token, timeframe="1", fields="open,high,low,close,volume", sort="asc", adjusted="true"
     )
     r.raise_for_status()
     data = r.json()
@@ -164,26 +167,29 @@ def _get_done_stocks(date_str: str) -> set:
     return set(df[df["date"] == date_str]["stock_id"].tolist())
 
 
-def _update_m1_fugle(stocks: list, date_str: str):
-    """Fugle 那一半：historical/candles 一次就含今天（見 _download_m1() 的
-    2026-07-13 實測結果），1.05秒/支（1次API），維持在 60 req/min 以內留緩衝。"""
+def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str = "Fugle"):
+    """Fugle 那一份：historical/candles 一次就含今天（見 _download_m1() 的
+    2026-07-13 實測結果），1.05秒/支（1次API），維持在 60 req/min 以內留緩衝。
+
+    token/label：讓 update_m1() 可以開兩條 Fugle 執行緒各用一組帳號
+    （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。"""
     for stock_id in stocks:
         try:
-            df = _download_m1(stock_id)
+            df = _download_m1(stock_id, token=token)
             if not df.empty:
                 _save_m1(df)
-                print(f"[Fugle] {stock_id} 下載完成 {len(df)} 筆")
+                print(f"[{label}] {stock_id} 下載完成 {len(df)} 筆")
             else:
-                print(f"[Fugle] {stock_id} 無資料")
+                print(f"[{label}] {stock_id} 無資料")
             _update_flag(stock_id, date_str)
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                print(f"[Fugle] {stock_id} 無此股票資料，標記跳過")
+                print(f"[{label}] {stock_id} 無此股票資料，標記跳過")
                 _update_flag(stock_id, date_str)
             else:
-                print(f"[Fugle] {stock_id} 失敗: {e}")
+                print(f"[{label}] {stock_id} 失敗: {e}")
         except Exception as e:
-            print(f"[Fugle] {stock_id} 失敗: {e}")
+            print(f"[{label}] {stock_id} 失敗: {e}")
         time.sleep(1.05)
 
 
@@ -205,10 +211,13 @@ def _update_m1_fubon(stocks: list, date_str: str, sdk):
 
 
 def update_m1(stocks: list = None):
-    """1分鐘K線，flag避免同日重複下載。待下載清單拆一半，Fugle 跟富邦
-    同時下載（各自獨立 rate limit），約可把時間壓到單一資料源的一半。"""
+    """1分鐘K線，flag避免同日重複下載。待下載清單拆三份，Fugle 兩組帳號
+    （FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦一份同時下載，
+    約可把時間壓到單一資料源的三分之一。"""
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
+    if not fugle_api.TOKEN_DAYTRADE:
+        raise RuntimeError("缺少第二組 Fugle API Key，請在 .env 設定 FUGLE_DAYTRADE")
 
     now = datetime.now(_TW)
     date_str = now.strftime("%Y-%m-%d")
@@ -219,20 +228,30 @@ def update_m1(stocks: list = None):
     wait_stocks = [s for s in candidates if s not in done]
     print("還有", len(wait_stocks), "個股票未更新（已排除今日已下載 flag）")
 
-    half = len(wait_stocks) // 2
-    fugle_half, fubon_half = wait_stocks[:half], wait_stocks[half:]
-    print(f"Fugle {len(fugle_half)} 支、富邦 {len(fubon_half)} 支，同時下載...")
+    third = len(wait_stocks) // 3
+    fugle_half1 = wait_stocks[:third]
+    fugle_half2 = wait_stocks[third : 2 * third]
+    fubon_half = wait_stocks[2 * third :]
+    print(
+        f"Fugle {len(fugle_half1)} 支、Fugle(daytrade) {len(fugle_half2)} 支、"
+        f"富邦 {len(fubon_half)} 支，同時下載..."
+    )
 
     from fubon import fubon_api as trade_api
 
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)
     try:
-        t_fugle = threading.Thread(target=_update_m1_fugle, args=(fugle_half, date_str))
+        t_fugle1 = threading.Thread(target=_update_m1_fugle, args=(fugle_half1, date_str))
+        t_fugle2 = threading.Thread(
+            target=_update_m1_fugle, args=(fugle_half2, date_str, fugle_api.TOKEN_DAYTRADE, "Fugle-DT")
+        )
         t_fubon = threading.Thread(target=_update_m1_fubon, args=(fubon_half, date_str, sdk))
-        t_fugle.start()
+        t_fugle1.start()
+        t_fugle2.start()
         t_fubon.start()
-        t_fugle.join()
+        t_fugle1.join()
+        t_fugle2.join()
         t_fubon.join()
     finally:
         trade_api.logout(sdk)

@@ -15,10 +15,13 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parents[1] / ".env", override=True)
 
 TOKEN = os.environ.get("FUGLE", "")
+# 第二組 Fugle帳號（獨立 rate limit），讓 m1/day loader 可以開兩條 Fugle
+# 執行緒同時下載（各自的 60次/分鐘互不影響），2026-07-21 加入。
+TOKEN_DAYTRADE = os.environ.get("FUGLE_DAYTRADE", "")
 _BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 
 
-def historical_candles(symbol: str, **params) -> requests.Response:
+def historical_candles(symbol: str, token: str = None, **params) -> requests.Response:
     """REST 行情 API：取得歷史K線（historical/candles/{symbol}），429 自動重試
     一次（依 Retry-After 等待秒數）。
 
@@ -30,8 +33,11 @@ def historical_candles(symbol: str, **params) -> requests.Response:
     params 直接透傳給 Fugle API：timeframe/from/to/fields/sort/adjusted 等
     （語意對齊 fubon/fubon_api.py::historical_candles()，2026-07-13 實測過
     from/to 抓日K兩邊行為一致，同一套底層 fugle_marketdata 元件）。
+
+    token：不帶就用預設 FUGLE（TOKEN），呼叫端要用第二組帳號（TOKEN_DAYTRADE）
+    分流時明確傳入。
     """
-    headers = {"X-API-KEY": TOKEN}
+    headers = {"X-API-KEY": token or TOKEN}
     r = requests.get(f"{_BASE_URL}/historical/candles/{symbol}", params=params, headers=headers, timeout=10)
     if r.status_code == 429:
         time.sleep(float(r.headers.get("Retry-After", 60)) + 1)

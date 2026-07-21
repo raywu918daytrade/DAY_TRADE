@@ -87,7 +87,7 @@ def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
         raise
 
 
-def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
+def _fetch_year(stock_id: str, from_date: str, to_date: str, token: str = None) -> pd.DataFrame:
     """單次請求（區間 < 1 年）。404 代表這支股票在這段區間還沒有資料（例如
     尚未上市／尚未開始交易），回傳空 DataFrame，不當例外處理——2026-07-15
     實測：對現在才被列入候選清單、但更早以前還沒上市的股票回補歷史時很常見
@@ -97,6 +97,7 @@ def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     錯誤）。"""
     r = fugle_api.historical_candles(
         stock_id,
+        token=token,
         **{"from": from_date, "to": to_date, "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"},
     )
     if r.status_code == 404:
@@ -111,17 +112,20 @@ def _fetch_year(stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     return df
 
 
-def _download_day(stock_id: str, start_date: str, end_date: str | None = None) -> pd.DataFrame:
+def _download_day(stock_id: str, start_date: str, end_date: str | None = None, token: str = None) -> pd.DataFrame:
     """自動切割成年度區間（Fugle 限制每次 < 1 年）。end_date 選填，預設到今天；
     data/backfill_day_history.py 回補歷史缺口時會指定成「現有資料最早日期的
-    前一天」，避免重複下載已經有的部分。"""
+    前一天」，避免重複下載已經有的部分。
+
+    token：不帶用預設 FUGLE 帳號，第二組 Fugle 執行緒池（_update_day_fugle2）
+    會傳入 fugle_api.TOKEN_DAYTRADE 走另一組獨立 rate limit。"""
     now = datetime.now(_TW)
     end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else now.date()
     cur = datetime.strptime(start_date, "%Y-%m-%d").date()
     chunks = []
     while cur <= end:
         chunk_end = min(cur.replace(year=cur.year + 1) - timedelta(days=1), end)
-        df = _fetch_year(stock_id, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"))
+        df = _fetch_year(stock_id, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"), token=token)
         if not df.empty:
             chunks.append(df)
         cur = chunk_end + timedelta(days=1)
@@ -232,9 +236,12 @@ def _get_done_stocks(date_str: str) -> set:
     return set(df[df["date"] == date_str]["stock_id"].tolist())
 
 
-def _update_day_fugle(stocks: list, start_date: str, date_str: str, workers: int):
-    """Fugle 那一半：多執行緒併發，429 交給 Retry-After 被動重試
-    （見 _fetch_year()），workers=5 約 5 分鐘下載 1500 支。"""
+def _update_day_fugle(stocks: list, start_date: str, date_str: str, workers: int, token: str = None, label: str = "Fugle"):
+    """Fugle 那一份：多執行緒併發，429 交給 Retry-After 被動重試
+    （見 _fetch_year()），workers=5 約 5 分鐘下載 1500 支。
+
+    token/label：讓 update_day() 可以開兩組 Fugle 執行緒池各用一組帳號
+    （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     completed = 0
@@ -243,7 +250,7 @@ def _update_day_fugle(stocks: list, start_date: str, date_str: str, workers: int
         nonlocal completed
         time.sleep(0.2)  # 每執行緒小延遲，5 執行緒合計 ~1 req/s
         try:
-            df = _download_day(stock_id, start_date)
+            df = _download_day(stock_id, start_date, token=token)
             if not df.empty:
                 _save_day(df)
             _update_flag(stock_id, date_str)
@@ -262,9 +269,9 @@ def _update_day_fugle(stocks: list, start_date: str, date_str: str, workers: int
             sid, rows, err = fut.result()
             completed += 1
             if err:
-                print(f"  [Fugle {completed}/{len(stocks)}] {sid} 失敗: {err}")
+                print(f"  [{label} {completed}/{len(stocks)}] {sid} 失敗: {err}")
             elif completed % 100 == 0 or completed == len(stocks):
-                print(f"  [Fugle {completed}/{len(stocks)}] 進度更新")
+                print(f"  [{label} {completed}/{len(stocks)}] 進度更新")
 
 
 def _update_day_fubon(stocks: list, start_date: str, date_str: str, sdk):
@@ -285,12 +292,14 @@ def _update_day_fubon(stocks: list, start_date: str, date_str: str, sdk):
 
 def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     """
-    日線，flag 避免同日重複下載。待下載清單拆一半，Fugle 跟富邦同時下載
-    （各自獨立 rate limit）。
-    workers: Fugle 那一半的並發執行緒數（預設 5，約 5 分鐘下載 1500 支）
+    日線，flag 避免同日重複下載。待下載清單拆三份，Fugle 兩組帳號
+    （FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦一份同時下載。
+    workers: 每組 Fugle 執行緒池的並發數（預設 5，約 5 分鐘下載 1500 支）
     """
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
+    if not fugle_api.TOKEN_DAYTRADE:
+        raise RuntimeError("缺少第二組 Fugle API Key，請在 .env 設定 FUGLE_DAYTRADE")
 
     now = datetime.now(_TW)
     date_str = now.strftime("%Y-%m-%d")
@@ -304,10 +313,13 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     done = _get_done_stocks(date_str)
     wait_stocks = [s for s in candidates if s not in done]
 
-    half = len(wait_stocks) // 2
-    fugle_half, fubon_half = wait_stocks[:half], wait_stocks[half:]
+    third = len(wait_stocks) // 3
+    fugle_half1 = wait_stocks[:third]
+    fugle_half2 = wait_stocks[third : 2 * third]
+    fubon_half = wait_stocks[2 * third :]
     print(
-        f"start_date={start_date}，Fugle {len(fugle_half)} 支（{workers} 並發）、"
+        f"start_date={start_date}，Fugle {len(fugle_half1)} 支、"
+        f"Fugle(daytrade) {len(fugle_half2)} 支（各 {workers} 並發）、"
         f"富邦 {len(fubon_half)} 支，同時下載..."
     )
 
@@ -316,11 +328,17 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)
     try:
-        t_fugle = threading.Thread(target=_update_day_fugle, args=(fugle_half, start_date, date_str, workers))
+        t_fugle1 = threading.Thread(target=_update_day_fugle, args=(fugle_half1, start_date, date_str, workers))
+        t_fugle2 = threading.Thread(
+            target=_update_day_fugle,
+            args=(fugle_half2, start_date, date_str, workers, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+        )
         t_fubon = threading.Thread(target=_update_day_fubon, args=(fubon_half, start_date, date_str, sdk))
-        t_fugle.start()
+        t_fugle1.start()
+        t_fugle2.start()
         t_fubon.start()
-        t_fugle.join()
+        t_fugle1.join()
+        t_fugle2.join()
         t_fubon.join()
     finally:
         trade_api.logout(sdk)
