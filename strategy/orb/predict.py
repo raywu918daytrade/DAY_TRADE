@@ -45,13 +45,14 @@ def predict(
     if model is None:
         model = load_model_lgbm()
 
-    # cache 新鮮度只比對 test_days 這段窗口涵蓋的月份檔案（見
+    # 按月分區 cache 只算/只讀 start_date 所在月份到最新月份這段範圍（見
     # load_features() docstring）：test_only=True 時我們本來就只看最後
     # test_days 天，背景 finmind.backfill_history 這類程式補很久以前的
-    # 歷史資料、動到舊月份檔案 mtime 不該讓這裡整批重算特徵。多留10天緩衝
-    # 給 atr_hour_surprise 等需要「過去N天」歷史的特徵。
-    since = pd.Timestamp.now().normalize() - pd.Timedelta(days=test_days + 10) if test_only else None
-    df = load_features(since=since)
+    # 歷史資料、動到舊月份檔案完全不會讓這裡的 cache 誤判過期。atr_hour_surprise
+    # 等需要「過去N天」歷史的特徵回看緩衝由 load_features() 內部自動處理，
+    # 這裡不用再自己多留天數。
+    start_date = (pd.Timestamp.now().normalize() - pd.Timedelta(days=test_days)).strftime("%Y-%m-%d") if test_only else ""
+    df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES)
     df = apply_liquidity_filter(df)
 

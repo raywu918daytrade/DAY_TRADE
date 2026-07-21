@@ -60,6 +60,18 @@ _CONFIDENCE_LABELS = [
 ]
 
 
+def _scope_start_date(test_days: int, start_date: str, end_date: str) -> str:
+    """算出要傳給 load_features() 的 start_date，讓按月分區 cache 只算/只讀
+    真正會用到的月份範圍（見 features.py load_features() 的說明）——驗證報表
+    最終只會用到「(end_date 或現在) 往前 test_days 天」這段測試集，不用因為
+    沒指定 start_date 就讓 load_features() 處理全部歷史月份。呼叫端有明確
+    傳 start_date 的話直接尊重那個值（可能比 test_days 往前推算的還早）。"""
+    if start_date:
+        return start_date
+    reference = pd.Timestamp(end_date) if end_date else pd.Timestamp.now()
+    return (reference - pd.Timedelta(days=test_days)).strftime("%Y-%m-%d")
+
+
 def _warn_if_train_test_overlap(model, test_df: pd.DataFrame) -> None:
     """
     檢查驗證用的測試區間，是不是跟這個模型實際訓練時的切點重疊。
@@ -91,7 +103,7 @@ def _load_test_df(
     start_date: str = "",
     end_date: str = "",
 ) -> pd.DataFrame:
-    df = load_features()
+    df = load_features(start_date=_scope_start_date(test_days, start_date, end_date))
     df = df.dropna(subset=FEATURES + ["target"])
     df = apply_liquidity_filter(df)
 
@@ -292,7 +304,7 @@ def compare_report(
     """RFC vs LGBM vs XGB：同一份測試集上的 Accuracy / AUC 對照表。"""
     models = {"RFC ": load_model_rfc(), "LGBM": load_model_lgbm(), "XGB ": load_model_xgb()}
 
-    df = load_features()
+    df = load_features(start_date=_scope_start_date(test_days, start_date, end_date))
     df = df.dropna(subset=FEATURES + ["target"])
     df = apply_liquidity_filter(df)
     if start_date:

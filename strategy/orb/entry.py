@@ -35,7 +35,7 @@ def main(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
-    skip_cache_check: bool = False,
+    use_cache: bool = True,
 ):
     """
     當沖策略 ORB + LightGBM 主程式。
@@ -44,11 +44,11 @@ def main(
       1. 直接傳參數：main(mode="train_lgbm")
       2. CLI 執行：python strategy/orb/entry.py train_lgbm
 
-    skip_cache_check: 只影響 train_rfc/train_lgbm/train_xgb，見 train.py
-    _prepare_train_test() 的說明——預設 False（正式訓練用最嚴格的 cache
-    新鮮度檢查）；True 時不管 db/m1 有沒有更新都直接吃現成 cache，只適合
-    背景資料補齊程式還在跑、你只是想先跑一版測試程式碼/參數邏輯的情境，
-    不要拿這樣訓練出來的模型正式上場。
+    use_cache: 只影響 train_rfc/train_lgbm/train_xgb，見 train.py
+    _prepare_train_test() 的說明——預設 True，逐月檢查 cache 新鮮度，新鮮的
+    月份直接沿用、過期的月份才重算，這就是「有用到 cache」的正常訓練流程；
+    False 時不管每個月分區現在是什麼狀態，目標範圍內全部月份都強制重算，
+    只在你明確懷疑 cache 壞掉、或改了 FEATURES 想強制全部重新計算時才用。
     """
     if not mode:
         parser = argparse.ArgumentParser(
@@ -63,25 +63,27 @@ def main(
         parser.add_argument("--start_date", type=str, default="", help="資料起日 YYYY-MM-DD")
         parser.add_argument("--end_date", type=str, default="", help="資料迄日 YYYY-MM-DD")
         parser.add_argument(
-            "--skip_cache_check",
-            action="store_true",
-            help="train_rfc/train_lgbm/train_xgb 專用：不管 db/m1 有沒有更新都直接用現成特徵 cache（犧牲正確性換速度，不要拿來訓練正式模型）",
+            "--use_cache",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="train_rfc/train_lgbm/train_xgb 專用：是否用按月分區的特徵 cache（預設 True）；"
+            "--no-use_cache 不管每個月分區新不新鮮，目標範圍內全部強制重算",
         )
         args = parser.parse_args()
         mode = args.mode
         test_days = args.test_days
         start_date = args.start_date
         end_date = args.end_date
-        skip_cache_check = args.skip_cache_check
+        use_cache = args.use_cache
 
     if mode == "train_rfc":
-        train_rfc(test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=skip_cache_check)
+        train_rfc(test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)
 
     elif mode == "train_lgbm":
-        train_lgbm(test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=skip_cache_check)
+        train_lgbm(test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)
 
     elif mode == "train_xgb":
-        train_xgb(test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=skip_cache_check)
+        train_xgb(test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)
 
     elif mode == "validate":
         for name, model in available_models().items():
@@ -123,10 +125,10 @@ if __name__ == "__main__":
     compare      RFC vs LGBM vs XGB 同一份測試集 Accuracy/AUC 對照（三個模型都要先訓練過）
     predict      印批次機率矩陣（predict()）的形狀跟最後一個時間點的排行榜，用來肉眼檢查
     """
-    mode = "train_xgb"  # validate,train_rfc,train_lgbm,train_xgb
+    mode = "validate"  # validate,train_rfc,train_lgbm,train_xgb
     test_days = DEFAULT_TEST_DAYS  # 統一用 config.py 的預設值，不要在這裡另外寫死數字
-    start_date = ""
+    start_date = "2026-01-01"
     end_date = ""
-    force_cache = False  # True 時 train_lgbm/train_xgb 不管 db/m1 有沒有更新都直接用現成特徵 cache（犧牲正確性換速度，見 train.py skip_cache_check 說明，不要拿來訓練正式模型）
+    use_cache = True  # False 時 train_rfc/train_lgbm/train_xgb 不管每個月分區新不新鮮，目標範圍內全部強制重算（見 train.py use_cache 說明，正常訓練用 True 就好，True 本來就會用新鮮的 cache、只重算過期的月份）
 
-    main(mode=mode, test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=force_cache)
+    main(mode=mode, test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)

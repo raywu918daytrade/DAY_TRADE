@@ -26,17 +26,22 @@ def _prepare_train_test(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
-    skip_cache_check: bool = False,
+    use_cache: bool = True,
 ):
-    """載入特徵並切分訓練/測試集（LGBM/XGB 共用）。
+    """載入特徵並切分訓練/測試集（RFC/LGBM/XGB 共用）。
 
-    skip_cache_check: 見 features.load_features() 的 skip_staleness_check
-    說明——預設 False（正式訓練該用），True 時不管 db/m1 有沒有更新都直接
-    用現成 cache，只適合背景還在跑資料補齊、你只是想先跑一版測試程式碼/
-    參數邏輯的情境，不是給要拿去正式用的模型。
+    start_date 會往下傳給 load_features()，只算/只讀 start_date 所在月份到
+    db/m1 現有最新月份這段範圍，更早的月份完全不會被讀取或比對新鮮度——
+    2019 年起的歷史 backfill 不會讓這裡的 cache 誤判過期（見 features.py
+    load_features() 的按月分區說明）。
+
+    use_cache: 見 features.load_features() 的說明——預設 True，逐月檢查
+    新鮮度，新鮮的月份直接沿用 cache、過期的月份才重算。False 時不管每個月
+    分區現在是什麼狀態，目標範圍內全部月份都重算，犧牲速度換正確性保證，
+    只在你明確懷疑 cache 壞掉或改了 FEATURES 想強制全部重算時才用。
     """
     print("特徵工程...")
-    df = load_features(skip_staleness_check=skip_cache_check)
+    df = load_features(start_date=start_date, use_cache=use_cache)
     df = df.dropna(subset=FEATURES + ["target"])
     print(f"  使用特徵數: {len(FEATURES)}")
     print(f"  全天有效樣本: {len(df):,} 筆")
@@ -72,10 +77,10 @@ def train_rfc(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
-    skip_cache_check: bool = False,
+    use_cache: bool = True,
 ):
-    """訓練 RandomForest 模型（只用 ORB 特徵）。skip_cache_check 見 _prepare_train_test()。"""
-    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, skip_cache_check)
+    """訓練 RandomForest 模型（只用 ORB 特徵）。use_cache 見 _prepare_train_test()。"""
+    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, use_cache)
     X_train, X_test = to_model_input(train_df), to_model_input(test_df)
 
     model = RandomForestClassifier(
@@ -106,12 +111,12 @@ def train_lgbm(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
-    skip_cache_check: bool = False,
+    use_cache: bool = True,
 ):
-    """訓練 LightGBM 模型（只用 ORB 特徵）。skip_cache_check 見 _prepare_train_test()。"""
+    """訓練 LightGBM 模型（只用 ORB 特徵）。use_cache 見 _prepare_train_test()。"""
     import lightgbm as lgb
 
-    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, skip_cache_check)
+    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, use_cache)
     X_train, X_test = to_model_input(train_df), to_model_input(test_df)
 
     # target 不平衡（漲約35% vs 跌約65%），scale_pos_weight 校準機率分佈，
@@ -159,12 +164,12 @@ def train_xgb(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
     end_date: str = "",
-    skip_cache_check: bool = False,
+    use_cache: bool = True,
 ):
-    """訓練 XGBoost 模型（跟 LGBM 共用 FEATURES/切分方式，方便比較）。skip_cache_check 見 _prepare_train_test()。"""
+    """訓練 XGBoost 模型（跟 LGBM 共用 FEATURES/切分方式，方便比較）。use_cache 見 _prepare_train_test()。"""
     from xgboost import XGBClassifier
 
-    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, skip_cache_check)
+    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, use_cache)
     X_train, X_test = to_model_input(train_df), to_model_input(test_df)
 
     # 同 train_lgbm() 的 scale_pos_weight 校準邏輯
