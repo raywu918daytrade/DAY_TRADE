@@ -225,6 +225,9 @@ def train_lgbm(
         num_leaves=31,
         min_child_samples=50,
         subsample=0.8,
+        subsample_freq=1,  # LightGBM sklearn API 沒設這個 subsample 不會生效（bagging_freq
+        # 預設0，bagging_fraction 會被忽略當1.0處理）——2026-07-21 發現，見
+        # experiments/tune_lgbm.py 的說明，補上才讓 subsample=0.8 真的有作用
         colsample_bytree=0.8,
         reg_lambda=1.0,
         random_state=42,
