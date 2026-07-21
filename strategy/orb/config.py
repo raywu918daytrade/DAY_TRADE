@@ -6,7 +6,7 @@
 
 import os
 
-# ── 要用哪個模型（lgbm / xgb） ─────────────────────────────────────────────
+# ── 要用哪個模型（rfc / lgbm / xgb） ───────────────────────────────────────
 # run_backtest.py（回測）跟 live.py（即時交易）都讀這個，只改這裡（或 .env 的
 # ORB_MODEL_TYPE）一個地方就能同時切換兩邊要用的模型，比照 rally 的做法
 # （strategy/rally/config.py 的 MODEL_TYPE）。預設 lgbm——見

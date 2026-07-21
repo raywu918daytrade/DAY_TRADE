@@ -1,5 +1,5 @@
 """
-模型訓練 — LightGBM / XGBoost（只用 ORB 特徵，兩個模型互相比較用）
+模型訓練 — RandomForest / LightGBM / XGBoost（只用 ORB 特徵，三個模型互相比較用）
 """
 
 import sys
@@ -7,6 +7,7 @@ from pathlib import Path
 
 import joblib
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 if str(Path(__file__).parent.parent.parent) not in sys.path:
@@ -16,6 +17,7 @@ from strategy.orb.config import DEFAULT_TEST_DAYS, MIN_VOL_MA20
 from strategy.orb.features import FEATURES, apply_liquidity_filter, load_features, to_model_input
 
 _ROOT = Path(__file__).parent.parent.parent
+_MODEL_PATH_RFC = _ROOT / "models/m1_orb_rfc.pkl"
 _MODEL_PATH_LGBM = _ROOT / "models/m1_orb_lgbm.pkl"
 _MODEL_PATH_XGB = _ROOT / "models/m1_orb_xgb.pkl"
 
@@ -66,6 +68,40 @@ def _prepare_train_test(
     return train_df, test_df
 
 
+def train_rfc(
+    test_days: int = DEFAULT_TEST_DAYS,
+    start_date: str = "",
+    end_date: str = "",
+    skip_cache_check: bool = False,
+):
+    """訓練 RandomForest 模型（只用 ORB 特徵）。skip_cache_check 見 _prepare_train_test()。"""
+    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, skip_cache_check)
+    X_train, X_test = to_model_input(train_df), to_model_input(test_df)
+
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_leaf=50,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced",  # target 不平衡（漲約35% vs 跌約65%），理由同
+        # train_lgbm()/train_xgb() 的 scale_pos_weight 校準邏輯，RFC 用 sklearn
+        # 原生的 class_weight 達到同樣效果
+    )
+    model.fit(X_train, train_df["target"])
+    model._orb_train_cutoff = train_df["date"].max()  # 理由同 train_lgbm()
+
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+    print(f"\nAccuracy : {accuracy_score(test_df['target'], y_pred):.4f}")
+    print(f"AUC      : {roc_auc_score(test_df['target'], y_prob):.4f}")
+
+    _MODEL_PATH_RFC.parent.mkdir(exist_ok=True)
+    joblib.dump(model, _MODEL_PATH_RFC)
+    print(f"模型已存至 {_MODEL_PATH_RFC}")
+    return model
+
+
 def train_lgbm(
     test_days: int = DEFAULT_TEST_DAYS,
     start_date: str = "",
@@ -92,6 +128,8 @@ def train_lgbm(
         num_leaves=31,
         min_child_samples=50,
         subsample=0.8,
+        subsample_freq=1,  # LightGBM sklearn API 沒設這個 subsample 不會生效（bagging_freq
+        # 預設0，bagging_fraction 會被忽略當1.0處理）——見 strategy/rally/train.py 同一個坑
         colsample_bytree=0.8,
         reg_lambda=1.0,
         random_state=42,
@@ -165,6 +203,12 @@ def train_xgb(
     return model
 
 
+def load_model_rfc():
+    if not _MODEL_PATH_RFC.exists():
+        raise FileNotFoundError("找不到 RFC 模型，請先執行 train_rfc()")
+    return joblib.load(_MODEL_PATH_RFC)
+
+
 def load_model_lgbm():
     if not _MODEL_PATH_LGBM.exists():
         raise FileNotFoundError("找不到 LGBM 模型，請先執行 train_lgbm()")
@@ -178,13 +222,14 @@ def load_model_xgb():
 
 
 _MODEL_LOADERS = {
+    "rfc": load_model_rfc,
     "lgbm": load_model_lgbm,
     "xgb": load_model_xgb,
 }
 
 
 def load_model_by_type(model_type: str):
-    """依 config.MODEL_TYPE（"lgbm"/"xgb"）載入對應模型，
+    """依 config.MODEL_TYPE（"rfc"/"lgbm"/"xgb"）載入對應模型，
     run_backtest.py 跟 live.py 共用這支，切換模型只要改 config.py/.env 一個地方。"""
     if model_type not in _MODEL_LOADERS:
         raise ValueError(f"未知 model_type: {model_type!r}，可用: {list(_MODEL_LOADERS)}")

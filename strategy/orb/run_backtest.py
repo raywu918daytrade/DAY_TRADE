@@ -29,7 +29,7 @@ def run(
     """
     跑一次 ORB 回測。
 
-    要用哪個模型（lgbm/xgb）由 config.MODEL_TYPE 決定（讀 .env 的
+    要用哪個模型（rfc/lgbm/xgb）由 config.MODEL_TYPE 決定（讀 .env 的
     ORB_MODEL_TYPE，預設 lgbm），跟 live.py 共用同一個參數，比照 rally 的
     run_backtest.py 做法——只改 config.py/.env 一個地方，回測跟即時交易就會
     一起換模型，不用兩邊分別改。

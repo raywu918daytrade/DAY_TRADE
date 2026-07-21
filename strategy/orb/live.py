@@ -9,7 +9,7 @@ orb 策略對外的即時交易介面 — live_trader.py 只透過這支檔案�
 train.py/validate.py/features.py 這些訓練/驗證用的東西，live_trader.py 完全
 不會碰到，依賴方向永遠是單向的：live_trader → live.py → predict.py/train.py。
 
-要用哪個模型（lgbm/xgb）由 config.MODEL_TYPE 決定（讀 .env 的
+要用哪個模型（rfc/lgbm/xgb）由 config.MODEL_TYPE 決定（讀 .env 的
 ORB_MODEL_TYPE，預設 lgbm），跟 run_backtest.py 共用同一個參數，比照
 strategy/rally/live.py 的做法，改 config.py/.env 一個地方兩邊就會一起換。
 """

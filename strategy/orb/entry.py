@@ -1,20 +1,12 @@
 """
-當沖策略 — ORB（開盤區間突破）特徵 + LightGBM / XGBoost 模型（CLI 進入點）
+當沖策略 — ORB（開盤區間突破）特徵 + RandomForest / LightGBM / XGBoost 模型（CLI 進入點）
 
 實際邏輯拆到同資料夾底下：
     config.py     交易相關設定（TP/SL/HOLD_BARS、開盤區間分鐘數）
     features.py   ORB 特徵工程、triple barrier 標籤、FEATURES 清單、load_features() cache
-    train.py      LightGBM / XGBoost 訓練與模型載入
-    validate.py   信心度分析、召回率分析、分鐘區間交叉報表、特徵重要性、LGBM vs XGB 比較
+    train.py      RandomForest / LightGBM / XGBoost 訓練與模型載入
+    validate.py   信心度分析、召回率分析、分鐘區間交叉報表、特徵重要性、RFC vs LGBM vs XGB 比較
     predict.py    predict()（批次機率矩陣，回測用）、predict_live()（即時推論入口）
-
-== Main 模式 ==
-
-train_lgbm   訓練 LightGBM 模型
-train_xgb    訓練 XGBoost 模型
-validate     信心度分析 + 召回率分析 + 突破後分鐘區間交叉報表 + 特徵重要性（LGBM、XGB 已訓練的都跑）
-compare      LGBM vs XGB 同一份測試集 Accuracy/AUC 對照（兩個模型都要先訓練過）
-predict      印批次機率矩陣（predict()）的形狀跟最後一個時間點的排行榜，用來肉眼檢查
 """
 
 import argparse
@@ -26,7 +18,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 from strategy.orb.config import DEFAULT_TEST_DAYS, HOLD_BARS, OPENING_RANGE_MINUTES, SL_PCT, TP_PCT  # noqa: F401
 from strategy.orb.predict import predict as predict_batch
-from strategy.orb.train import train_lgbm, train_xgb
+from strategy.orb.train import train_lgbm, train_rfc, train_xgb
 from strategy.orb.validate import (
     available_models,
     compare_report,
@@ -52,7 +44,7 @@ def main(
       1. 直接傳參數：main(mode="train_lgbm")
       2. CLI 執行：python strategy/orb/entry.py train_lgbm
 
-    skip_cache_check: 只影響 train_lgbm/train_xgb，見 train.py
+    skip_cache_check: 只影響 train_rfc/train_lgbm/train_xgb，見 train.py
     _prepare_train_test() 的說明——預設 False（正式訓練用最嚴格的 cache
     新鮮度檢查）；True 時不管 db/m1 有沒有更新都直接吃現成 cache，只適合
     背景資料補齊程式還在跑、你只是想先跑一版測試程式碼/參數邏輯的情境，
@@ -60,10 +52,12 @@ def main(
     """
     if not mode:
         parser = argparse.ArgumentParser(
-            description="當沖策略 — ORB 特徵 + LightGBM",
+            description="當沖策略 — ORB 特徵 + RandomForest / LightGBM / XGBoost",
         )
         parser.add_argument(
-            "mode", choices=["train_lgbm", "train_xgb", "validate", "compare", "predict"], help="執行模式"
+            "mode",
+            choices=["train_rfc", "train_lgbm", "train_xgb", "validate", "compare", "predict"],
+            help="執行模式",
         )
         parser.add_argument("--test_days", type=int, default=DEFAULT_TEST_DAYS, help="測試集天數")
         parser.add_argument("--start_date", type=str, default="", help="資料起日 YYYY-MM-DD")
@@ -71,7 +65,7 @@ def main(
         parser.add_argument(
             "--skip_cache_check",
             action="store_true",
-            help="train_lgbm/train_xgb 專用：不管 db/m1 有沒有更新都直接用現成特徵 cache（犧牲正確性換速度，不要拿來訓練正式模型）",
+            help="train_rfc/train_lgbm/train_xgb 專用：不管 db/m1 有沒有更新都直接用現成特徵 cache（犧牲正確性換速度，不要拿來訓練正式模型）",
         )
         args = parser.parse_args()
         mode = args.mode
@@ -80,7 +74,10 @@ def main(
         end_date = args.end_date
         skip_cache_check = args.skip_cache_check
 
-    if mode == "train_lgbm":
+    if mode == "train_rfc":
+        train_rfc(test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=skip_cache_check)
+
+    elif mode == "train_lgbm":
         train_lgbm(test_days=test_days, start_date=start_date, end_date=end_date, skip_cache_check=skip_cache_check)
 
     elif mode == "train_xgb":
@@ -113,11 +110,20 @@ def main(
             print(f"    {stock_id:>8s}  {p:.4f}")
 
     else:
-        print(f"未知模式: {mode}，可用: train_lgbm / train_xgb / validate / compare / predict")
+        print(f"未知模式: {mode}，可用: train_rfc / train_lgbm / train_xgb / validate / compare / predict")
 
 
 if __name__ == "__main__":
-    mode = "validate"  # validate,train_lgbm,train_xgb
+    """
+    == Main 模式 ==
+    train_rfc    訓練 RandomForest 模型
+    train_lgbm   訓練 LightGBM 模型
+    train_xgb    訓練 XGBoost 模型
+    validate     信心度分析 + 召回率分析 + 突破後分鐘區間交叉報表 + 特徵重要性（RFC、LGBM、XGB 已訓練的都跑）
+    compare      RFC vs LGBM vs XGB 同一份測試集 Accuracy/AUC 對照（三個模型都要先訓練過）
+    predict      印批次機率矩陣（predict()）的形狀跟最後一個時間點的排行榜，用來肉眼檢查
+    """
+    mode = "train_xgb"  # validate,train_rfc,train_lgbm,train_xgb
     test_days = DEFAULT_TEST_DAYS  # 統一用 config.py 的預設值，不要在這裡另外寫死數字
     start_date = ""
     end_date = ""

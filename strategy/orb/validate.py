@@ -1,10 +1,10 @@
 """
-模型驗證報表 — 信心度分析、召回率分析、時段交叉報表、特徵重要性、LGBM vs XGB 比較
+模型驗證報表 — 信心度分析、召回率分析、時段交叉報表、特徵重要性、RFC vs LGBM vs XGB 比較
 
 比照 strategy/rally/validate.py 的做法。confidence_report/coverage_report/
 hour_confidence_report/feature_importance 都是單一模型的報表（model=None 時
 預設 LGBM），entry.py 的 validate 模式用 available_models() 對每個已訓練好
-的模型各跑一輪；compare_report() 是兩個模型在同一份測試集上的 Accuracy/AUC
+的模型各跑一輪；compare_report() 是三個模型在同一份測試集上的 Accuracy/AUC
 對照表。
 """
 
@@ -19,12 +19,23 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 
 from strategy.orb.config import DEFAULT_TEST_DAYS
 from strategy.orb.features import FEATURES, apply_liquidity_filter, load_features, to_model_input
-from strategy.orb.train import _MODEL_PATH_LGBM, _MODEL_PATH_XGB, load_model_lgbm, load_model_xgb
+from strategy.orb.train import (
+    _MODEL_PATH_LGBM,
+    _MODEL_PATH_RFC,
+    _MODEL_PATH_XGB,
+    load_model_lgbm,
+    load_model_rfc,
+    load_model_xgb,
+)
 
 
 def available_models() -> dict:
     """回傳目前已訓練好的模型 {名稱: model}，還沒訓練過的會跳過。"""
     models = {}
+    if _MODEL_PATH_RFC.exists():
+        models["RFC"] = load_model_rfc()
+    else:
+        print("  （跳過 RFC：模型不存在，請先執行 train_rfc）")
     if _MODEL_PATH_LGBM.exists():
         models["LGBM"] = load_model_lgbm()
     else:
@@ -278,8 +289,8 @@ def compare_report(
     start_date: str = "",
     end_date: str = "",
 ):
-    """LGBM vs XGB：同一份測試集上的 Accuracy / AUC 對照表。"""
-    models = {"LGBM": load_model_lgbm(), "XGB ": load_model_xgb()}
+    """RFC vs LGBM vs XGB：同一份測試集上的 Accuracy / AUC 對照表。"""
+    models = {"RFC ": load_model_rfc(), "LGBM": load_model_lgbm(), "XGB ": load_model_xgb()}
 
     df = load_features()
     df = df.dropna(subset=FEATURES + ["target"])
