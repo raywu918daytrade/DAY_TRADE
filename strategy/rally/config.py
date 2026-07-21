@@ -11,18 +11,17 @@ TP_PCT = 0.03
 SL_PCT = 0.03
 HOLD_BARS = 30
 
-# ── 要用哪個模型（rfc / xgb / lgbm） ──────────────────────────────────────
-# run_backtest.py（回測）跟 live.py（即時交易）都讀這個，只改這裡一個地方
-# 就能同時切換兩邊要用的模型，不用分別改兩個檔案。
-MODEL_TYPE = os.environ.get("RALLY_MODEL_TYPE", "xgb")
-
-# ── 即時交易信心度門檻預設值 ──────────────────────────────────────────────
-# main/live_trader.py 每分鐘先查前端 settings 裡的全域 threshold，沒設定才
-# fallback 這裡（見 main/state.py::StrategyState、main/live_trader.py 的
-# 說明）——原本 main/config.py 有一個全域 THRESHOLD 給所有策略共用，但
-# orb/rally/mkt 三個模型的機率校準跟最佳門檻不一定一樣，2026-07-21 拆成
-# 各策略自己一個。跟 predict.py::predict_live() 的 threshold 參數預設值一致。
-THRESHOLD = float(os.environ.get("RALLY_THRESHOLD", "0.55"))
+# ── 即時交易信心度門檻（RFC/XGB/LGBM 各自一個，rally_xgb/rally_lgbm 兩個
+# 獨立策略各自查自己的 key） ──────────────────────────────────────────────
+# rally 自己的 RFC/XGB/LGBM 三個模型機率校準不一樣（見
+# experiments/walk_forward_xgb.py、walk_forward_lgbm.py 的驗證結果，XGB/LGBM
+# 在 threshold=0.60 才開始有穩定明顯的改善）。寫死（2026-07-22：改成跟
+# strategy/orb/config.py 統一寫法，不走 .env 環境變數——這些值是 walk-forward
+# 驗證出來的結論，不是隨時能調的操作旋鈕，.env 沒進版控，改了不會留下
+# git 紀錄，寫死才能讓每次調整都對得起某次驗證結果）。
+# RFC 的 walk-forward 驗證還沒跑完，先沿用舊預設 0.55，之後驗證結果出來
+# 再調整。
+THRESHOLD_BY_MODEL = {"rfc": 0.55, "xgb": 0.60, "lgbm": 0.60}
 
 # ── 交易時段（早盤過濾範圍） ──────────────────────────────────────────────────
 SESSION_START = (9, 1)

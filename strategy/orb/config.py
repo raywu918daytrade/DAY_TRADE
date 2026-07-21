@@ -4,23 +4,23 @@
 只放常數，不放邏輯，比照 strategy/rally/config.py 的作法。
 """
 
-import os
-
-# ── 要用哪個模型（rfc / lgbm / xgb） ───────────────────────────────────────
-# run_backtest.py（回測）跟 live.py（即時交易）都讀這個，只改這裡（或 .env 的
-# ORB_MODEL_TYPE）一個地方就能同時切換兩邊要用的模型，比照 rally 的做法
-# （strategy/rally/config.py 的 MODEL_TYPE）。預設 lgbm——見
-# strategy/orb/validate.py 的 compare_report()，同一份測試集上 AUC、精確率
-# 門檻表現都比 XGB 好。
-MODEL_TYPE = os.environ.get("ORB_MODEL_TYPE", "lgbm")
-
-# ── 即時交易信心度門檻預設值 ──────────────────────────────────────────────
-# main/live_trader.py 每分鐘先查前端 settings 裡的全域 threshold，沒設定才
-# fallback 這裡（見 main/state.py::StrategyState、main/live_trader.py 的
-# 說明）——原本 main/config.py 有一個全域 THRESHOLD 給所有策略共用，但
-# orb/rally/mkt 三個模型的機率校準跟最佳門檻不一定一樣，2026-07-21 拆成
-# 各策略自己一個。跟 predict.py::predict_live() 的 threshold 參數預設值一致。
-THRESHOLD = float(os.environ.get("ORB_THRESHOLD", "0.55"))
+# ── 即時交易信心度門檻（RFC/LGBM/XGB 各自一個，orb_xgb/orb_lgbm 兩個獨立
+# 策略各自查自己的 key） ───────────────────────────────────────────────────
+# 同一個 orb 策略內 RFC/LGBM/XGB 三個模型的機率校準不一樣（見 validate.py
+# compare_report() 的門檻表——同樣門檻，三個模型的精確率/召回率取捨完全
+# 不同），共用同一個門檻沒有意義。寫死（目前沒有另外開 .env 變數覆蓋的
+# 需求），取「精確率明顯優於基準線（測試集實際上漲比例約45%）且訊號量
+# 還沒被壓到個位數」的保守門檻，見 2026-07-22 用19個月資料跑 validate()
+# 的門檻表：
+#   RFC  0.60 → 精確率 79.5%（n=44）
+#   LGBM 0.65 → 精確率 64.0%（n=100）
+#   XGB  0.65 → 精確率 68.1%（n=210）
+# 2026-07-22：原本這裡還有個 MODEL_TYPE（讀 ORB_MODEL_TYPE）決定「單一」
+# THRESHOLD 給 predict.py 當預設參數值，但 main/live_trader.py 呼叫
+# predict_live() 一律明確傳 threshold=0（見該檔案），這個預設值從來沒被
+# 用到過，run_backtest.py 也已經改成直接傳 model_type 參數（不再讀
+# ORB_MODEL_TYPE），確認完全沒有消費者後拿掉。
+THRESHOLD_BY_MODEL = {"rfc": 0.60, "lgbm": 0.65, "xgb": 0.65}
 
 # ── Triple Barrier 參數（標籤怎麼定義，沿用 rally 的定義） ──────────────────
 # 2026-07-11 測過改成 2%：test_days=10 AUC 幾乎沒變（0.4925→0.4916），

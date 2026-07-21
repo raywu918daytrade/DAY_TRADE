@@ -13,7 +13,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backtest.intraday_platform import print_trades, run_backtest
-from strategy.mkt.config import HOLD_BARS, MODEL_TYPE, SL_PCT, TP_PCT
+from strategy.mkt.config import HOLD_BARS, SL_PCT, TP_PCT
 from strategy.mkt.predict import predict
 from strategy.mkt.train import load_model_by_type
 
@@ -23,14 +23,15 @@ def run(
     threshold: float = 0.6,
     top_n: int = 5,
     max_positions: int = 10,
+    model_type: str = "lgbm",
 ):
     """
     跑一次 mkt 回測。
 
-    要用哪個模型（rfc/xgb/lgbm）由 config.MODEL_TYPE 決定（讀 .env 的
-    MKT_MODEL_TYPE，預設lgbm），跟 live.py 共用同一個參數，比照
-    strategy/rally/run_backtest.py、strategy/orb/run_backtest.py 的做法——
-    只改 config.py/.env 一個地方，回測跟即時交易就會一起換模型。
+    model_type: 要用哪個模型（rfc/xgb/lgbm），直接傳參數指定（2026-07-22
+    討論：不再跟 live.py 共用 config.MODEL_TYPE/MKT_MODEL_TYPE，回測改成
+    參數輸入，不用再繞去改 .env——live.py 目前還是單一策略、依 config.
+    MODEL_TYPE 切換，這裡只是讓回測獨立於那個設定）。
 
     threshold: 信心度門檻，predict() 產生的機率矩陣是「漲」（class=2）的
         機率，只有 proba >= threshold 的候選才會進場（純做多，跟共用引擎
@@ -41,7 +42,7 @@ def run(
         跟這裡的交易窗口本來就要保持一致（見 train.py::_prepare_data() 的
         說明），不應該讓呼叫端自己調鬆調緊。
     """
-    model = load_model_by_type(MODEL_TYPE)
+    model = load_model_by_type(model_type)
 
     df_proba = predict(model=model, test_days=test_days)
     print(f"機率矩陣: {df_proba.shape}，非空值 {df_proba.notna().sum().sum()} 筆")

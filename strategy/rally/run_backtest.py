@@ -13,7 +13,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backtest.intraday_platform import print_trades, run_backtest
-from strategy.rally.config import HOLD_BARS, MODEL_TYPE, SL_PCT, TP_PCT
+from strategy.rally.config import HOLD_BARS, SL_PCT, TP_PCT
 from strategy.rally.predict import predict
 from strategy.rally.train import load_model_by_type
 
@@ -21,9 +21,13 @@ from strategy.rally.train import load_model_by_type
 def run(
     test_days: int = 10,
     threshold: float = 0.70,
+    model_type: str = "xgb",
 ):
-    """跑一次 rally 回測（模型由 config.MODEL_TYPE 決定）。"""
-    model = load_model_by_type(MODEL_TYPE)
+    """跑一次 rally 回測。model_type：要用哪個模型（rfc/xgb/lgbm），直接傳參數
+    指定（2026-07-22 討論：即時交易現在是 rally_xgb/rally_lgbm 兩個獨立策略
+    各自寫死模型，不再共用 config.MODEL_TYPE/RALLY_MODEL_TYPE 切換，回測這裡
+    也直接改成參數輸入，不用再繞去改 .env）。"""
+    model = load_model_by_type(model_type)
 
     df_proba = predict(model=model, test_days=test_days)
     print(f"機率矩陣: {df_proba.shape}，非空值 {df_proba.notna().sum().sum()} 筆")

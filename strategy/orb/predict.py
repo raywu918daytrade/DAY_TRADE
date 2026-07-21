@@ -88,7 +88,7 @@ def predict_live(
     open_vol_history: pd.DataFrame | None = None,
     hourly_tr_history: pd.DataFrame | None = None,
     model=None,
-    threshold: float = 0.55,
+    threshold: float = 0.65,
     day_trade_stocks: set | None = None,
     m1_live: pd.DataFrame | None = None,
 ) -> list:
