@@ -1,6 +1,24 @@
 """
 當沖策略 — RandomForest 簡單模型（CLI 進入點）
 
+== 策略重點（破底翻，rally） ==
+
+抓「先跌後漲」的當日反彈型態：股價當天先破底、動能轉弱後又開始翻揚，賭這股
+反彈動能會延續。不是規則式硬過濾，而是用機器學習分類器（RandomForest/XGBoost/
+LightGBM 三選一比較）學這個型態加上一整套盤中動能/量能/位置特徵，去預測「進場
+後 30 根分K內（HOLD_BARS），會先漲 3%（TP_PCT）還是先跌 3%（SL_PCT）」
+（triple barrier 標籤，target=1/0，見 features.py）。
+
+breakout_signal（第1根5分鐘K跌、第2根5分鐘K漲＝先跌後漲）原本是即時交易的硬
+過濾規則，2026-07-09 驗證後拿掉了——加這道規則反而讓勝率下降 8-10 個百分點
+（見 experiments/breakout_filter_eval.py），現在只是模型的 93 個輸入特徵之一，
+讓樹模型自己決定要不要用、怎麼用，不再強制訊號一定要先跌後漲。
+
+全天訓練（不鎖 9:14~9:30 黃金窗口），靠 minutes_since_open 這個特徵讓模型自己
+判斷開盤動能期 vs 中午盤整期，交易時段限制交給呼叫端（回測用 first_entry_time/
+last_entry_time，即時交易用 config.py 的 SESSION_START/END）。當沖策略，
+不留倉，收盤前強制平倉（live_trader.py 的 _force_close_eod）。
+
 實際邏輯拆到同資料夾底下：
     config.py     交易相關設定（TP/SL/HOLD_BARS、SESSION、BREAKOUT_TRADE 時段）
     features.py   特徵工程、triple barrier 標籤、FEATURES 清單、load_features() cache
