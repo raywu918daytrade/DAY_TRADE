@@ -183,13 +183,18 @@ def train_xgb(
     train_df, test_df = _prepare_train_test(test_days, start_date, end_date, use_cache)
 
     model = XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=50,
-        reg_lambda=1.0,
+        # 2026-07-21 用 experiments/tune_xgb.py（Optuna，train/val/test 三段式
+        # 切分）調過，再用 experiments/walk_forward_xgb.py（4個獨立窗口）驗證：
+        # threshold>=0.60 時新參數 4/4 窗口都贏舊參數（0.60: 55.18% vs 47.00%，
+        # 0.65: 66.03% vs 49.16%），才貼進來取代原本隨便設的預設值。
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.013674939977956298,
+        subsample=0.603928001148621,
+        colsample_bytree=0.8222495158859673,
+        min_child_weight=25,
+        reg_lambda=1.9326921144453604,
+        gamma=2.5044241331307036,
         random_state=42,
         n_jobs=-1,
         eval_metric="logloss",
@@ -220,16 +225,22 @@ def train_lgbm(
     train_df, test_df = _prepare_train_test(test_days, start_date, end_date, use_cache)
 
     model = lgb.LGBMClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=50,
-        subsample=0.8,
+        # 2026-07-21 用 experiments/tune_lgbm.py（Optuna，train/val/test 三段式
+        # 切分）調過：val precision 62.83% → test（完全沒被調參碰過）60.11%，
+        # 掉幅小、generalize 得好，才貼進來取代原本隨便設的預設值。同一次也
+        # 調過 XGB，但那組參數 val 62.12% → test 只剩 44.29%（掉了17.8個百分
+        # 點、幾乎跟瞎猜差不多），明顯是過擬合到 val 期間，沒有採用。
+        n_estimators=200,
+        num_leaves=101,
+        max_depth=3,
+        learning_rate=0.03657843946200939,
+        min_child_samples=28,
+        subsample=0.8600035132620599,
         subsample_freq=1,  # LightGBM sklearn API 沒設這個 subsample 不會生效（bagging_freq
         # 預設0，bagging_fraction 會被忽略當1.0處理）——2026-07-21 發現，見
-        # experiments/tune_lgbm.py 的說明，補上才讓 subsample=0.8 真的有作用
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
+        # experiments/tune_lgbm.py 的說明，補上才讓 subsample 真的有作用
+        colsample_bytree=0.8319671794969992,
+        reg_lambda=0.5187813029919602,
         random_state=42,
         n_jobs=-1,
         verbosity=-1,
