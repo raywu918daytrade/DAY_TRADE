@@ -1,5 +1,5 @@
 """
-mkt_idx 策略 —— 核心特徵：個股跟大盤（0050）的累積報酬率差值。
+mkt 策略 —— 核心特徵：個股跟大盤（0050）的累積報酬率差值。
 
 第一版先只做這一個特徵（ret_vs_idx），驗證數字正確後再逐步加其他特徵，
 不一次寫完整套 pipeline（見 2026-07-14 的討論：先精簡、慢慢加，方便debug）。
@@ -14,7 +14,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from strategy.mkt_idx.config import HOLD_BARS, IDX_SYMBOL, SL_PCT, TP_PCT
+from strategy.mkt.config import HOLD_BARS, IDX_SYMBOL, SL_PCT, TP_PCT
 
 
 def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFrame:

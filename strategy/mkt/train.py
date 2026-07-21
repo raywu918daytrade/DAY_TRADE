@@ -1,5 +1,5 @@
 """
-mkt_idx 模型訓練 — RandomForest / XGBoost / LightGBM
+mkt 模型訓練 — RandomForest / XGBoost / LightGBM
 
 2026-07-14 討論：先用最簡單的設定跑一次，確認整條 pipeline（特徵→標籤→
 流動性過濾→時段過濾→訓練）真的串得起來、看得懂結果，之後再逐步加特徵、
@@ -8,7 +8,7 @@ XGBoost/LightGBM，三個模型共用同一份 FEATURES/_split_data() 切分邏�
 比照 strategy/rally/train.py 的三模型設計。
 
 目前設定（都是前面幾支 experiments/ 腳本驗證出來的結論）：
-    FEATURES        見 strategy/mkt_idx/features.py（單一事實來源，這裡
+    FEATURES        見 strategy/mkt/features.py（單一事實來源，這裡
                     不重複列一份，避免兩邊各自維護一份不一致）
     流動性過濾：前一日量前100名   訊號密度提升最明顯的門檻
     時段：9:11~9:30                9:00~9:10被判定為開盤集合競價剛結束的
@@ -17,7 +17,7 @@ XGBoost/LightGBM，三個模型共用同一份 FEATURES/_split_data() 切分邏�
 
 == Main 模式 ==
 
-train        訓練模型，存至 models/mkt_idx_{rfc,xgb,lgbm}.pkl（用
+train        訓練模型，存至 models/mkt_{rfc,xgb,lgbm}.pkl（用
              --model_type 選演算法，預設rfc）
 importance   顯示特徵重要性（讀已存的模型，不重訓）
 evaluate     單獨印混淆矩陣 + 分類報告（讀已存的模型 + 跟訓練時同一套切分
@@ -26,12 +26,12 @@ confidence   漲/跌兩個稀有類別的信心度門檻掃描，看不同機率
              precision/recall（讀已存的模型，不重訓）
 
 用法：
-    python -m strategy.mkt_idx.train train
-    python -m strategy.mkt_idx.train train --model_type xgb
-    python -m strategy.mkt_idx.train train --model_type lgbm
-    python -m strategy.mkt_idx.train importance --model_type xgb
-    python -m strategy.mkt_idx.train evaluate
-    python -m strategy.mkt_idx.train confidence
+    python -m strategy.mkt.train train
+    python -m strategy.mkt.train train --model_type xgb
+    python -m strategy.mkt.train train --model_type lgbm
+    python -m strategy.mkt.train importance --model_type xgb
+    python -m strategy.mkt.train evaluate
+    python -m strategy.mkt.train confidence
 
 ⚠️ evaluate/confidence 用的 test_days 要跟當初訓練那個模型用的 test_days
 一致（都預設30），不然測試集會跟模型訓練時看過的資料重疊，評估結果不可信
@@ -52,8 +52,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 from data.query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
-from strategy.mkt_idx.config import IDX_SYMBOL
-from strategy.mkt_idx.features import (
+from strategy.mkt.config import IDX_SYMBOL
+from strategy.mkt.features import (
     FEATURES,
     add_bar_features,
     add_m3_m5_features,
@@ -64,10 +64,10 @@ from strategy.mkt_idx.features import (
 )
 
 _ROOT = Path(__file__).parent.parent.parent
-_MODEL_PATH = _ROOT / "models/mkt_idx_rfc.pkl"
-_MODEL_PATH_XGB = _ROOT / "models/mkt_idx_xgb.pkl"
-_MODEL_PATH_LGBM = _ROOT / "models/mkt_idx_lgbm.pkl"
-_CACHE_PATH = _ROOT / "cache/mkt_idx_prepared.parquet"
+_MODEL_PATH = _ROOT / "models/mkt_rfc.pkl"
+_MODEL_PATH_XGB = _ROOT / "models/mkt_xgb.pkl"
+_MODEL_PATH_LGBM = _ROOT / "models/mkt_lgbm.pkl"
+_CACHE_PATH = _ROOT / "cache/mkt_prepared.parquet"
 _SOURCE_DIRS = [_ROOT / "db/m1", _ROOT / "db/m3", _ROOT / "db/m5", _ROOT / "db/m3_std", _ROOT / "db/m5_std"]
 
 
@@ -499,7 +499,7 @@ def main(
     model_type: str = "rfc",
     use_cache: bool = False,
 ):
-    """CLI進入點，比照 strategy/rally/entry.py 的 mode 切換方式（mkt_idx
+    """CLI進入點，比照 strategy/rally/entry.py 的 mode 切換方式（mkt
     目前只有 train.py，還沒有 predict.py/live.py/entry.py，等那些補齊了
     再考慮要不要拆成獨立的 entry.py）。可用模式見檔頭的「== Main 模式 ==」。
 
@@ -512,7 +512,7 @@ def main(
       1. VS Code按F5：__main__ 裡直接寫死 mode 變數，不帶任何CLI參數
          （sys.argv長度=1，只有腳本路徑本身），這裡就直接用傳進來的 mode，
          不會被argparse覆蓋。
-      2. 終端機帶參數：python -m strategy.mkt_idx.train evaluate --threshold 0.6
+      2. 終端機帶參數：python -m strategy.mkt.train evaluate --threshold 0.6
          （sys.argv長度>1），這裡改用argparse解析，CLI帶的參數會覆蓋掉
          __main__ 裡寫死的值。
     """
@@ -521,7 +521,7 @@ def main(
     # 不要看mode是不是空字串來判斷（之前這樣寫，F5執行時只要mode沒填就會
     # 誤觸發argparse，去讀根本不存在的CLI參數而出錯或用到不對的預設值）。
     if len(sys.argv) > 1:
-        parser = argparse.ArgumentParser(description="mkt_idx 策略 — RandomForest/XGBoost/LightGBM")
+        parser = argparse.ArgumentParser(description="mkt 策略 — RandomForest/XGBoost/LightGBM")
         parser.add_argument(
             "mode",
             nargs="?",
@@ -600,15 +600,15 @@ if __name__ == "__main__":
                     有更新才重算。
 
     2. 終端機帶參數（會覆蓋掉下面寫死的值）：
-        python -m strategy.mkt_idx.train train
-        python -m strategy.mkt_idx.train train --model_type xgb
-        python -m strategy.mkt_idx.train train --model_type lgbm
-        python -m strategy.mkt_idx.train importance --model_type xgb
-        python -m strategy.mkt_idx.train evaluate --threshold 0.6
-        python -m strategy.mkt_idx.train evaluate --use_cache
-        python -m strategy.mkt_idx.train confidence
+        python -m strategy.mkt.train train
+        python -m strategy.mkt.train train --model_type xgb
+        python -m strategy.mkt.train train --model_type lgbm
+        python -m strategy.mkt.train importance --model_type xgb
+        python -m strategy.mkt.train evaluate --threshold 0.6
+        python -m strategy.mkt.train evaluate --use_cache
+        python -m strategy.mkt.train confidence
     """
-    mode = "train"  # train / importance / evaluate / confidence
+    mode = "evaluate"  # train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
     model_type = "lgbm"  # rfc / xgb / lgbm

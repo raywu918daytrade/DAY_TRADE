@@ -18,7 +18,7 @@
     越多）那組，未來報酬率平均越高（負相關、單調遞減的關係）。
 
 用法
-    python strategy/mkt_idx/experiments/ret_vs_idx_signal_check.py
+    python strategy/mkt/experiments/ret_vs_idx_signal_check.py
 """
 
 import sys
@@ -31,15 +31,15 @@ import numpy as np
 import pandas as pd
 
 from data.query import load_m1
-from strategy.mkt_idx.config import IDX_SYMBOL
-from strategy.mkt_idx.features import add_ret_vs_idx, top_n_by_prev_day_volume
+from strategy.mkt.config import IDX_SYMBOL
+from strategy.mkt.features import add_ret_vs_idx, top_n_by_prev_day_volume
 
 
 def _load_base(top_n: int | None = None) -> pd.DataFrame:
     """載入分K + 算好 ret_vs_idx，各 forward_minutes 共用同一份，不用重複載入。
 
     top_n: 留空=不過濾；設數字則只留每天依前一日成交量排序前 top_n 名的股票
-    （見 strategy/mkt_idx/features.py::top_n_by_prev_day_volume，2026-07-14
+    （見 strategy/mkt/features.py::top_n_by_prev_day_volume，2026-07-14
     驗證過流動性過濾能提升訊號密度，這裡進一步驗證過濾後 decile 的優勢
     是否也更明顯）。"""
     print("載入分K...")

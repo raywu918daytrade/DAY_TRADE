@@ -3,7 +3,7 @@
 一天裡是怎麼分佈的（見 2026-07-14 討論）。
 
 背景
-    strategy/mkt_idx/features.py::make_barrier_labels_3class() 驗證過，
+    strategy/mkt/features.py::make_barrier_labels_3class() 驗證過，
     HOLD_BARS=10、TP_PCT=SL_PCT=3% 這組參數下，「平」（10分鐘內都沒碰到
     ±3%）佔了九成以上，「漲」「跌」是很稀有的事件（各不到1%）——這跟台股
     盤中「開盤活躍、10:00~13:00盤整」的日內型態吻合。這支腳本進一步驗證：
@@ -16,7 +16,7 @@
     （13點NaN高達56%），可信度打折。
 
 用法
-    python strategy/mkt_idx/experiments/hourly_event_distribution.py
+    python strategy/mkt/experiments/hourly_event_distribution.py
 """
 
 import sys
@@ -28,8 +28,8 @@ if str(Path(__file__).parent.parent.parent.parent) not in sys.path:
 import pandas as pd
 
 from data.query import load_m1
-from strategy.mkt_idx.config import IDX_SYMBOL
-from strategy.mkt_idx.features import make_barrier_labels_3class
+from strategy.mkt.config import IDX_SYMBOL
+from strategy.mkt.features import make_barrier_labels_3class
 
 
 def run(hours: list[int] | None = None):

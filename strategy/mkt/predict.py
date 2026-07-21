@@ -1,7 +1,7 @@
 """
 即時推論 — predict()（批次機率矩陣，回測用）、predict_live()（正式即時推論入口）
 
-mkt_idx 是3分類（跌=0/平=1/漲=2），但策略本身只做多、只在乎「漲」這個訊號的
+mkt 是3分類（跌=0/平=1/漲=2），但策略本身只做多、只在乎「漲」這個訊號的
 機率，所以這裡跟 orb/rally 的二分類 predict_proba()[:, 1] 概念一致，只是改抓
 class=2 那一欄，套進同一份 backtest/intraday_platform.py 共用回測引擎（那支
 引擎只吃單一機率矩陣，不知道背後模型是幾分類）。
@@ -17,8 +17,8 @@ import pandas as pd
 
 from data.query import load_m1, load_m1_live
 from data.resample import compute_m3, compute_m3_std, compute_m5, compute_m5_std
-from strategy.mkt_idx.config import IDX_SYMBOL, MODEL_TYPE
-from strategy.mkt_idx.features import (
+from strategy.mkt.config import IDX_SYMBOL, MODEL_TYPE
+from strategy.mkt.features import (
     FEATURES,
     add_bar_features,
     add_m3_m5_features,
@@ -26,7 +26,7 @@ from strategy.mkt_idx.features import (
     add_ret_vs_idx,
     top_n_stock_ids_by_latest_volume,
 )
-from strategy.mkt_idx.train import _prepare_data, load_model_by_type
+from strategy.mkt.train import _prepare_data, load_model_by_type
 
 
 def _up_proba(model, df: pd.DataFrame):
@@ -99,7 +99,7 @@ def predict_live(
     `s.predict_live(minute_str, state.day, model=..., threshold=0,
     day_trade_stocks=..., m1_live=..., **s.prewarm_cache)` 這種寫法呼叫
     （state.day 是位置參數），不會知道也不會檢查個別策略實際用不用得到
-    day。mkt_idx 目前用不到日K背景資料（ret_vs_idx/m3/m5/m3_std/m5_std全部
+    day。mkt 目前用不到日K背景資料（ret_vs_idx/m3/m5/m3_std/m5_std全部
     是分K現算），day 收下來直接忽略，但仍要保留在同一個位置，不然
     state.day 會被誤傳進下一個參數的位置（例如錯的話會被當成 m1_live，
     整條 pipeline 全部算錯，2026-07-21發現這個bug）。

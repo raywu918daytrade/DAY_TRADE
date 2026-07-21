@@ -4,7 +4,7 @@
 裡面訊號是不是又更集中在剛開盤那幾分鐘（見 2026-07-14 討論）。
 
 用法
-    python strategy/mkt_idx/experiments/opening_hour_10min_distribution.py
+    python strategy/mkt/experiments/opening_hour_10min_distribution.py
 """
 
 import sys
@@ -16,13 +16,13 @@ if str(Path(__file__).parent.parent.parent.parent) not in sys.path:
 import pandas as pd
 
 from data.query import load_m1
-from strategy.mkt_idx.config import IDX_SYMBOL
-from strategy.mkt_idx.features import make_barrier_labels_3class, top_n_by_prev_day_volume
+from strategy.mkt.config import IDX_SYMBOL
+from strategy.mkt.features import make_barrier_labels_3class, top_n_by_prev_day_volume
 
 
 def run(top_n: int | None = None):
     """top_n: 留空=不過濾（全部股票）；設數字則只留每天依前一日成交量排序
-    前 top_n 名的股票（見 strategy/mkt_idx/features.py::top_n_by_prev_day_volume）。"""
+    前 top_n 名的股票（見 strategy/mkt/features.py::top_n_by_prev_day_volume）。"""
     print("載入分K...")
     m1 = load_m1()
     m1["date"] = pd.to_datetime(m1["date"])
