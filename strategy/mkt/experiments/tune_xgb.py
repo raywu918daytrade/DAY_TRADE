@@ -47,9 +47,18 @@ _THRESHOLD = 0.6
 _MIN_PRED = 20
 
 
-def _train_val_test_split(test_days: int = 45, val_days: int = 45, use_cache: bool = True):
+def _train_val_test_split(
+    test_days: int = 45, val_days: int = 45, use_cache: bool = True, train_window_days: int | None = None
+):
     """跟 train.py::_split_data() 的date cutoff邏輯一致，只是多切一段val出來
-    （見檔頭說明，避免Optuna調參污染最終報告用的test集）。"""
+    （見檔頭說明，避免Optuna調參污染最終報告用的test集）。
+
+    train_window_days（2026-07-21討論）：預設None＝訓練資料用「val_cutoff
+    之前的全部歷史」（expanding，跟train.py現在的做法一致）。設數字（例如
+    365/540）則只留訓練資料裡最後這麼多天，模擬「只用最近N個月訓練」——
+    用來驗證「訓練資料塞越多歷史越好」這個假設是否成立，還是舊regime的
+    資料反而稀釋掉近期的訊號（walk-forward窗口間precision大幅擺盪，暗示
+    這個資料的規律不是恆定的，值得驗證）。"""
     df = _prepare_data(use_cache=use_cache)
     test_cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     trainval_df = df[df["date"] <= test_cutoff]
@@ -58,6 +67,11 @@ def _train_val_test_split(test_days: int = 45, val_days: int = 45, use_cache: bo
     val_cutoff = trainval_df["date"].max() - pd.Timedelta(days=val_days)
     train_df = trainval_df[trainval_df["date"] <= val_cutoff]
     val_df = trainval_df[trainval_df["date"] > val_cutoff]
+
+    if train_window_days is not None:
+        train_start = train_df["date"].max() - pd.Timedelta(days=train_window_days)
+        train_df = train_df[train_df["date"] > train_start]
+
     return train_df, val_df, test_df
 
 
@@ -127,12 +141,20 @@ def _objective(trial, train_df: pd.DataFrame, val_df: pd.DataFrame):
     return precision
 
 
-def run(test_days: int = 45, val_days: int = 45, n_trials: int = 40, use_cache: bool = True):
+def run(
+    test_days: int = 45,
+    val_days: int = 45,
+    n_trials: int = 40,
+    use_cache: bool = True,
+    train_window_days: int | None = None,
+):
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    train_df, val_df, test_df = _train_val_test_split(test_days, val_days, use_cache=use_cache)
+    train_df, val_df, test_df = _train_val_test_split(
+        test_days, val_days, use_cache=use_cache, train_window_days=train_window_days
+    )
     print(
         f"train: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')}~"
         f"{train_df['date'].max().strftime('%Y-%m-%d')})  "

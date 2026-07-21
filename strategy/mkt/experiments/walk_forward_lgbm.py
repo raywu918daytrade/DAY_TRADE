@@ -42,19 +42,20 @@ _BASELINE_PARAMS = dict(
     reg_lambda=1.0,
 )
 
-# tune_lgbm.py 2026-07-21那次搜出來的候選：val集precision=10.66%/n=441，
-# test集precision=5.52%/n=145（val→test腰斬，跟XGB第二輪相反的方向，先跑
-# walk-forward確認是單一窗口運氣不好還是真的不穩）。
+# tune_lgbm.py 2026-07-21第二次搜出來的候選（修正learning_rate下限+高門檻
+# 可行性檢查後）：val集precision=11.97%/n=309，test集precision=17.45%/
+# n=361（val→test變好，跟XGB第二輪同方向，第一次那組learning_rate太低
+# 導致0.7/0.8完全沒預測的問題應該已經修正，先跑walk-forward確認）。
 _CANDIDATE_PARAMS = dict(
-    n_estimators=300,
-    num_leaves=52,
-    max_depth=3,
-    learning_rate=0.013836965470308786,
-    min_child_samples=29,
-    subsample=0.6827035664667751,
+    n_estimators=800,
+    num_leaves=101,
+    max_depth=8,
+    learning_rate=0.17376155767832735,
+    min_child_samples=16,
+    subsample=0.8372082477437949,
     subsample_freq=1,
-    colsample_bytree=0.514105814557647,
-    reg_lambda=1.8127365928417005,
+    colsample_bytree=0.6699451641790991,
+    reg_lambda=1.1052479063154046,
 )
 
 _THRESHOLDS = [0.5, 0.6, 0.7, 0.8]
@@ -72,7 +73,17 @@ def _walk_forward_windows(df: pd.DataFrame, n_windows: int, window_days: int) ->
     return list(reversed(windows))
 
 
-def run(n_windows: int = 5, window_days: int = 45, min_train_days: int = 60, use_cache: bool = True):
+def run(
+    n_windows: int = 5,
+    window_days: int = 45,
+    min_train_days: int = 60,
+    use_cache: bool = True,
+    train_window_days: int | None = None,
+):
+    """
+    train_window_days：見 walk_forward_xgb.py::run() 的說明，用法完全一致
+    （預設None＝expanding訓練資料；設數字則每個窗口只留最近這麼多天）。
+    """
     df = _prepare_data(use_cache=use_cache)
     windows = _walk_forward_windows(df, n_windows, window_days)
 
@@ -80,6 +91,9 @@ def run(n_windows: int = 5, window_days: int = 45, min_train_days: int = 60, use
 
     for test_start, test_end in windows:
         train_df = df[df["date"] < test_start]
+        if train_window_days is not None:
+            train_start = test_start - pd.Timedelta(days=train_window_days)
+            train_df = train_df[train_df["date"] >= train_start]
         test_df = df[(df["date"] >= test_start) & (df["date"] < test_end)]
         label = f"{test_start.date()}~{test_end.date()}"
 

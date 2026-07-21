@@ -82,7 +82,21 @@ def _walk_forward_windows(df: pd.DataFrame, n_windows: int, window_days: int) ->
     return list(reversed(windows))
 
 
-def run(n_windows: int = 5, window_days: int = 45, min_train_days: int = 60, use_cache: bool = True):
+def run(
+    n_windows: int = 5,
+    window_days: int = 45,
+    min_train_days: int = 60,
+    use_cache: bool = True,
+    train_window_days: int | None = None,
+):
+    """
+    train_window_days（2026-07-21討論）：預設None＝每個窗口的訓練資料用
+    「test_start之前的全部歷史」（expanding，見檔頭說明，跟正式上線情境
+    一致）。設數字（例如365/540）則每個窗口都只留訓練資料裡最近這麼多天
+    （rolling），用來驗證「訓練資料是不是塞越多歷史越好」，還是舊regime
+    的資料反而稀釋掉近期訊號——把這個參數設不同值分別跑一次run()，比較
+    哪種訓練資料範圍在多個窗口下precision比較穩定/比較高。
+    """
     df = _prepare_data(use_cache=use_cache)
     windows = _walk_forward_windows(df, n_windows, window_days)
 
@@ -91,6 +105,9 @@ def run(n_windows: int = 5, window_days: int = 45, min_train_days: int = 60, use
 
     for test_start, test_end in windows:
         train_df = df[df["date"] < test_start]
+        if train_window_days is not None:
+            train_start = test_start - pd.Timedelta(days=train_window_days)
+            train_df = train_df[train_df["date"] >= train_start]
         test_df = df[(df["date"] >= test_start) & (df["date"] < test_end)]
         label = f"{test_start.date()}~{test_end.date()}"
 

@@ -87,12 +87,20 @@ def _objective(trial, train_df: pd.DataFrame, val_df: pd.DataFrame):
     return precision
 
 
-def run(test_days: int = 45, val_days: int = 45, n_trials: int = 40, use_cache: bool = True):
+def run(
+    test_days: int = 45,
+    val_days: int = 45,
+    n_trials: int = 40,
+    use_cache: bool = True,
+    train_window_days: int | None = None,
+):
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    train_df, val_df, test_df = _train_val_test_split(test_days, val_days, use_cache=use_cache)
+    train_df, val_df, test_df = _train_val_test_split(
+        test_days, val_days, use_cache=use_cache, train_window_days=train_window_days
+    )
     print(
         f"train: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')}~"
         f"{train_df['date'].max().strftime('%Y-%m-%d')})  "
