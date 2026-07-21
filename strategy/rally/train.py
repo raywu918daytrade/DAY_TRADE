@@ -28,7 +28,7 @@ def train(
     test_days: int = 10,
     start_date: str = "",
     end_date: str = "",
-    force_cache: bool = False,
+    use_cache: bool = True,
 ):
     """
     訓練 RandomForest 模型。
@@ -38,14 +38,17 @@ def train(
     test_days : int
         以最後 N 天為測試集（預設 10）。若指定 start_date/end_date 則忽略此參數。
     start_date : str
-        訓練資料起日，格式 "YYYY-MM-DD"。留空表示不限制。
+        訓練資料起日，格式 "YYYY-MM-DD"。留空表示不限制。會往下傳給
+        load_features()，在算特徵之前就篩掉更早的資料，減少計算量（見
+        features.load_features() 的說明），不是算完全部歷史才篩。
     end_date : str
-        訓練資料迄日，格式 "YYYY-MM-DD"。留空表示不限制。
-    force_cache : bool
-        True 時略過 cache 新鮮度檢查，只要 cache 存在就直接用（見 features.load_features()）。
+        訓練資料迄日，格式 "YYYY-MM-DD"。留空表示不限制（只在算完特徵後篩選，
+        不影響特徵計算量）。
+    use_cache : bool
+        False 時不管 cache 現在是什麼狀態，一律重新計算特徵（見 features.load_features()）。
     """
     print("特徵工程...")
-    df = load_features(force_cache=force_cache)
+    df = load_features(use_cache=use_cache, start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
     print(f"  使用特徵: {FEATURES}")
     print(f"  全天有效樣本: {len(df):,} 筆")
@@ -136,11 +139,11 @@ def _prepare_train_test(
     test_days: int = 10,
     start_date: str = "",
     end_date: str = "",
-    force_cache: bool = False,
+    use_cache: bool = True,
 ):
     """載入特徵並切分全天訓練/測試集（三模型共用）。"""
     print("特徵工程...")
-    df = load_features(force_cache=force_cache)
+    df = load_features(use_cache=use_cache, start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
     print(f"  使用特徵數: {len(FEATURES)}")
     print(f"  全天有效樣本: {len(df):,} 筆")
@@ -172,12 +175,12 @@ def train_xgb(
     test_days: int = 10,
     start_date: str = "",
     end_date: str = "",
-    force_cache: bool = False,
+    use_cache: bool = True,
 ):
     """訓練 XGBoost 模型（與 RFC 共用 FEATURES）。"""
     from xgboost import XGBClassifier
 
-    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, force_cache)
+    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, use_cache)
 
     model = XGBClassifier(
         n_estimators=300,
@@ -209,12 +212,12 @@ def train_lgbm(
     test_days: int = 10,
     start_date: str = "",
     end_date: str = "",
-    force_cache: bool = False,
+    use_cache: bool = True,
 ):
     """訓練 LightGBM 模型（與 RFC 共用 FEATURES）。"""
     import lightgbm as lgb
 
-    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, force_cache)
+    train_df, test_df = _prepare_train_test(test_days, start_date, end_date, use_cache)
 
     model = lgb.LGBMClassifier(
         n_estimators=300,

@@ -75,7 +75,7 @@ def main(
     test_days: int = 10,
     start_date: str = "",
     end_date: str = "",
-    force_cache: bool = False,
+    use_cache: bool = True,
 ):
     """
     當沖策略 RandomForest 主程式。
@@ -95,10 +95,9 @@ def main(
         資料起日，格式 "YYYY-MM-DD"。留空不限制。
     end_date : str
         資料迄日，格式 "YYYY-MM-DD"。留空不限制。
-    force_cache : bool
-        True 時略過特徵 cache 新鮮度檢查，只要 cache 存在就直接讀（例如背景資料
-        下載動到 db/m1 檔案時間戳、但資料內容沒變時，跳過不必要的重算）。
-        只影響 train / train_xgb / train_lgbm。
+    use_cache : bool
+        False 時不管特徵 cache 現在是什麼狀態，一律重新計算（見
+        features.load_features()）。只影響 train / train_xgb / train_lgbm。
     """
     if not mode:
         parser = argparse.ArgumentParser(
@@ -121,25 +120,26 @@ def main(
         parser.add_argument("--start_date", type=str, default="", help="資料起日 YYYY-MM-DD")
         parser.add_argument("--end_date", type=str, default="", help="資料迄日 YYYY-MM-DD")
         parser.add_argument(
-            "--force_cache",
-            action="store_true",
-            help="略過特徵 cache 新鮮度檢查，只要 cache 存在就直接讀（只影響 train 系列 mode）",
+            "--use_cache",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="是否用特徵 cache（預設 True）；--no-use_cache 強制重新計算（只影響 train 系列 mode）",
         )
         args = parser.parse_args()
         mode = args.mode
         test_days = args.test_days
         start_date = args.start_date
         end_date = args.end_date
-        force_cache = args.force_cache
+        use_cache = args.use_cache
 
     if mode == "train":
-        train(test_days=test_days, start_date=start_date, end_date=end_date, force_cache=force_cache)
+        train(test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)
 
     elif mode == "train_xgb":
-        train_xgb(test_days=test_days, start_date=start_date, end_date=end_date, force_cache=force_cache)
+        train_xgb(test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)
 
     elif mode == "train_lgbm":
-        train_lgbm(test_days=test_days, start_date=start_date, end_date=end_date, force_cache=force_cache)
+        train_lgbm(test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)
 
     elif mode == "validate":
         confidence_report(test_days=test_days, start_date=start_date, end_date=end_date)
@@ -187,9 +187,8 @@ if __name__ == "__main__":
         test_days     測試集天數（預設 10，取最後 N 天）
         start_date    資料起日 YYYY-MM-DD（留空 = 不限制）
         end_date      資料迄日 YYYY-MM-DD（留空 = 不限制）
-        force_cache   True 時略過特徵 cache 新鮮度檢查，只要 cache 存在就直接讀
-                      （只影響 train/train_xgb/train_lgbm；db/m1 被背景下載動到
-                      檔案時間戳但資料沒變時用得到，見 features.load_features()）
+        use_cache     False 時不管特徵 cache 現在是什麼狀態，一律重新計算
+                      （只影響 train/train_xgb/train_lgbm，見 features.load_features()）
 
     備註：
         - breakout_signal（先跌後漲的破底翻型態）是模型的普通輸入特徵之一，
@@ -206,16 +205,16 @@ if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     #  在這裡直接改 mode，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "train_lgbm"  # build_m3_m5,train_xgb,validate
+    mode = "train"  # build_m3_m5,train_xgb,validate
     test_days = 30
-    start_date = ""
+    start_date = "2026-01-01"
     end_date = ""
-    force_cache = False  # 用現有 cache，略過 db/m1 新鮮度檢查（不重算特徵）
+    use_cache = True  # False 時不管 cache 狀態一律重新計算特徵
 
     main(
         mode=mode,
         test_days=test_days,
         start_date=start_date,
         end_date=end_date,
-        force_cache=force_cache,
+        use_cache=use_cache,
     )

@@ -48,7 +48,7 @@ def confidence_report(
     if model is None:
         model = load_model()
 
-    df = load_features()
+    df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
 
     # 日期過濾
@@ -104,7 +104,7 @@ def model_hour_confidence_report(
         print("  無可用模型，請先訓練 RFC / XGB / LGBM。")
         return
 
-    df = load_features()
+    df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()
@@ -175,7 +175,7 @@ def hour_signal_report(
         print("  無可用模型，請先訓練 RFC / XGB / LGBM。")
         return
 
-    df = load_features()
+    df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()
@@ -215,7 +215,7 @@ def coverage_report(
     if model is None:
         model = load_model()
 
-    df = load_features()
+    df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
 
     # 日期過濾

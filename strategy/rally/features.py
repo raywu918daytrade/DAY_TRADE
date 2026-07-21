@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from data.query import load_day, load_m1, load_m3, load_m5
+from data.query import load_day, load_m3, load_m5
 from data.resample import compute_m3, compute_m5
 from strategy.rally.config import HOLD_BARS, SL_PCT, TP_PCT
 
@@ -31,68 +31,179 @@ _ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_ROOT / ".env", override=True)
 
 _M1_DIR = _ROOT / "db/m1"
+_M3_DIR = _ROOT / "db/m3"
+_M5_DIR = _ROOT / "db/m5"
 _DAY_DIR = _ROOT / "db/fugle_day"
-_CACHE_PATH = _ROOT / "cache/m1_rally_features.parquet"
+_CACHE_DIR = _ROOT / "cache/m1_rally_features"
+
+# 日K特徵最長回看窗口（pos_20d 用 rolling(20)），算某個月份的特徵時 db/fugle_day
+# 要多抓這麼多天當緩衝，不然那個月前面幾天會因為算不出 day_ret_10/pos_20d/
+# day_atr 而被 dropna 丟掉，等於變相把可用起日往後推。
+_DAY_LOOKBACK_CALENDAR_DAYS = 45
+
+_META_COLS = ["stock_id", "date", "day_date", "hour", "minute", "target", "breakout_signal"]
 
 
-# ── Cache 管理 ───────────────────────────────────────────────────────────────
+# ── Cache 管理（按月分區，跟 db/m1/db/m3/db/m5/db/fugle_day 同樣的按月分檔慣例）──
+#
+# 2026-07-21 從單一大檔案改成按月分區：舊版一次讀全部歷史算完存一份 cache，
+# 資料長到 5800萬筆時實測記憶體峰值到 86GB（機器只有 25.8GB RAM）。現在一次
+# 只處理一個月（現在規模大概幾百萬筆），且 db/m1 幾乎每天只會動到「當月」
+# 那個檔案，所以平常只有當月分區需要重算，其他月份的分區維持不動、不用重讀
+# 也不用重算，兩個問題（記憶體峰值、每天都要整個重算）一起解決。
 
 
-def _m1_mtime() -> float:
-    """db/m1/ 中最新檔案的修改時間戳。"""
-    mtimes = [f.stat().st_mtime for f in _M1_DIR.iterdir() if f.suffix == ".parquet"]
-    return max(mtimes) if mtimes else 0
+def _month_str(year: int, month: int) -> str:
+    return f"{year}_{month:02d}"
 
 
-def _day_mtime() -> float:
-    """db/fugle_day/ 中最新檔案的修改時間戳。"""
-    if not _DAY_DIR.exists():
-        return 0
-    mtimes = [f.stat().st_mtime for f in _DAY_DIR.iterdir() if f.suffix == ".parquet"]
-    return max(mtimes) if mtimes else 0
+def _month_file(dir_path: Path, year: int, month: int) -> Path:
+    return dir_path / f"{_month_str(year, month)}.parquet"
 
 
-def _cache_is_fresh() -> bool:
-    """檢查 cache 是否比 db/m1/ 與 db/fugle_day/ 所有檔案都新。"""
-    if not _CACHE_PATH.exists():
+def _file_mtime(path: Path) -> float:
+    return path.stat().st_mtime if path.exists() else 0
+
+
+def _months_between(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[int, int]]:
+    """回傳 start~end（含頭尾月份）涵蓋的所有 (year, month)，用月初對齊比較。"""
+    cur = pd.Timestamp(year=start.year, month=start.month, day=1)
+    end_marker = pd.Timestamp(year=end.year, month=end.month, day=1)
+    months = []
+    while cur <= end_marker:
+        months.append((cur.year, cur.month))
+        cur = cur + pd.DateOffset(months=1)
+    return months
+
+
+def _day_lookback_months(year: int, month: int) -> list[tuple[int, int]]:
+    """算某個月份的特徵時，day K 需要往前抓的月份範圍（含自己），
+    新鮮度檢查跟實際讀取資料共用同一份邏輯，確保兩邊範圍一致。"""
+    month_start = pd.Timestamp(year=year, month=month, day=1)
+    day_cutoff = month_start - pd.Timedelta(days=_DAY_LOOKBACK_CALENDAR_DAYS)
+    return _months_between(day_cutoff, month_start)
+
+
+def _m1_available_months() -> list[tuple[int, int]]:
+    """db/m1/ 現有的所有月份（依檔名判斷），由早到晚排序。"""
+    months = []
+    for f in _M1_DIR.iterdir():
+        if f.suffix == ".parquet":
+            year_str, month_str = f.stem.split("_")
+            months.append((int(year_str), int(month_str)))
+    return sorted(months)
+
+
+def _month_is_fresh(year: int, month: int) -> bool:
+    """檢查某個月份的 cache 分區是否比對應的 db/m1、db/fugle_day（含回看範圍
+    內的月份）都新。"""
+    partition = _month_file(_CACHE_DIR, year, month)
+    if not partition.exists():
         return False
-    cache_mtime = _CACHE_PATH.stat().st_mtime
-    return cache_mtime >= _m1_mtime() and cache_mtime >= _day_mtime()
+    partition_mtime = partition.stat().st_mtime
+    if partition_mtime < _file_mtime(_month_file(_M1_DIR, year, month)):
+        return False
+    for dy, dm in _day_lookback_months(year, month):
+        if partition_mtime < _file_mtime(_month_file(_DAY_DIR, dy, dm)):
+            return False
+    return True
 
 
-def load_features(force_rebuild: bool = False, force_cache: bool = False) -> pd.DataFrame:
+def _read_month_parquet(dir_path: Path, year: int, month: int) -> pd.DataFrame:
+    """直接讀單一月份檔案（不像 data.query.load_m1() 等函式會掃整個資料夾），
+    避免逐月處理時每個月都要重讀一次全部歷史。"""
+    path = _month_file(dir_path, year, month)
+    if not path.exists():
+        return pd.DataFrame(columns=["stock_id", "date", "open", "high", "low", "close", "volume"])
+    df = pd.read_parquet(path)
+    df["date"] = pd.to_datetime(df["date"], format="mixed")
+    if {"stock_id", "date"} <= set(df.columns):
+        df = df.drop_duplicates(subset=["stock_id", "date"], keep="last")
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def _compute_month_features(year: int, month: int) -> pd.DataFrame:
+    """對單一月份重算特徵，回傳只含 FEATURES + meta_cols 的 DataFrame。"""
+    month_start = pd.Timestamp(year=year, month=month, day=1)
+    month_end = month_start + pd.DateOffset(months=1)
+
+    m1 = _read_month_parquet(_M1_DIR, year, month)
+
+    m3_frames = [_read_month_parquet(_M3_DIR, year, month)]
+    m5_frames = [_read_month_parquet(_M5_DIR, year, month)]
+    m3 = m3_frames[0]
+    m5 = m5_frames[0]
+
+    day_frames = [_read_month_parquet(_DAY_DIR, dy, dm) for dy, dm in _day_lookback_months(year, month)]
+    day = pd.concat(day_frames, ignore_index=True) if day_frames else pd.DataFrame()
+    if not day.empty:
+        day = day[day["date"] < month_end].reset_index(drop=True)
+
+    df = make_features(m1, m3=m3, m5=m5, day=day, compute_labels=True)
+    cache_cols = [c for c in df.columns if c in set(FEATURES) | set(_META_COLS)]
+    return df[cache_cols]
+
+
+def load_features(use_cache: bool = True, start_date: str = "") -> pd.DataFrame:
     """
-    載入特徵（自動使用 / 重建 cache）。
+    載入特徵（按月分區 cache，自動使用 / 增量重建）。
 
-    若 cache 存在且 db/m1/ 與 db/fugle_day/ 都沒有新檔案，直接讀取 cache parquet。
-    否則重新執行 make_features() 並更新 cache。
+    start_date：決定要涵蓋哪些月份，從 start_date 所在月份到 db/m1/ 現有最新
+    月份（含頭尾）；留空表示從 db/m1/ 最早的月份開始（等同全歷史，但仍然是
+    按月分批算，不會一次把全部歷史塞進記憶體）。
 
-    force_cache=True：只要 cache 存在且欄位齊全就直接讀，略過新鮮度檢查（db/m1 被
-    背景中的資料下載流程動到檔案時間戳、但資料內容其實沒變時用得到，可以跳過不必要
-    的重算）。跟 force_rebuild 同時為 True 時 force_rebuild 優先。
+    use_cache=True（預設）：逐月檢查該月分區是否比對應的 db/m1、day K 回看
+    範圍內的月份檔都新，新鮮就沿用、不新鮮才重算「那一個月」——不會因為某個
+    月有更新就牽動其他月份重算。db/m1 幾乎每天只會動到「當月」那個檔案，
+    所以平常只有當月分區需要重算，其他月份直接沿用。
+    use_cache=False：不管每個月分區現在是什麼狀態，全部月份都重算。
     """
-    if not force_rebuild and _CACHE_PATH.exists() and (force_cache or _cache_is_fresh()):
-        cached = pd.read_parquet(_CACHE_PATH)
-        missing = [c for c in FEATURES if c not in cached.columns]
-        if not missing:
-            print("  讀取 cache 特徵" + ("（force_cache，略過新鮮度檢查）" if force_cache else "") + "...")
-            return cached
-        print(f"  cache 缺少欄位 {missing}，重新計算...")
+    available = _m1_available_months()
+    if not available:
+        raise RuntimeError("db/m1/ 沒有任何資料")
+    latest_year, latest_month = available[-1]
+    if start_date:
+        start_ts = pd.Timestamp(start_date)
+        start_year, start_month = start_ts.year, start_ts.month
+    else:
+        start_year, start_month = available[0]
 
-    print("  重新計算特徵（db/m1 有更新）...")
-    m1 = load_m1()
-    day = load_day()
-    df = make_features(m1, day=day, compute_labels=True)
-    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # 只存特徵欄位 + time/target，去掉原始 m1 的 raw ohlcv 避免體積過大。
-    # breakout_signal 不在 FEATURES（2026-07-09 因為重要性太低被拿掉了），
-    # 但 predict_live() 的 use_breakout_filter 硬過濾、experiments/ 底下的
-    # breakout_filter_eval.py/breakout_specialist.py 都還要用這個欄位本身
-    # （不是拿去當模型輸入），所以要跟 meta_cols 一樣保留在 cache 裡。
-    meta_cols = ["stock_id", "date", "day_date", "hour", "minute", "target", "breakout_signal"]
-    cache_cols = [c for c in df.columns if c in set(FEATURES) | set(meta_cols)]
-    df[cache_cols].to_parquet(_CACHE_PATH)
-    print(f"  cache 已存至 {_CACHE_PATH}（{len(df):,} 筆）")
+    target_months = _months_between(
+        pd.Timestamp(year=start_year, month=start_month, day=1),
+        pd.Timestamp(year=latest_year, month=latest_month, day=1),
+    )
+
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 欄位齊不齊檢查：只要有任何一個目標月份的分區缺欄位（例如 FEATURES 加了
+    # 新特徵，舊分區沒算過），就強制全部目標月份重算一次，之後才會又回到
+    # 逐月增量的狀態。
+    force_all = False
+    if use_cache:
+        for year, month in target_months:
+            partition = _month_file(_CACHE_DIR, year, month)
+            if partition.exists():
+                existing_cols = set(pd.read_parquet(partition, columns=None).columns)
+                if not set(FEATURES) <= existing_cols:
+                    print(f"  {_month_str(year, month)} 分區缺欄位，全部月份重算一次...")
+                    force_all = True
+                break
+
+    for year, month in target_months:
+        if use_cache and not force_all and _month_is_fresh(year, month):
+            continue
+        print(f"  重新計算特徵：{_month_str(year, month)}...")
+        month_df = _compute_month_features(year, month)
+        month_df.to_parquet(_month_file(_CACHE_DIR, year, month))
+        print(f"    {_month_str(year, month)} 分區已存（{len(month_df):,} 筆）")
+
+    partition_paths = [
+        _month_file(_CACHE_DIR, year, month)
+        for year, month in target_months
+        if _month_file(_CACHE_DIR, year, month).exists()
+    ]
+    print(f"  讀取 {len(partition_paths)} 個月份分區...")
+    df = pd.concat([pd.read_parquet(p) for p in partition_paths], ignore_index=True)
     return df
 
 
@@ -651,5 +762,14 @@ def make_features(
         m1["target"] = _make_barrier_labels(m1)
         m1 = m1[m1["target"].notna()].copy()
         m1["target"] = m1["target"].astype(int)
+
+    # FEATURES 欄位統一降成 float32：原始 db/m1 的 ohlcv 雖然存的就是 float32，
+    # 但上面一路算下來很多欄位是靠 pandas 的 .rolling()/.ewm()（m1_atr、
+    # macd_hist、macd_divergence、reversal_N、day_atr 等）算出來的，這類操作
+    # 內部一律用 float64 累加，輸出不管輸入是什麼 dtype 都會變 float64。這些
+    # 特徵本質上是比例值/報酬率，float32 的精度（~7位有效數字）綽綽有餘，
+    # 樹模型也不需要 float64，這裡統一轉一次能省接近一半記憶體。
+    _feature_cols_present = [c for c in FEATURES if c in m1.columns]
+    m1[_feature_cols_present] = m1[_feature_cols_present].astype("float32")
 
     return m1
