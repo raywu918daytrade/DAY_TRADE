@@ -127,7 +127,7 @@ if __name__ == "__main__":
     """
     mode = "validate"  # validate,train_rfc,train_lgbm,train_xgb
     test_days = DEFAULT_TEST_DAYS  # 統一用 config.py 的預設值，不要在這裡另外寫死數字
-    start_date = "2025-01-01"
+    start_date = "2024-07-01"
     end_date = ""
     use_cache = True  # False 時 train_rfc/train_lgbm/train_xgb 不管每個月分區新不新鮮，目標範圍內全部強制重算（見 train.py use_cache 說明，正常訓練用 True 就好，True 本來就會用新鮮的 cache、只重算過期的月份）
 
