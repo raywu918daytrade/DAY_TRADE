@@ -154,7 +154,7 @@ def _prepare_data(
     return df
 
 
-def _split_data(test_days: int = 30, use_cache: bool = False):
+def _split_data(test_days: int = 30, use_cache: bool = False, start_date: str | None = None):
     """跟 train() 共用同一套切分邏輯，讓 evaluate()/confidence_report() 能
     用「跟訓練時同一份」測試集去評估已存的模型，不用每次都重新訓練一次
     （2026-07-17 討論：混淆矩陣/信心度報表要能單獨印，不用綁著train()）。
@@ -163,18 +163,39 @@ def _split_data(test_days: int = 30, use_cache: bool = False):
     跟模型訓練時看過的資料重疊，評估結果不可信。
 
     use_cache：見 _prepare_data() 的說明。
+
+    start_date（2026-07-22討論）：只篩 train_df（不影響 test_df），限制
+    訓練資料從這個日期開始，不用全部歷史。⚠️ 故意放在 _prepare_data() 之後
+    才篩，不是塞進 _prepare_data() 裡面——_prepare_data() 的cache新鮮度只看
+    來源檔案mtime，不知道 start_date 是什麼，如果篩選寫在 _prepare_data()
+    裡，改了 start_date 但來源沒更新，會拿到用舊start_date算出來的cache、
+    不會生效也不會報錯。放在這裡篩是對記憶體裡的DataFrame做，改start_date
+    馬上生效，且cache本身永遠存全部歷史、不用重建。留空＝用全部歷史（現在
+    的行為，不受影響）。這是固定絕對日期，不是「最近N天」——隨時間推移
+    train_df的範圍會越變越長（新資料進來、start_date不變），不是恆定窗口，
+    要保持「只看最近N個月」的話要定期回來手動調整這個日期。
+
+    evaluate()/confidence_report() 只用這支函式回傳的 test_df，不會用到
+    train_df，所以不用把 start_date 傳給它們。
     """
     df = _prepare_data(use_cache=use_cache)
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
-    return df[df["date"] <= cutoff], df[df["date"] > cutoff]
+    train_df, test_df = df[df["date"] <= cutoff], df[df["date"] > cutoff]
+    if start_date is not None:
+        train_df = train_df[train_df["date"] >= pd.Timestamp(start_date)]
+    return train_df, test_df
 
 
-def train(test_days: int = 20):
+def train(test_days: int = 20, start_date: str | None = None, use_cache: bool = False):
     # test_days=20（2026-07-16 從10調大）：0050歷史資料補齊後，訓練資料從
     # 約1.5個月變成6個月以上，但漲/跌是很稀有的類別（各僅佔2~5%），test_days
     # 太小的話測試集裡稀有類別樣本數太少、precision/recall算出來不穩定，
     # 不是「訓練資料變多就要按比例放大測試集」的邏輯。
-    train_df, test_df = _split_data(test_days)
+    # start_date：只篩訓練資料起始日期，見 _split_data() 的說明。
+    # use_cache（2026-07-22新增）：True＝不管背景有沒有寫入新的m1資料都直接
+    # 用現成cache，見 _prepare_data() 的說明——反覆調整 start_date/超參數時
+    # 不想每次都被背景寫入觸發整包重建，設True。
+    train_df, test_df = _split_data(test_days, use_cache=use_cache, start_date=start_date)
     print(
         f"\n訓練: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')} ~ "
         f"{train_df['date'].max().strftime('%Y-%m-%d')})"
@@ -219,7 +240,7 @@ def train(test_days: int = 20):
     return model
 
 
-def train_xgb(test_days: int = 20):
+def train_xgb(test_days: int = 20, start_date: str | None = None, use_cache: bool = False):
     """訓練 XGBoost 模型，跟 train()（RandomForest）共用 FEATURES/切分邏輯，
     比照 strategy/rally/train.py 的 train_xgb() 寫法（2026-07-21 討論）。
 
@@ -243,7 +264,7 @@ def train_xgb(test_days: int = 20):
     from sklearn.utils.class_weight import compute_sample_weight
     from xgboost import XGBClassifier
 
-    train_df, test_df = _split_data(test_days)
+    train_df, test_df = _split_data(test_days, use_cache=use_cache, start_date=start_date)
     print(
         f"\n訓練: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')} ~ "
         f"{train_df['date'].max().strftime('%Y-%m-%d')})"
@@ -288,7 +309,7 @@ def train_xgb(test_days: int = 20):
     return model
 
 
-def train_lgbm(test_days: int = 20):
+def train_lgbm(test_days: int = 20, start_date: str | None = None, use_cache: bool = False):
     """訓練 LightGBM 模型，跟 train()（RandomForest）共用 FEATURES/切分邏輯，
     比照 strategy/rally/train.py 的 train_lgbm() 寫法（2026-07-21 討論）。
     LGBMClassifier 的 class_weight="balanced" 是原生支援多分類的，跟
@@ -296,7 +317,7 @@ def train_lgbm(test_days: int = 20):
     """
     import lightgbm as lgb
 
-    train_df, test_df = _split_data(test_days)
+    train_df, test_df = _split_data(test_days, use_cache=use_cache, start_date=start_date)
     print(
         f"\n訓練: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')} ~ "
         f"{train_df['date'].max().strftime('%Y-%m-%d')})"
@@ -510,6 +531,7 @@ def main(
     threshold: float | list[float] | None = None,
     model_type: str = "rfc",
     use_cache: bool = False,
+    start_date: str | None = None,
 ):
     """CLI進入點，比照 strategy/rally/entry.py 的 mode 切換方式（mkt
     目前只有 train.py，還沒有 predict.py/live.py/entry.py，等那些補齊了
@@ -558,6 +580,12 @@ def main(
             action="store_true",
             help="不管來源資料有沒有更新，只要cache存在就直接用（見_prepare_data()說明）",
         )
+        parser.add_argument(
+            "--start_date",
+            type=str,
+            default=None,
+            help="train專用：只篩訓練資料起始日期（例：2025-01-01），留空=用全部歷史（見_split_data()說明）",
+        )
         args = parser.parse_args()
         mode = args.mode
         test_days = args.test_days
@@ -566,11 +594,12 @@ def main(
         threshold = args.threshold
         model_type = args.model_type
         use_cache = args.use_cache
+        start_date = args.start_date
     elif not mode:
         mode = "train"  # F5執行、__main__也沒寫mode時的保底預設
 
     if mode == "train":
-        _TRAIN_BY_TYPE[model_type](test_days=test_days)
+        _TRAIN_BY_TYPE[model_type](test_days=test_days, start_date=start_date, use_cache=use_cache)
     elif mode == "importance":
         feature_importance(model=_LOAD_MODEL_BY_TYPE[model_type]())
     elif mode == "evaluate":
@@ -610,11 +639,17 @@ if __name__ == "__main__":
                     True=不管來源資料新不新都直接用cache（快，適合反覆
                     測試evaluate/confidence）；False=自動判斷，來源資料
                     有更新才重算。
+        start_date  只有 mode="train" 會用到（2026-07-22新增）。只篩訓練
+                    資料起始日期（例："2025-01-01"），留 None = 用全部
+                    歷史（現在的行為）。⚠️ 固定絕對日期，不是「最近N天」，
+                    隨時間推移train_df範圍會越來越長，要保持「只看最近N
+                    個月」得定期回來手動調整，見 _split_data() 的說明。
 
     2. 終端機帶參數（會覆蓋掉下面寫死的值）：
         python -m strategy.mkt.train train
         python -m strategy.mkt.train train --model_type xgb
         python -m strategy.mkt.train train --model_type lgbm
+        python -m strategy.mkt.train train --model_type xgb --start_date 2025-01-01
         python -m strategy.mkt.train importance --model_type xgb
         python -m strategy.mkt.train evaluate --threshold 0.6
         python -m strategy.mkt.train evaluate --use_cache
@@ -623,6 +658,14 @@ if __name__ == "__main__":
     mode = "evaluate"  # train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
-    model_type = "xgb"  # rfc / xgb / lgbm
+    model_type = "lgbm"  # rfc / xgb / lgbm
     use_cache = True  # 只有 mode="evaluate"/"confidence" 用得到
-    main(mode=mode, test_days=test_days, threshold=threshold, model_type=model_type, use_cache=use_cache)
+    start_date = "2024-07-01"  # 只有 mode="train" 用得到；留 None = 用全部歷史
+    main(
+        mode=mode,
+        test_days=test_days,
+        threshold=threshold,
+        model_type=model_type,
+        use_cache=use_cache,
+        start_date=start_date,
+    )

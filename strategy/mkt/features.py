@@ -23,7 +23,11 @@ def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFra
     的報酬率」，逐分鐘更新，回傳加了 ret_vs_idx 欄位的 m1（複本，不動傳
     進來的原始 df）。順便廣播 0050 自己「這一分鐘」的報酬率（idx_ret_1m，
     不是累積型），給 add_bar_features() 算「0050漲個股跌」這種分鐘級的
-    背離旗標用（2026-07-20 討論）。
+    背離旗標用（2026-07-20 討論）；也留下 0050 自己「從開盤累積到現在」的
+    報酬率（idx_ret_since_open，2026-07-22討論加回FEATURES）——同樣是
+    ret_vs_idx=-2%，「大盤漲2%、個股沒漲」（補漲情境，策略假設成立）跟
+    「大盤跌1%、個股跌3%」（兩個都在跌，不是補漲邏輯）意義完全不同，之前
+    只算了差值、沒把大盤自己的方向留給模型看，是個漏洞。
 
     >0 代表這支股票從開盤到現在，漲得比大盤多（相對強勢）；
     <0 代表跑輸大盤（相對弱勢）。
@@ -42,13 +46,13 @@ def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFra
 
     idx = (
         m1[m1["stock_id"] == idx_symbol][["date", "_ret_since_open", "_ret_1m"]]
-        .rename(columns={"_ret_since_open": "_idx_ret_since_open", "_ret_1m": "idx_ret_1m"})
+        .rename(columns={"_ret_since_open": "idx_ret_since_open", "_ret_1m": "idx_ret_1m"})
         .drop_duplicates("date")
     )
 
     m1 = m1.merge(idx, on="date", how="left")
-    m1["ret_vs_idx"] = m1["_ret_since_open"] - m1["_idx_ret_since_open"]
-    m1 = m1.drop(columns=["_ret_since_open", "_idx_ret_since_open", "_ret_1m"])
+    m1["ret_vs_idx"] = m1["_ret_since_open"] - m1["idx_ret_since_open"]
+    m1 = m1.drop(columns=["_ret_since_open", "_ret_1m"])
     return m1
 
 
@@ -354,8 +358,13 @@ def make_barrier_labels_3class(
 # 代表「翻轉」這個框架本身沒訊號，不是門檻不夠嚴格。已改成更簡單的
 # bullish_volume_surge（這分鐘收紅K+量放大1.5倍以上，不看前一分鐘方向），
 # 還沒驗證有沒有效。
+# 2026-07-22：加回 idx_ret_since_open（0050自己從開盤累積到現在的報酬率）
+# ——之前只有 ret_vs_idx 這個差值，模型看不出「大盤本身是漲是跌」，同樣
+# ret_vs_idx=-2%，大盤漲2%個股沒漲（補漲情境）跟大盤跌1%個股跌3%（兩個
+# 都在跌）意義完全不同，這是個漏洞，見 add_ret_vs_idx() 的說明。
 FEATURES = [
     "ret_vs_idx",
+    "idx_ret_since_open",
     "vol_ratio_cum",
     "vol_ratio_prev",
     "ret_1m",
