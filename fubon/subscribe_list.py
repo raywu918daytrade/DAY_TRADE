@@ -100,7 +100,11 @@ def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
         for sid in stock_ids:
             try:
                 info = trade_api.intraday_ticker(sdk, sid)
-                if info.get("canDayTrade") and info.get("canBuyDayTrade"):
+                # canDayTrade 先註解掉，不要求（2026-07-22：0050 這種正常標的
+                # 也會 canDayTrade=False/canBuyDayTrade=True，兩個都要求會把
+                # 它濾掉，先只看 canBuyDayTrade；不要刪，之後確認 canDayTrade
+                # 的正確用法再決定要不要恢復）。
+                if info.get("canBuyDayTrade"):  # and info.get("canDayTrade")
                     tradable.append(sid)
             except Exception as e:
                 print(f"  警告：{sid} intraday_ticker 查詢失敗，略過: {e}", flush=True)
@@ -110,14 +114,27 @@ def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
     return tradable
 
 
+# 大盤代理（0050）— strategy/rally/features.py 的市場代理特徵（idx_ret_1/idx_atr/
+# idx_up 等）用這一檔的即時分K廣播給所有候選股，是必要依賴，不是要拿來當沖
+# 交易，只是要抓報價。2026-07-22 發現：0050 canDayTrade=False 時會被
+# _filter_day_tradable() 濾掉，導致 rally 全部候選股的大盤特徵在 merge 時對不到
+# 這一分鐘的 0050 row、整批變 NaN，被 dropna 篩光，rally 當下完全沒有任何推論
+# 結果（而且不會報錯，只會安靜地一直印 0 支）。所以這裡無條件強制加回去，不受
+# 當沖資格檢查限制。
+_FORCE_INCLUDE = ["0050"]
+
+
 def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     """把候選股切成 ≤MAX_PER_CONNECTION 支一組，最多 MAX_CONNECTIONS 組
     （富邦 WebSocket 連線本身的 rate limit，定義在 fubon/config.py）。
 
     順序：均量排序＋截斷（ranked_candidates） → canDayTrade/canBuyDayTrade
-    逐支確認（_filter_day_tradable） → 分連線。"""
+    逐支確認（_filter_day_tradable） → 強制加回 _FORCE_INCLUDE → 分連線。"""
     candidates = ranked_candidates(names)
     candidates = _filter_day_tradable(candidates)
+    for sid in _FORCE_INCLUDE:
+        if sid not in candidates:
+            candidates.insert(0, sid)
     batches = [
         candidates[i : i + MAX_PER_CONNECTION]
         for i in range(0, len(candidates), MAX_PER_CONNECTION)
