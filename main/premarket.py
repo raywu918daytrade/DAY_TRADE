@@ -7,8 +7,7 @@ bootstrap 跟 _daily_refresh() 對同一種失敗要印的訊息、要做的 fal
 不一樣（見 main/live_trader.py）。
 """
 from data.data_manager import load_d1
-from fubon.subscribe_list import build_and_save_subscribe_list, load_candidates
-from main.config import DAILY_REFRESH_TICKERS
+from fubon.subscribe_list import build_and_save_subscribe_list
 from strategy.prewarm import build_prewarm_cache
 
 
@@ -19,24 +18,17 @@ def refresh_tickers(state) -> None:
     WebSocket 訂閱清單唯一的來源，這裡重用同一份，避免候選股跟 WebSocket
     實際訂閱的股票不一致（先前這裡走 Fugle、WebSocket 那邊走富邦，兩邊
     各自過濾，理論上該一致但沒有保證）。API 回傳空值（例如非盤中）不算
-    例外，視為「不過濾」。
+    例外，視為「不過濾」。這支函式開機時跟每天 06:00 都會被呼叫，每次都
+    重新計算（2026-07-22：拿掉 DAILY_REFRESH_TICKERS 開關——那是2026-07-14
+    為了讓候選股清單跟 FinMind 歷史資料補齊的範圍保持一致才暫時凍結的，
+    現在不需要了）。
 
     不額外濾槓桿/反向/主動型ETF（曾經用代號碼數濾過，2026-07-14 發現這是錯的：
     00878/00919 這類完全正常、成交量很大的高股息ETF也是5碼，用碼數過濾會連
     這些一起誤殺，見 fubon/subscribe_list.py 的說明）。是否進候選股交給
     isNormal=true + 均量排序決定。
-
-    DAILY_REFRESH_TICKERS=false（.env）時不重新計算，改讀既有的
-    db/fubon_subscribe/subscribe_list.parquet——這支函式在開機時跟每天
-    06:00 都會被呼叫，兩個時機都會套用這個開關，維持候選股清單不隨每天
-    均量排名變動（2026-07-14：要讓清單跟 FinMind 歷史資料補齊的範圍
-    保持一致，暫時關閉）。
     """
-    if not DAILY_REFRESH_TICKERS:
-        print("  DAILY_REFRESH_TICKERS=false，讀取既有候選清單，不重新計算", flush=True)
-        df = load_candidates()
-    else:
-        df = build_and_save_subscribe_list()
+    df = build_and_save_subscribe_list()
     if df.empty:
         print("  警告：無法取得候選股清單（非盤中或富邦 API 失敗），不過濾股票", flush=True)
         state.tickers = {}

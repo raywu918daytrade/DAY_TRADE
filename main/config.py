@@ -29,13 +29,6 @@ STRATEGY_MODULES = [
 # 共識訊號，額外推送給前端參考（見 main/live_trader.py 的 on_minute()）。
 CONSENSUS_TOP_N = int(os.environ.get("CONSENSUS_TOP_N", "10"))
 
-# 每天06:00是否自動重算當沖候選清單（fubon.subscribe_list.build_and_save_subscribe_list()）。
-# 均量排名每天都會變，預設開啟（現有行為）；2026-07-14 因為要讓
-# db/fubon_subscribe/subscribe_list.parquet 的1000支候選股維持穩定（例如
-# 同時在對照FinMind歷史資料補齊的範圍），暫時關閉——關閉後 main/live_trader.py
-# 只有開機當下會算一次，之後每天06:00不會再重算，清單會維持開機時那份不變。
-DAILY_REFRESH_TICKERS = os.environ.get("DAILY_REFRESH_TICKERS", "true").lower() == "true"
-
 # 頁首固定追蹤股票（不經過策略候選篩選，例如 ETF 0050）：on_minute() 每分鐘
 # 收到這些股票的 m1 就查前一交易日收盤價、算漲跌幅，push_quote() 推給前端。
 WATCHLIST_QUOTES = [
