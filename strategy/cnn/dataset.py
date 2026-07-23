@@ -12,8 +12,28 @@ features.py，避免混淆。
 
 跟 rally 一樣不跨日——lookback 窗口只在同一個 (stock_id, day_date) 內取，
 避免隔夜跳空汙染窗口（見 rally features.py 的 g_day 分組慣例）。
+
+== 為什麼按月分片(shard)存，而不是一次存成一個大檔案 ==
+
+2026-07-21 討論：試跑半年資料（~140個交易日）時整個process被系統OOM
+killed（exit 137）——這台機器只有24GB RAM，140天粗估視窗tensor本身就要
+~50GB，一次性在記憶體裡用python list累積全部視窗、最後才concatenate存檔
+的寫法，記憶體峰值會隨著請求的日期範圍線性長大，超過24GB就會被砍。
+
+改成「先把整個範圍的原始資料載入一次（這步驟本身不是問題——5天測試時
+就已經是載入全部24個月的m1/m3/m5/m3_std/m5_std再篩選，這個固定成本
+本來就沒有OOM過），但視窗組裝完之後不要全部累積在記憶體，改成每處理完
+一個月份就立刻把該月的tensor寫進磁碟（cache/cnn/{branch}_{yyyy_mm}.npy
++ meta_{yyyy_mm}.parquet），釋放掉那個月的暫存陣列再處理下一個月」——
+這樣記憶體峰值只跟「一個月的視窗量」有關，不會隨請求範圍變大而跟著長大，
+可以放心跑到半年甚至全量22個月。
+
+train.py 那邊對應也要用 np.load(..., mmap_mode='r') 跨shard讀取，不能整包
+讀進RAM，否則train階段一樣會在大範圍資料上OOM（見 train.py 的
+ShardedMultiScaleDataset）。
 """
 
+from collections import defaultdict
 from pathlib import Path
 
 import numba
@@ -110,20 +130,34 @@ def _make_barrier_labels(stock_id: pd.Series, day_date: pd.Series, close: pd.Ser
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _source_mtime() -> float:
+def _month_key(day_date) -> str:
+    return f"{day_date.year}_{day_date.month:02d}"
+
+
+def _month_source_mtime(month: str) -> float:
+    """單一月份對應的來源檔案（db/m1、db/m3、db/m5、db/m3_std、db/m5_std 各自的
+    {month}.parquet）裡最新的mtime，找不到就跳過。"""
     mtimes = []
     for d in _SOURCE_DIRS:
-        p = _ROOT / d
+        p = _ROOT / d / f"{month}.parquet"
         if p.exists():
-            mtimes.extend(f.stat().st_mtime for f in p.glob("*.parquet"))
+            mtimes.append(p.stat().st_mtime)
     return max(mtimes) if mtimes else 0.0
 
 
-def _cache_is_fresh() -> bool:
-    meta_path = _CACHE_DIR / "meta.parquet"
+def _shard_is_fresh(month: str) -> bool:
+    """單一月份shard的新鮮度檢查——只比對「這個月份自己對應」的來源檔案
+    mtime，不是整包 db/m1 等資料夾裡最新的檔案。
+
+    2026-07-22 修過的 bug：原本用「整包資料夾裡最新的一個檔案」當基準，
+    導致只更新了某一個月的來源資料（例如 update_m1 只重抓最近一兩個月），
+    卻連其他完全沒變的月份 shard 也被誤判過期、全部重建，完全沒享受到
+    按月分片的好處——使用者實測半年資料時親自碰到這個問題（改了db/m1
+    的06/07月資料，01~05月shard也被牽連重建）。"""
+    meta_path = _CACHE_DIR / f"meta_{month}.parquet"
     if not meta_path.exists():
         return False
-    return meta_path.stat().st_mtime >= _source_mtime()
+    return meta_path.stat().st_mtime >= _month_source_mtime(month)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -198,40 +232,32 @@ def _load_std_frame(loader, start_date: str, end_date: str) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _build_windows(start_date: str = "", end_date: str = "") -> tuple[dict, pd.DataFrame]:
-    """回傳 ({branch_name: np.ndarray shape (N, 5, branch_len)}, meta df[stock_id/date/target])。
+def _build_windows_for_keys(wide_groups, keys, m3_std_groups, m5_std_groups) -> tuple[dict, pd.DataFrame]:
+    """回傳 ({branch_name: np.ndarray shape (N, 5, branch_len)}, meta df[stock_id/date/target])，
+    只處理 keys 這個子集的 (stock_id, day_date) 分組——呼叫端一次只傳一個月份的
+    keys，藉此把記憶體峰值限制在「一個月的視窗量」（見檔頭「為什麼按月分片存」
+    的說明），不是這支函式自己知道月份的概念。
 
-    效能備註：外層對每個 (stock_id, day_date) 分組跑一次 Python 迴圈（組數上看數十萬），
-    組內全部用 numpy 向量化操作（sliding_window_view / fancy-index gather），沒有逐候選
-    的 inner python 迴圈。這是「最基本架構」版本，第一次跑建議用 --start_date/--end_date
-    限縮月份範圍，避免全量22個月資料第一次就跑很久；之後有需要再優化成更少 Python 迴圈
-    開銷的寫法（例如整批 groupby.indices 一次算完）。
+    效能備註：外層對 keys 跑一次 Python 迴圈，組內全部用 numpy 向量化操作
+    （sliding_window_view / fancy-index gather），沒有逐候選的 inner python 迴圈。
     """
-    wide = _load_wide_frame(start_date, end_date)
-    m3_std = _load_std_frame(load_m3_std, start_date, end_date)
-    m5_std = _load_std_frame(load_m5_std, start_date, end_date)
-
-    m3_std_groups = {k: v for k, v in m3_std.groupby(["stock_id", "day_date"], sort=False)}
-    m5_std_groups = {k: v for k, v in m5_std.groupby(["stock_id", "day_date"], sort=False)}
-
     offsets3 = np.arange(-(M3STD_LEN - 1), 1)
     offsets5 = np.arange(-(M5STD_LEN - 1), 1)
 
     m1m3m5_list, m3std_list, m5std_list = [], [], []
     meta_stock, meta_date, meta_target = [], [], []
 
-    n_groups = 0
-    for (stock_id, day_date), day_df in wide.groupby(["stock_id", "day_date"], sort=False):
-        n_groups += 1
+    for key in keys:
+        stock_id, day_date = key
+        day_df = wide_groups.get_group(key)
         day_len = len(day_df)
         if day_len < M1_LEN:
             continue
 
-        key = (stock_id, day_date)
-        m3std_day = m3_std_groups.get(key)
-        m5std_day = m5_std_groups.get(key)
-        if m3std_day is None or m5std_day is None:
+        if key not in m3_std_groups.groups or key not in m5_std_groups.groups:
             continue
+        m3std_day = m3_std_groups.get_group(key)
+        m5std_day = m5_std_groups.get_group(key)
 
         arr = day_df[_WIDE_FEATURE_COLS].to_numpy(dtype=np.float32)
         win = sliding_window_view(arr, M1_LEN, axis=0)  # (day_len-M1_LEN+1, 15, M1_LEN)
@@ -276,8 +302,8 @@ def _build_windows(start_date: str = "", end_date: str = "") -> tuple[dict, pd.D
         meta_date.append(cand_dates[final_idx])
         meta_target.append(cand_targets[final_idx])
 
-        if n_groups % 2000 == 0:
-            print(f"  ...processed {n_groups} (stock_id, day) groups, {sum(len(m) for m in meta_target):,} samples so far")
+    if not meta_target:
+        return {}, pd.DataFrame(columns=["stock_id", "date", "target"])
 
     combined = np.concatenate(m1m3m5_list, axis=0)  # (N, 15, M1_LEN)
     branches = {
@@ -296,29 +322,79 @@ def _build_windows(start_date: str = "", end_date: str = "") -> tuple[dict, pd.D
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 對外入口
+# 對外入口（按月分片 build + 讀取）
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def build_dataset(start_date: str = "", end_date: str = "", force_rebuild: bool = False) -> None:
-    """組裝五路 tensor + label，寫入 cache/cnn/ 底下。"""
-    if not force_rebuild and _cache_is_fresh():
-        print("cache/cnn/ 已是最新，略過重算（force_rebuild=True 可強制重算）")
-        return
+def build_dataset(start_date: str = "", end_date: str = "", force_rebuild: bool = False) -> list[str]:
+    """組裝五路 tensor + label，依月份分片(shard)寫入 cache/cnn/ 底下
+    （{branch}_{yyyy_mm}.npy + meta_{yyyy_mm}.parquet）。
 
-    print("組裝五路多解析度 tensor（第一次跑或資料有更新時才會執行，會需要一段時間）...")
-    branches, meta = _build_windows(start_date, end_date)
+    原始資料（m1/m3/m5/m3_std/m5_std）只載入一次（這步驟本身的記憶體成本是
+    固定的，不隨 start_date/end_date 縮放——data/query.py 的 load_*() 本來就是
+    整包載入再篩選），但視窗組裝完之後逐月立刻存檔、釋放暫存陣列，讓記憶體峰值
+    只跟「一個月的視窗量」有關，可以放心跑到半年甚至全量。
+
+    ⚠️ groupby 之後務必維持 lazy 的 GroupBy 物件、用 .get_group(key) 隨用隨取，
+    不要用 {k: v for k, v in df.groupby(...)} 這種寫法把每個 (stock_id, day_date)
+    分組都具現化成獨立 DataFrame 存進 dict——半年資料分組數上看28萬組，每個小
+    DataFrame本身的pandas物件開銷（跟資料量無關，是index/block manager等固定
+    overhead）疊起來就能吃到幾十GB，這是2026-07-22實測半年資料時把系統記憶體
+    衝到36GB（機器只有24GB）的真正原因，不是視窗tensor本身太大。
+
+    回傳這次涵蓋到、且成功建好（或已是最新略過）的月份 key 清單（"yyyy_mm"）。
+    """
+    wide = _load_wide_frame(start_date, end_date)
+    m3_std = _load_std_frame(load_m3_std, start_date, end_date)
+    m5_std = _load_std_frame(load_m5_std, start_date, end_date)
+
+    wide_groups = wide.groupby(["stock_id", "day_date"], sort=False)
+    m3_std_groups = m3_std.groupby(["stock_id", "day_date"], sort=False)
+    m5_std_groups = m5_std.groupby(["stock_id", "day_date"], sort=False)
+
+    keys_by_month = defaultdict(list)
+    for key in wide_groups.groups.keys():
+        _, day_date = key
+        keys_by_month[_month_key(day_date)].append(key)
 
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    for name, arr in branches.items():
-        np.save(_CACHE_DIR / f"{name}.npy", arr)
-    meta.to_parquet(_CACHE_DIR / "meta.parquet")
-    print(f"完成，共 {len(meta):,} 筆樣本，寫入 {_CACHE_DIR}")
+    months = sorted(keys_by_month.keys())
+    for month in months:
+        if not force_rebuild and _shard_is_fresh(month):
+            print(f"  {month} shard 已是最新，略過重算")
+            continue
+
+        keys = keys_by_month[month]
+        print(f"  組裝 {month}（{len(keys)} 個 stock×day 分組）...")
+        branches, meta = _build_windows_for_keys(wide_groups, keys, m3_std_groups, m5_std_groups)
+        if len(meta) == 0:
+            print(f"  {month} 沒有通過篩選的有效樣本，略過存檔")
+            continue
+
+        for name, arr in branches.items():
+            np.save(_CACHE_DIR / f"{name}_{month}.npy", arr)
+        meta.to_parquet(_CACHE_DIR / f"meta_{month}.parquet")
+        print(f"  {month} 完成，{len(meta):,} 筆")
+
+    return months
 
 
-def load_dataset(start_date: str = "", end_date: str = "", force_rebuild: bool = False) -> tuple[dict, pd.DataFrame]:
-    """讀取（必要時先重建）cache/cnn/ 底下的五路 tensor + meta。"""
-    build_dataset(start_date=start_date, end_date=end_date, force_rebuild=force_rebuild)
-    branches = {name: np.load(_CACHE_DIR / f"{name}.npy") for name in BRANCH_NAMES}
-    meta = pd.read_parquet(_CACHE_DIR / "meta.parquet")
-    return branches, meta
+def available_months() -> list[str]:
+    """回傳 cache/cnn/ 底下已經建好（存在 meta_{yyyy_mm}.parquet）的月份清單，由小到大排序。"""
+    if not _CACHE_DIR.exists():
+        return []
+    return sorted(p.stem.replace("meta_", "") for p in _CACHE_DIR.glob("meta_*.parquet"))
+
+
+def load_shard_meta(month: str) -> pd.DataFrame:
+    """讀單一月份shard的meta（stock_id/date/target，檔案很小，直接整包讀沒關係）。"""
+    return pd.read_parquet(_CACHE_DIR / f"meta_{month}.parquet")
+
+
+def load_shard_branch(month: str, branch: str, mmap: bool = True) -> np.ndarray:
+    """讀單一月份shard的單一分支tensor。mmap=True（預設）用
+    np.load(mmap_mode='r')，不整包讀進RAM，訓練時只有實際用到的那幾筆才會被
+    作業系統從磁碟page進記憶體——大範圍資料train階段才不會又OOM一次
+    （見 train.py 的 ShardedMultiScaleDataset）。"""
+    path = _CACHE_DIR / f"{branch}_{month}.npy"
+    return np.load(path, mmap_mode="r" if mmap else None)
