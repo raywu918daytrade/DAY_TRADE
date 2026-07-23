@@ -56,6 +56,46 @@ def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFra
     return m1
 
 
+def add_idx_gap_pct(m1: pd.DataFrame, day: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFrame:
+    """
+    0050開盤跳空缺口：今天開盤價 vs 昨天收盤價的漲跌幅（2026-07-23討論）。
+    整天固定不變，不是像 ret_vs_idx/idx_ret_since_open 那樣逐分鐘更新——
+    反映的是隔夜/開盤前的市場情緒，跟盤中才發生的事是不同資訊，不是
+    idx_ret_since_open 的重複。
+
+    今天開盤價：從 m1 裡 0050 自己當日第一根K棒抓（即時可用，不用等
+    db/fugle_day 收盤後才更新）。昨天收盤價：從 day（歷史日K）抓，shift(1)
+    往前推一天。
+
+    ⚠️ 這支函式假設 day 裡每個 m1 出現過的 day_date，都能在 day 裡找到
+    「前一個交易日」的列（訓練用全部歷史批次資料本來就滿足）。即時推論
+    （db/fugle_day 收盤後才更新，今天這個day_date在day裡完全沒有列）要先
+    在 day 補一列「今天」的佔位列（值不重要，只需要day_date存在，讓
+    shift(1)排到正確位置），理由與做法跟舊版 day_ret_vs_idx 實驗
+    （已刪除）遇到的問題一樣，見 predict.py::predict_live() 的處理。
+
+    m1 需已有 stock_id/day_date/date/open 欄位。day 需為 load_day() 原始
+    輸出（全市場、含0050）。
+    """
+    idx_m1 = m1[m1["stock_id"] == idx_symbol][["day_date", "date", "open"]].sort_values("date")
+    idx_today_open = idx_m1.groupby("day_date")["open"].first().reset_index()
+    idx_today_open = idx_today_open.rename(columns={"open": "_idx_today_open"})
+
+    idx_day = day[day["stock_id"] == idx_symbol][["date", "close"]].copy()
+    idx_day["date"] = pd.to_datetime(idx_day["date"])
+    idx_day = idx_day.sort_values("date")
+    idx_day["day_date"] = idx_day["date"].dt.date
+    idx_day["_idx_prev_close"] = idx_day["close"].shift(1)
+    idx_day = idx_day[["day_date", "_idx_prev_close"]]
+
+    gap = idx_today_open.merge(idx_day, on="day_date", how="left")
+    gap["idx_gap_pct"] = gap["_idx_today_open"] / gap["_idx_prev_close"] - 1
+    gap = gap[["day_date", "idx_gap_pct"]]
+
+    m1 = m1.merge(gap, on="day_date", how="left")
+    return m1
+
+
 def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
     """
     當根1分鐘K棒自己的量能/波動特徵（2026-07-19 討論，先精簡加一批基本
@@ -362,9 +402,16 @@ def make_barrier_labels_3class(
 # ——之前只有 ret_vs_idx 這個差值，模型看不出「大盤本身是漲是跌」，同樣
 # ret_vs_idx=-2%，大盤漲2%個股沒漲（補漲情境）跟大盤跌1%個股跌3%（兩個
 # 都在跌）意義完全不同，這是個漏洞，見 add_ret_vs_idx() 的說明。
+# 2026-07-23：試過加 idx_gap_pct（0050開盤跳空缺口，今天開盤vs昨天收盤），
+# XGB加入前後（同一個test窗口 2026-06-22~07-21）「漲」precision幾乎持平、
+# 甚至微降（threshold=0.6: 21%→20%、0.7: 26%→26%、0.8: 34%→33%），沒有幫助，
+# 拿掉。函式 add_idx_gap_pct() 本身留著（train.py/predict.py 也還是會呼叫、
+# 算出這欄，只是不進FEATURES），之後如果有新想法要用到跳空缺口可以直接
+# 重新加回FEATURES這一行，不用重寫。
 FEATURES = [
     "ret_vs_idx",
     "idx_ret_since_open",
+    # "idx_gap_pct",
     "vol_ratio_cum",
     "vol_ratio_prev",
     "ret_1m",

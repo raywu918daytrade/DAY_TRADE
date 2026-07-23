@@ -15,12 +15,13 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 import pandas as pd
 
-from data.query import load_m1, load_m1_live
+from data.query import load_day, load_m1, load_m1_live
 from data.resample import compute_m3, compute_m3_std, compute_m5, compute_m5_std
 from strategy.mkt.config import IDX_SYMBOL, MODEL_TYPE
 from strategy.mkt.features import (
     FEATURES,
     add_bar_features,
+    add_idx_gap_pct,
     add_m3_m5_features,
     add_m3_m5_std_features,
     add_ret_vs_idx,
@@ -99,10 +100,10 @@ def predict_live(
     `s.predict_live(minute_str, state.day, model=..., threshold=0,
     day_trade_stocks=..., m1_live=..., **s.prewarm_cache)` 這種寫法呼叫
     （state.day 是位置參數），不會知道也不會檢查個別策略實際用不用得到
-    day。mkt 目前用不到日K背景資料（ret_vs_idx/m3/m5/m3_std/m5_std全部
-    是分K現算），day 收下來直接忽略，但仍要保留在同一個位置，不然
-    state.day 會被誤傳進下一個參數的位置（例如錯的話會被當成 m1_live，
-    整條 pipeline 全部算錯，2026-07-21發現這個bug）。
+    day。錯位的話 state.day 會被誤傳進下一個參數的位置（例如當成
+    m1_live，整條 pipeline 全部算錯，2026-07-21發現過這個bug），所以就算
+    用不到也要保留在同一個位置。2026-07-23起 idx_gap_pct（0050開盤跳空
+    缺口）需要用到它，不再是純粹為了介面相容才收下、不使用。
 
     top_n_stock_ids: 今天的流動性名單，見 build_prewarm_cache()。留空則內部
         自己現算 top_n_stock_ids_by_latest_volume(load_m1())（對全歷史 db/m1/
@@ -140,6 +141,25 @@ def predict_live(
     # 且已對0050去重，會保留 m1_live 原本依 stock_id/date 排序的列順序，
     # 後面 compute_m3/compute_m5 的 rolling 計算才不會因為列序被打亂而算錯。
     df = add_ret_vs_idx(m1_live)
+
+    # 0050開盤跳空缺口（idx_gap_pct，2026-07-23討論）：db/fugle_day 是GHA
+    # 批次工作、收盤後才更新，「今天」這個day_date在load_day()裡完全沒有
+    # 0050的列——merge(on="day_date")找不到today的列會讓idx_gap_pct整天
+    # 都是NaN。修法：補一列0050「今天」的佔位列到day裡（值不重要，只需要
+    # day_date存在，讓add_idx_gap_pct()內部的shift(1)能對到正確位置），
+    # 理由同舊版day_ret_vs_idx實驗（已刪除）遇到的問題。也是要在排除0050
+    # 之前算，理由同add_ret_vs_idx()。
+    if day is None:
+        day = load_day()
+    day = day.copy()
+    day["date"] = pd.to_datetime(day["date"])
+    today_ts = pd.Timestamp(date_str)
+    if not ((day["stock_id"] == IDX_SYMBOL) & (day["date"] == today_ts)).any():
+        day = pd.concat(
+            [day, pd.DataFrame([{"stock_id": IDX_SYMBOL, "date": today_ts, "close": None}])],
+            ignore_index=True,
+        )
+    df = add_idx_gap_pct(df, day)
     df = df[df["stock_id"] != IDX_SYMBOL]
 
     if top_n_stock_ids is None:

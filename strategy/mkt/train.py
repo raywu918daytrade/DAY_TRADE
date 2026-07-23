@@ -51,11 +51,12 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from data.query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
+from data.query import load_day, load_m1, load_m3, load_m3_std, load_m5, load_m5_std
 from strategy.mkt.config import IDX_SYMBOL
 from strategy.mkt.features import (
     FEATURES,
     add_bar_features,
+    add_idx_gap_pct,
     add_m3_m5_features,
     add_m3_m5_std_features,
     add_ret_vs_idx,
@@ -68,7 +69,14 @@ _MODEL_PATH = _ROOT / "models/mkt_rfc.pkl"
 _MODEL_PATH_XGB = _ROOT / "models/mkt_xgb.pkl"
 _MODEL_PATH_LGBM = _ROOT / "models/mkt_lgbm.pkl"
 _CACHE_PATH = _ROOT / "cache/mkt_prepared.parquet"
-_SOURCE_DIRS = [_ROOT / "db/m1", _ROOT / "db/m3", _ROOT / "db/m5", _ROOT / "db/m3_std", _ROOT / "db/m5_std"]
+_SOURCE_DIRS = [
+    _ROOT / "db/m1",
+    _ROOT / "db/m3",
+    _ROOT / "db/m5",
+    _ROOT / "db/m3_std",
+    _ROOT / "db/m5_std",
+    _ROOT / "db/fugle_day",
+]
 
 
 def _source_mtime() -> float:
@@ -78,10 +86,19 @@ def _source_mtime() -> float:
     return max(mtimes) if mtimes else 0
 
 
-def _cache_is_fresh() -> bool:
-    if not _CACHE_PATH.exists():
+def _cache_path_for(top_n: int) -> Path:
+    """top_n=100（預設）用原本那份共用cache，跟現有行為完全一致；其他
+    top_n值各自存獨立檔案（2026-07-22討論）——top_n是在_prepare_data()
+    內部就套用的流動性過濾，不像start_date是事後才篩，如果共用同一份
+    cache，不同top_n會互相覆蓋、讀到錯的資料（例如拿top_n=300算出來的
+    cache，被誤判成新鮮的top_n=100結果直接回傳）。"""
+    return _CACHE_PATH if top_n == 100 else _ROOT / f"cache/mkt_prepared_top{top_n}.parquet"
+
+
+def _cache_is_fresh(cache_path: Path) -> bool:
+    if not cache_path.exists():
         return False
-    return _CACHE_PATH.stat().st_mtime >= _source_mtime()
+    return cache_path.stat().st_mtime >= _source_mtime()
 
 
 def _prepare_data(
@@ -97,13 +114,16 @@ def _prepare_data(
                 還新，就直接用cache；只要來源有任何檔案比cache新（例如
                 db/m1 今天寫進新的即時資料），就視為過期、重新跑一次完整
                 流程並覆蓋掉舊cache。不用手動清cache、不用設定過期時間。
+
+    top_n 不同值各自有獨立cache，見 _cache_path_for() 的說明。
     """
-    if use_cache and _CACHE_PATH.exists():
-        print("use_cache=True，直接讀取cache（不檢查來源資料有沒有更新）...")
-        return pd.read_parquet(_CACHE_PATH)
-    if not use_cache and _cache_is_fresh():
-        print("cache比來源資料新，直接讀取cache...")
-        return pd.read_parquet(_CACHE_PATH)
+    cache_path = _cache_path_for(top_n)
+    if use_cache and cache_path.exists():
+        print(f"use_cache=True，直接讀取cache（不檢查來源資料有沒有更新）... [{cache_path.name}]")
+        return pd.read_parquet(cache_path)
+    if not use_cache and _cache_is_fresh(cache_path):
+        print(f"cache比來源資料新，直接讀取cache... [{cache_path.name}]")
+        return pd.read_parquet(cache_path)
 
     print("載入分K...")
     m1 = load_m1()
@@ -114,6 +134,10 @@ def _prepare_data(
     print("算 ret_vs_idx...")
     # 0050 自己要留著算完才能排除，理由見 features.py::add_ret_vs_idx() 的說明
     df = add_ret_vs_idx(m1)
+
+    print("算 0050 開盤跳空缺口...")
+    # 同樣要在排除0050之前算，理由見 features.py::add_idx_gap_pct() 的說明
+    df = add_idx_gap_pct(df, load_day())
     df = df[df["stock_id"] != IDX_SYMBOL]
 
     print(f"流動性過濾：前一日量前{top_n}名...")
@@ -148,9 +172,9 @@ def _prepare_data(
     df["target"] = df["target"].astype(int)
     print(f"有效樣本: {len(df):,} 筆")
 
-    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_CACHE_PATH)
-    print(f"cache已存至 {_CACHE_PATH}")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path)
+    print(f"cache已存至 {cache_path}")
     return df
 
 
@@ -314,6 +338,17 @@ def train_lgbm(test_days: int = 20, start_date: str | None = None, use_cache: bo
     比照 strategy/rally/train.py 的 train_lgbm() 寫法（2026-07-21 討論）。
     LGBMClassifier 的 class_weight="balanced" 是原生支援多分類的，跟
     RandomForestClassifier 用法一致，不用像 XGBoost 那樣另外算sample_weight。
+
+    2026-07-23：超參數換成 strategy/mkt/experiments/tune_lgbm.py（Optuna，
+    45天val/test切分）+ walk_forward_lgbm.py（5個45天窗口）驗證過的一組。
+    ⚠️ 跟train_xgb()那次不同，這組不是全面勝利：threshold=0.5/0.6全面贏
+    （mean precision分別5.21%→8.41%、6.18%→8.42%），0.7小贏（8.78%→9.89%，
+    但std下降代表比較穩），threshold=0.8打平偏輸（15.03%→13.33%，只有3/5
+    窗口贏）——貼這組上來是因為低/中門檻確實比舊參數穩定變好，且原本的
+    n_estimators=300/learning_rate=0.05/num_leaves=31/min_child_samples=50/
+    subsample=0.8（沒有subsample_freq，subsample其實從未真的生效過，見
+    tune_lgbm.py檔頭說明）根本沒調過，不是什麼值得堅持的基準。原始參數
+    紀錄在這裡以防之後要retune時當對照組。
     """
     import lightgbm as lgb
 
@@ -329,13 +364,15 @@ def train_lgbm(test_days: int = 20, start_date: str | None = None, use_cache: bo
     print(f"\n訓練集標籤分佈:\n{(train_df['target'].value_counts(normalize=True)*100).round(2)}")
 
     model = lgb.LGBMClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=50,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
+        n_estimators=800,
+        num_leaves=101,
+        max_depth=8,
+        learning_rate=0.17376155767832735,
+        min_child_samples=16,
+        subsample=0.8372082477437949,
+        subsample_freq=1,
+        colsample_bytree=0.6699451641790991,
+        reg_lambda=1.1052479063154046,
         random_state=42,
         n_jobs=-1,
         class_weight="balanced",
@@ -658,7 +695,7 @@ if __name__ == "__main__":
     mode = "evaluate"  # train / importance / evaluate / confidence
     test_days = 30
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
-    model_type = "lgbm"  # rfc / xgb / lgbm
+    model_type = "xgb"  # rfc / xgb / lgbm
     use_cache = True  # 只有 mode="evaluate"/"confidence" 用得到
     start_date = "2024-07-01"  # 只有 mode="train" 用得到；留 None = 用全部歷史
     main(
