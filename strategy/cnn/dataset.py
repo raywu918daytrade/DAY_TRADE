@@ -58,14 +58,14 @@ _ROOT = Path(__file__).parent.parent.parent
 _CACHE_DIR = _ROOT / "cache/cnn"
 _SOURCE_DIRS = ["db/m1", "db/m3", "db/m5", "db/m3_std", "db/m5_std"]
 
-# m1多帶atr5/ma10（1分鐘技術指標）+ret_vs_idx/idx_ret_since_open（大盤相對
-# 強弱，2026-07-24新增，見_add_atr_ma()/_add_market_relative()）。
+# m1多帶atr5/ma10/ma5/ma3（1分鐘技術指標）+ret_vs_idx/idx_ret_since_open
+# （大盤相對強弱，2026-07-24新增，見_add_atr_ma()/_add_market_relative()）。
 # 只做ATR沒做ADX——orb已踩過這個坑：ADX雙重平滑需要~28根K棒才穩定，縮小視窗
 # 後（M1_LEN=10）候選視窗本身就只有10步，缺值率會非常高，見project_orb_strategy
 # 記憶裡的教訓，直接沿用「拿掉adx，只留單次平滑的atr」的結論。
 _M1_COLS = [
     "m1_open", "m1_high", "m1_low", "m1_close", "m1_volume",
-    "atr5", "ma10", "ret_vs_idx", "idx_ret_since_open",
+    "atr5", "ma10", "ma5", "ma3", "ret_vs_idx", "idx_ret_since_open",
 ]
 _M3_COLS = ["m3_open", "m3_high", "m3_low", "m3_close", "m3_volume"]
 _M5_COLS = ["m5_open", "m5_high", "m5_low", "m5_close", "m5_volume"]
@@ -221,8 +221,12 @@ def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
 
 
 def _add_atr_ma(df: pd.DataFrame, g_day, day_open: pd.Series) -> None:
-    """1分鐘ATR(5)/MA(10)，2026-07-24新增，只加m1分支。用原始（未正規化）
-    high/low/close算，除以day_open正規化，跟其他OHLC欄位的正規化方式一致。
+    """1分鐘ATR(5)/MA(10)/MA(5)/MA(3)，2026-07-24新增，只加m1分支。用原始
+    （未正規化）high/low/close算，除以day_open正規化，跟其他OHLC欄位的正規化
+    方式一致。MA5/MA3（2026-07-24加）比MA10短，想給CNN更接近即時的價格參考
+    點——使用者觀察到「會不會動」（atr5過濾後有改善）跟「往哪動」（precision
+    看似變好但方向對錯機率接近或輸給丟銅板）是不同難度的問題，短天期MA
+    可能有助於後者（價格相對短均線的位置，是常見的動能/趨勢判斷依據）。
 
     ATR/MA本身需要暖機期（分別5根/10根K棒）：視窗縮小成M1_LEN=10之後，當天
     最早幾筆候選的視窗前段會落在暖機期內、算出NaN——一律fillna(0)，不能留
@@ -246,8 +250,9 @@ def _add_atr_ma(df: pd.DataFrame, g_day, day_open: pd.Series) -> None:
     df["atr5"] = (atr5 / day_open).fillna(0)
     df.drop(columns="_tr", inplace=True)
 
-    ma10 = _degroup(g_day["close"].rolling(10, min_periods=10).mean(), df.index)
-    df["ma10"] = (ma10 / day_open).fillna(0)
+    for name, window in [("ma10", 10), ("ma5", 5), ("ma3", 3)]:
+        ma = _degroup(g_day["close"].rolling(window, min_periods=window).mean(), df.index)
+        df[name] = (ma / day_open).fillna(0)
 
 
 def _add_market_relative(df: pd.DataFrame, day_open: pd.Series, idx_symbol: str) -> pd.DataFrame:

@@ -723,21 +723,21 @@ if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     #  VS Code按F5：在這裡直接改變數，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "confidence_hours"  # train / evaluate_hours / confidence_hours
+    mode = "train"  # train / evaluate_hours / confidence_hours
     test_days = 30
     max_rounds = 10  # 最多跑幾輪全部資料
     chunk_size = 1_000_000  # 每個chunk的筆數
     eval_every = 1  # 每幾個chunk評估一次（1=每個都評估）
     hour_start = 9  # 影響 train/evaluate_hours/confidence_hours
     hour_end = 10  # 影響 train/evaluate_hours/confidence_hours
-    atr5_min = 0.00541  # 只篩「平」，atr5>=門檻才留（9~10點p90，用乾淨完整資料算出來的，見experiments/atr5_flat_filter_check.py）
+    atr5_min = 0.00541  # 只篩「平」，atr5>=門檻才留——這個數字是用2026-03~07算的p90，範圍擴大到2024-01起，這個門檻可能不準了，見下方說明
     thresholds = None  # 只影響 confidence_hours，留None用預設清單[None,0.4,0.5,0.6,0.7,0.8]
     batch_size = 256
     lr = 1e-3
     patience = 3
-    start_date = "2026-03-01"  # 先限縮範圍驗證這次大改（拿掉爆量特徵+atr5存進meta）跑不跑得通，之後再放寬
+    start_date = "2024-01-01"  # 先縮小到2026-01起（約7個月），看勝率會不會提高
     end_date = ""
-    force_rebuild = False  # 剛剛train時已經重建過shard了，這次不用再重算
+    force_rebuild = False  # 2026-01/02這兩個月還沒用新schema建過，需要重建
 
     main(
         mode=mode,

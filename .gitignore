@@ -19,6 +19,7 @@ db
 log/
 cache/
 model/
+models/cnn_multiscale.pt
 *.json
 tmp.txt
 *.pyc
