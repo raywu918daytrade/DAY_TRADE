@@ -20,20 +20,6 @@ label 是3類 triple barrier（未來 HOLD_BARS 根先漲 TP_PCT% =漲、先跌 
 基本指標，驗證多分支設計本身可不可行。predict.py/live.py/backtest整合/
 confidence報表都還沒做，等這裡先證明有訊號了再回頭補。
 
-== Main 模式 ==
-
-train             分chunk漸進訓練（固定筆數切成好幾個chunk，一次只載入一個
-                  chunk訓練、練完立刻釋放），記憶體不會隨資料總量增加而長大，
-                  範圍再大也不會OOM（2026-07-23新增、2026-07-24確認沒有明顯
-                  缺點後取代掉原本「所有月份合併成一包」的舊版train）。
-evaluate          讀已存模型，在 test set 上印 accuracy/AUC/混淆矩陣
-evaluate_hours    跟 evaluate 一樣，但只看候選時間戳落在特定時段（例如
-                  9~10點）的樣本（2026-07-24新增）。
-confidence        掃描不同信心度門檻（P(跌)/P(漲)要多高才判斷方向，不是只看
-                  argmax），驗證信心度高的預測是不是真的比較準，比照
-                  rally/mkt的confidence_report慣例（2026-07-24新增）。
-confidence_hours  跟 confidence 一樣，但只看候選時間戳落在特定時段（例如
-                  9~10點）的樣本（2026-07-24新增）。
 """
 
 import argparse
@@ -118,8 +104,8 @@ def _month_bound(date_str: str) -> str:
 
 def _resolve_months_and_cutoff(test_days: int, start_date: str, end_date: str, force_rebuild: bool):
     """共用邏輯：確保cache建好、篩出符合範圍的月份、算出test/train切分的
-    cutoff日期。_load_test_ds()/_load_test_ds_hours()/train() 都靠這支
-    共用，避免每個地方各自重寫一份月份篩選+cutoff計算邏輯。"""
+    cutoff日期。_load_test_ds_hours()/train() 都靠這支共用，避免每個地方
+    各自重寫一份月份篩選+cutoff計算邏輯。"""
     build_dataset(start_date=start_date, end_date=end_date, force_rebuild=force_rebuild)
 
     months = available_months()
@@ -137,35 +123,28 @@ def _resolve_months_and_cutoff(test_days: int, start_date: str, end_date: str, f
     return months, metas, cutoff
 
 
-def _load_test_ds(
-    test_days: int, start_date: str = "", end_date: str = "", force_rebuild: bool = False
-) -> ShardedMultiScaleDataset:
-    """只建立test_ds，不建train_ds——evaluate()專用。2026-07-23發現：原本
-    evaluate()借用_split_data()，會連根本用不到的train_ds也一起建出來，範圍
-    一大（例如18個月）單純評估一個模型也會踩到跟訓練一樣的記憶體風險。"""
-    months, metas, cutoff = _resolve_months_and_cutoff(test_days, start_date, end_date, force_rebuild)
-    test_filters = {m: np.nonzero(meta["date"].to_numpy() > cutoff)[0] for m, meta in metas.items()}
-    return ShardedMultiScaleDataset(months, test_filters)
-
-
 def _load_test_ds_hours(
     test_days: int,
-    hour_start: int,
-    hour_end: int,
+    hour_start: int | None,
+    hour_end: int | None,
+    atr5_min: float | None = None,
     start_date: str = "",
     end_date: str = "",
     force_rebuild: bool = False,
 ) -> ShardedMultiScaleDataset:
-    """跟 _load_test_ds() 一樣，但只保留候選時間戳落在 [hour_start, hour_end)
-    的樣本（例如9~10點窗口），evaluate_hours() 專用（2026-07-24新增）——
-    用來驗證模型在特定時段（例如最活躍的開盤前段）表現是否比整體平均更好。"""
+    """只保留候選時間戳落在 [hour_start, hour_end) 的樣本（例如9~10點窗口），
+    evaluate_hours()/confidence_report() 專用（2026-07-24新增）——用來驗證
+    模型在特定時段（例如最活躍的開盤前段）表現是否比整體平均更好。
+
+    atr5_min給定時（2026-07-24新增），跟train()同一套篩選邏輯：只篩「平」
+    （atr5>=atr5_min才留），跟訓練時看到的分布保持一致，評估結果才公平。"""
     months, metas, cutoff = _resolve_months_and_cutoff(test_days, start_date, end_date, force_rebuild)
-    test_filters = {}
-    for m, meta in metas.items():
-        dates = meta["date"]
-        hour = dates.dt.hour
-        mask = (dates.to_numpy() > cutoff) & (hour >= hour_start).to_numpy() & (hour < hour_end).to_numpy()
-        test_filters[m] = np.nonzero(mask)[0]
+    test_filters = {
+        m: np.nonzero(
+            (meta["date"].to_numpy() > cutoff) & _hour_mask(meta, hour_start, hour_end) & _atr5_mask(meta, atr5_min)
+        )[0]
+        for m, meta in metas.items()
+    }
     return ShardedMultiScaleDataset(months, test_filters)
 
 
@@ -180,8 +159,38 @@ def _class_weights(target: np.ndarray) -> torch.Tensor:
     return torch.tensor(weights, dtype=torch.float32, device=DEVICE)
 
 
+def _hour_mask(meta: pd.DataFrame, hour_start: int | None, hour_end: int | None) -> np.ndarray:
+    """候選時間戳落在 [hour_start, hour_end) 的布林遮罩；兩個都是None時不篩選
+    （回傳全True）。2026-07-24新增，train()跟_load_test_ds_hours()共用同一套
+    邏輯，避免各自重寫一份小時篩選。"""
+    if hour_start is None or hour_end is None:
+        return np.ones(len(meta), dtype=bool)
+    hour = meta["date"].dt.hour.to_numpy()
+    return (hour >= hour_start) & (hour < hour_end)
+
+
+def _atr5_mask(meta: pd.DataFrame, atr5_min: float | None) -> np.ndarray:
+    """只篩「平」（target==1）：atr5>=atr5_min才留，跌/漲不受影響、全部保留。
+    atr5_min=None不篩選（回傳全True）。2026-07-24新增——平佔比過高，
+    class_weights只調loss權重、每個batch裡跌/漲訊號還是太稀疏，用atr5（波動
+    幅度）挑掉「本來就沒什麼波動、幾乎注定不會動」的平樣本，同時降低平的
+    數量、也提高留下來的平樣本的資訊量。門檻怎麼選見
+    experiments/atr5_flat_filter_check.py 的分布診斷。"""
+    if atr5_min is None:
+        return np.ones(len(meta), dtype=bool)
+    target = meta["target"].to_numpy()
+    atr5 = meta["atr5"].to_numpy()
+    return (target != 1) | (atr5 >= atr5_min)
+
+
 def _build_row_chunks(
-    months: list[str], metas: dict[str, pd.DataFrame], cutoff, chunk_size: int
+    months: list[str],
+    metas: dict[str, pd.DataFrame],
+    cutoff,
+    chunk_size: int,
+    hour_start: int | None = None,
+    hour_end: int | None = None,
+    atr5_min: float | None = None,
 ) -> list[dict[str, np.ndarray]]:
     """把所有月份裡日期<=cutoff（訓練集部分）的列，依時間順序（月份順序、
     月內列順序）攤平成一條列表，每 chunk_size 筆切一個chunk（最後一個chunk
@@ -192,11 +201,18 @@ def _build_row_chunks(
     2026-07-23討論：改成固定列數切、不照月份切的原因——每個月份實際筆數差
     滿多（例如2月106萬筆、6月233萬筆，差超過2倍），照月份切的話每個chunk的
     記憶體用量會忽大忽小；固定列數切可以讓每個chunk的大小更一致、更好預測。
+
+    hour_start/hour_end（2026-07-24新增）：只保留候選時間戳落在這個小時區間
+    的列（例如只訓練9~10點），None代表不篩選——train()現在預設只訓練9~10點
+    候選（使用者要求），跟固定測試集用同一個時段，才是公平的訓練/測試對齊。
+
+    atr5_min（2026-07-24新增）：只篩「平」，見_atr5_mask()說明。
     """
     flat: list[tuple[str, int]] = []
     for month in months:
         dates = metas[month]["date"].to_numpy()
-        train_idx = np.nonzero(dates <= cutoff)[0]
+        mask = (dates <= cutoff) & _hour_mask(metas[month], hour_start, hour_end) & _atr5_mask(metas[month], atr5_min)
+        train_idx = np.nonzero(mask)[0]
         flat.extend((month, int(i)) for i in train_idx)
 
     chunks: list[dict[str, np.ndarray]] = []
@@ -220,6 +236,9 @@ def train(
     start_date: str = "",
     end_date: str = "",
     force_rebuild: bool = False,
+    hour_start: int | None = 9,
+    hour_end: int | None = 10,
+    atr5_min: float | None = None,
 ):
     """分批漸進訓練——不會把所有月份合併成一個大的 ShardedMultiScaleDataset。
     任何時間點記憶體裡只有「當下這一個chunk（固定 chunk_size 筆，可能橫跨
@@ -252,25 +271,46 @@ def train(
     之後才開始生效——第一輪進行中，模型可能只看過前面幾個chunk，評估結果
     本來就還不穩定、廣度也還不完整，不能拿來跟「一次性訓練epoch 1（本來就
     看過全部資料一遍）」相提並論，用來判斷提早停止並不公平（2026-07-23討論）。
+
+    hour_start/hour_end（2026-07-24新增，預設9~10點）：訓練集跟固定測試集
+    都只保留候選時間戳落在這個小時區間的樣本，不是像evaluate_hours()那樣
+    只篩測試集——使用者要求只訓練9~10點（他實際交易只在意這個時段），
+    傳None/None關掉篩選可以退回全天訓練。
+
+    atr5_min（2026-07-24新增）：只篩「平」（見_atr5_mask()），訓練集跟固定
+    測試集都套用同一個門檻——跟hour_start/hour_end同樣的理由，訓練/測試
+    分布要一致才公平；門檻怎麼選見experiments/atr5_flat_filter_check.py。
     """
     months, metas, cutoff = _resolve_months_and_cutoff(test_days, start_date, end_date, force_rebuild)
 
     # 固定測試集：載入一次、全程留在記憶體（體積只跟test_days有關，不會隨
     # 訓練資料總量增加而變大），每個chunk訓練完都用同一組評估，才能公平比較。
-    test_filters = {m: np.nonzero(meta["date"].to_numpy() > cutoff)[0] for m, meta in metas.items()}
+    test_filters = {
+        m: np.nonzero(
+            (meta["date"].to_numpy() > cutoff) & _hour_mask(meta, hour_start, hour_end) & _atr5_mask(meta, atr5_min)
+        )[0]
+        for m, meta in metas.items()
+    }
     test_ds = ShardedMultiScaleDataset(months, test_filters)
-    print(f"固定測試集: {len(test_ds):,} 筆（最後{test_days}天，全程不變）")
+    hour_desc = f"、{hour_start}:00~{hour_end}:00" if hour_start is not None else ""
+    atr5_desc = f"、atr5>={atr5_min}(平)" if atr5_min is not None else ""
+    print(f"固定測試集: {len(test_ds):,} 筆（最後{test_days}天{hour_desc}{atr5_desc}，全程不變）")
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
-    chunks = _build_row_chunks(months, metas, cutoff, chunk_size)
+    chunks = _build_row_chunks(months, metas, cutoff, chunk_size, hour_start, hour_end, atr5_min)
     print(f"訓練集共切成 {len(chunks)} 個chunk（每個約{chunk_size:,}筆）")
 
     model = MultiScaleCNN().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # 類別不平衡加權：跟 train() 一樣的概念，這裡用全部月份訓練集部分的
-    # target分佈先算好，訓練過程中固定不變。
-    train_targets_per_month = [meta["target"].to_numpy()[meta["date"].to_numpy() <= cutoff] for meta in metas.values()]
+    # 類別不平衡加權：跟訓練集實際餵進去的資料（同樣的cutoff+小時篩選+atr5
+    # 篩選）算，不能用全天分佈，否則跟實際訓練資料的類別比例對不上。
+    train_targets_per_month = [
+        meta["target"].to_numpy()[
+            (meta["date"].to_numpy() <= cutoff) & _hour_mask(meta, hour_start, hour_end) & _atr5_mask(meta, atr5_min)
+        ]
+        for meta in metas.values()
+    ]
     all_train_targets = np.concatenate(train_targets_per_month)
     class_weights = _class_weights(all_train_targets)
     print(
@@ -377,8 +417,8 @@ def load_model() -> MultiScaleCNN:
 
 
 def _run_inference_and_report(model: MultiScaleCNN, test_ds: ShardedMultiScaleDataset, batch_size: int) -> None:
-    """對 test_ds 跑推論，印出 accuracy/AUC/混淆矩陣/分類報告——evaluate()跟
-    evaluate_hours()共用同一份報表邏輯，只差在test_ds怎麼篩出來的。"""
+    """對 test_ds 跑推論，印出 accuracy/AUC/混淆矩陣/分類報告——evaluate_hours()
+    專用的共用報表邏輯。"""
     test_target = test_ds.target
     print(f"\n測試集: {len(test_target):,} 筆")
     if len(test_target) == 0:
@@ -407,15 +447,10 @@ def _run_inference_and_report(model: MultiScaleCNN, test_ds: ShardedMultiScaleDa
     )
 
 
-def evaluate(test_days: int = 10, start_date: str = "", end_date: str = "", batch_size: int = 256):
-    model = load_model()
-    test_ds = _load_test_ds(test_days, start_date, end_date)
-    _run_inference_and_report(model, test_ds, batch_size)
-
-
 def evaluate_hours(
     hour_start: int = 9,
     hour_end: int = 10,
+    atr5_min: float | None = None,
     test_days: int = 10,
     start_date: str = "",
     end_date: str = "",
@@ -424,10 +459,12 @@ def evaluate_hours(
     """只評估候選時間戳落在 [hour_start, hour_end) 的樣本（預設9~10點），
     2026-07-24新增——用來驗證模型在特定時段（例如當沖最活躍的開盤前段）
     表現是否比整體平均更好或更差，跟一開始討論LOOKBACK_MINUTES時想讓推論
-    盡量涵蓋9-10點活躍時段的初衷呼應。"""
+    盡量涵蓋9-10點活躍時段的初衷呼應。atr5_min給定時同時套用flat過濾
+    （見_atr5_mask()），跟train()看到的分布保持一致。"""
     model = load_model()
-    test_ds = _load_test_ds_hours(test_days, hour_start, hour_end, start_date, end_date)
-    print(f"時段篩選: {hour_start}:00~{hour_end}:00")
+    test_ds = _load_test_ds_hours(test_days, hour_start, hour_end, atr5_min, start_date, end_date)
+    atr5_desc = f"、atr5>={atr5_min}(平)" if atr5_min is not None else ""
+    print(f"時段篩選: {hour_start}:00~{hour_end}:00{atr5_desc}")
     _run_inference_and_report(model, test_ds, batch_size)
 
 
@@ -458,8 +495,9 @@ _DEFAULT_THRESHOLDS: list[float | None] = [None, 0.4, 0.5, 0.6, 0.7, 0.8]
 def confidence_report(
     test_days: int = 10,
     thresholds: list[float | None] | None = None,
-    hour_start: int | None = None,
-    hour_end: int | None = None,
+    hour_start: int | None = 9,
+    hour_end: int | None = 10,
+    atr5_min: float | None = None,
     start_date: str = "",
     end_date: str = "",
     batch_size: int = 256,
@@ -469,17 +507,17 @@ def confidence_report(
     的預測還準」，比照 rally/mkt 的 confidence_report 慣例（2026-07-24新增）。
     只跑一次推論、算好機率矩陣後，每個門檻只是重新篩選、不用重跑模型。
 
-    hour_start/hour_end 都給定時（2026-07-24新增），只評估候選時間戳落在
+    hour_start/hour_end（預設9~10點，2026-07-24新增），只評估候選時間戳落在
     [hour_start, hour_end) 的樣本，跟 evaluate_hours() 同樣的篩選邏輯；
-    留 None（預設）就是全天，不篩時段。"""
+    atr5_min給定時同時套用flat過濾（見_atr5_mask()），跟train()看到的分布
+    保持一致。"""
     thresholds = thresholds if thresholds is not None else _DEFAULT_THRESHOLDS
 
     model = load_model()
-    if hour_start is not None and hour_end is not None:
-        test_ds = _load_test_ds_hours(test_days, hour_start, hour_end, start_date, end_date)
-        print(f"時段篩選: {hour_start}:00~{hour_end}:00")
-    else:
-        test_ds = _load_test_ds(test_days, start_date, end_date)
+    test_ds = _load_test_ds_hours(test_days, hour_start, hour_end, atr5_min, start_date, end_date)
+    hour_desc = f"{hour_start}:00~{hour_end}:00" if hour_start is not None else "全天"
+    atr5_desc = f"、atr5>={atr5_min}(平)" if atr5_min is not None else ""
+    print(f"時段篩選: {hour_desc}{atr5_desc}")
     test_target = test_ds.target
     print(f"\n測試集: {len(test_target):,} 筆")
     if len(test_target) == 0:
@@ -517,6 +555,7 @@ def main(
     eval_every: int = 1,
     hour_start: int = 9,
     hour_end: int = 10,
+    atr5_min: float | None = None,
     thresholds: list[float] | None = None,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -537,13 +576,22 @@ def main(
     train 依固定筆數（chunk_size）把資料切成好幾個chunk、一次只載入一個chunk
     訓練、練完立刻釋放，記憶體不會隨資料總量增加而長大（2026-07-24：原本
     另外有一個「一整包訓練」的版本，範圍一大就容易在24GB機器上OOM，實測後
-    確認分chunk版本沒有明顯缺點就直接取代掉，只留這一個）。
+    確認分chunk版本沒有明顯缺點就直接取代掉，只留這一個）。預設只訓練
+    [hour_start, hour_end) 時段的候選（預設9~10點，2026-07-24新增，使用者
+    只在意這個時段），傳 --hour_start/--hour_end 為 None 等效值可以退回全天
+    訓練（CLI下留空這兩個參數則用預設9~10，要關閉篩選需改F5區塊直接傳None）。
+    atr5_min給定時只篩「平」（見_atr5_mask()），訓練/測試集都套用同一門檻。
 
-    evaluate_hours：跟 evaluate 一樣讀已存模型評估，但只看候選時間戳落在
-    [hour_start, hour_end) 的樣本（預設9~10點，2026-07-24新增）。
+    evaluate_hours：讀已存模型評估，只看候選時間戳落在[hour_start, hour_end)
+    的樣本（預設9~10點，2026-07-24新增）。
 
-    confidence：掃描不同信心度門檻（P(跌)/P(漲)要多高才判斷方向，不是只看
-    argmax），驗證信心度高的預測是不是真的比較準（2026-07-24新增）。
+    confidence_hours：掃描不同信心度門檻（P(跌)/P(漲)要多高才判斷方向，不是
+    只看argmax），驗證信心度高的預測是不是真的比較準，一樣只看[hour_start,
+    hour_end)的樣本（2026-07-24新增）。
+
+    2026-07-24：拿掉全天版本的evaluate/confidence——現在train()預設只訓練
+    9~10點候選，模型從沒看過其他時段的資料，evaluate/confidence（全天無
+    篩選）評估出來的數字沒有意義，只留evaluate_hours/confidence_hours。
     """
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(description="cnn 策略 — 多解析度 1D CNN")
@@ -551,7 +599,7 @@ def main(
             "mode",
             nargs="?",
             default="train",
-            choices=["train", "evaluate", "evaluate_hours", "confidence", "confidence_hours"],
+            choices=["train", "evaluate_hours", "confidence_hours"],
             help="執行模式（預設train）",
         )
         parser.add_argument("--test_days", type=int, default=30, help="測試集天數")
@@ -563,14 +611,24 @@ def main(
             default=1,
             help="每幾個chunk才評估一次（只影響train，預設1=每個都評估）",
         )
-        parser.add_argument("--hour_start", type=int, default=9, help="只影響evaluate_hours：起始小時（含）")
-        parser.add_argument("--hour_end", type=int, default=10, help="只影響evaluate_hours：結束小時（不含）")
+        parser.add_argument(
+            "--hour_start", type=int, default=9, help="影響train/evaluate_hours/confidence_hours：起始小時（含）"
+        )
+        parser.add_argument(
+            "--hour_end", type=int, default=10, help="影響train/evaluate_hours/confidence_hours：結束小時（不含）"
+        )
+        parser.add_argument(
+            "--atr5_min",
+            type=float,
+            default=None,
+            help="影響train/evaluate_hours/confidence_hours：只篩「平」，atr5>=門檻才留（見_atr5_mask()）",
+        )
         parser.add_argument(
             "--thresholds",
             type=float,
             nargs="*",
             default=None,
-            help="只影響confidence：信心度門檻清單（例：--thresholds 0.5 0.6 0.7），留空用預設清單",
+            help="只影響confidence_hours：信心度門檻清單（例：--thresholds 0.5 0.6 0.7），留空用預設清單",
         )
         parser.add_argument("--batch_size", type=int, default=256, help="batch size")
         parser.add_argument("--lr", type=float, default=1e-3, help="learning rate（只影響train）")
@@ -591,6 +649,7 @@ def main(
         eval_every = args.eval_every
         hour_start = args.hour_start
         hour_end = args.hour_end
+        atr5_min = args.atr5_min
         thresholds = args.thresholds
         batch_size = args.batch_size
         lr = args.lr
@@ -613,22 +672,16 @@ def main(
             start_date=start_date,
             end_date=end_date,
             force_rebuild=force_rebuild,
+            hour_start=hour_start,
+            hour_end=hour_end,
+            atr5_min=atr5_min,
         )
-    elif mode == "evaluate":
-        evaluate(test_days=test_days, start_date=start_date, end_date=end_date, batch_size=batch_size)
     elif mode == "evaluate_hours":
         evaluate_hours(
             hour_start=hour_start,
             hour_end=hour_end,
+            atr5_min=atr5_min,
             test_days=test_days,
-            start_date=start_date,
-            end_date=end_date,
-            batch_size=batch_size,
-        )
-    elif mode == "confidence":
-        confidence_report(
-            test_days=test_days,
-            thresholds=thresholds if thresholds else None,
             start_date=start_date,
             end_date=end_date,
             batch_size=batch_size,
@@ -639,32 +692,52 @@ def main(
             thresholds=thresholds if thresholds else None,
             hour_start=hour_start,
             hour_end=hour_end,
+            atr5_min=atr5_min,
             start_date=start_date,
             end_date=end_date,
             batch_size=batch_size,
         )
     else:
-        print(f"未知模式: {mode}，可用: train / evaluate / evaluate_hours / confidence / confidence_hours")
+        print(f"未知模式: {mode}，可用: train / evaluate_hours / confidence_hours")
 
 
 if __name__ == "__main__":
+    """
+    == Main 模式 ==
+
+    train             分chunk漸進訓練（固定筆數切成好幾個chunk，一次只載入一個
+                      chunk訓練、練完立刻釋放），記憶體不會隨資料總量增加而長大，
+                      範圍再大也不會OOM（2026-07-23新增、2026-07-24確認沒有明顯
+                      缺點後取代掉原本「所有月份合併成一包」的舊版train）。
+    evaluate_hours    讀已存模型，只看候選時間戳落在特定時段（預設9~10點）的
+                      樣本，印 accuracy/AUC/混淆矩陣（2026-07-24新增）。
+    confidence_hours  跟 evaluate_hours 一樣先篩時段，另外掃描不同信心度門檻
+                      （P(跌)/P(漲)要多高才判斷方向，不是只看argmax），驗證
+                      信心度高的預測是不是真的比較準，比照rally/mkt的
+                      confidence_report慣例（2026-07-24新增）。
+
+    2026-07-24：拿掉全天版本的evaluate/confidence——train()現在預設只訓練
+    9~10點候選，模型沒看過其他時段，全天評估的數字沒有意義。
+    """
+
     # ══════════════════════════════════════════════════════════════════════
     #  VS Code按F5：在這裡直接改變數，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "confidence"  # train / evaluate / evaluate_hours / confidence
+    mode = "train"  # train / evaluate_hours / confidence_hours
     test_days = 30
     max_rounds = 10  # 最多跑幾輪全部資料
     chunk_size = 1_000_000  # 每個chunk的筆數
     eval_every = 1  # 每幾個chunk評估一次（1=每個都評估）
-    hour_start = 9  # 只影響 evaluate_hours
-    hour_end = 10  # 只影響 evaluate_hours
-    thresholds = None  # 只影響 confidence，留None用預設清單[None,0.4,0.5,0.6,0.7,0.8]
+    hour_start = 9  # 影響 train/evaluate_hours/confidence_hours
+    hour_end = 10  # 影響 train/evaluate_hours/confidence_hours
+    atr5_min = None  # 只篩「平」，atr5>=門檻才留；還沒重新算門檻，先None（見experiments/atr5_flat_filter_check.py待補）
+    thresholds = None  # 只影響 confidence_hours，留None用預設清單[None,0.4,0.5,0.6,0.7,0.8]
     batch_size = 256
     lr = 1e-3
     patience = 3
-    start_date = "2025-01-01"  # 先限縮範圍測試基本架構跑不跑得通，之後再放寬
+    start_date = "2026-03-01"  # 先限縮範圍驗證這次大改（拿掉爆量特徵+atr5存進meta）跑不跑得通，之後再放寬
     end_date = ""
-    force_rebuild = False
+    force_rebuild = True  # channel數/meta欄位都變了（拿掉vol_ratio/direction、atr5存進meta），舊cache不能沿用
 
     main(
         mode=mode,
@@ -674,6 +747,7 @@ if __name__ == "__main__":
         eval_every=eval_every,
         hour_start=hour_start,
         hour_end=hour_end,
+        atr5_min=atr5_min,
         thresholds=thresholds,
         batch_size=batch_size,
         lr=lr,

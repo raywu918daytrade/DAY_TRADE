@@ -16,20 +16,24 @@ from strategy.cnn.dataset import BRANCH_CHANNELS, BRANCH_NAMES, N_CLASSES
 class _Branch(nn.Module):
     """單一分支：Conv1d → BatchNorm1d → ReLU，重複幾層，最後 AdaptiveAvgPool1d(1)
     壓成固定長度 embedding——不用手算每個分支卷積後的長度，五路輸入長度不同
-    （m1/m3/m5=30，m3_std=10，m5_std=6）、輸入channel數也不一定相同（m1/m3/
-    m3_std=5，m5/m5_std=7，2026-07-24新增爆量方向特徵後），也能共用同一個
-    class，只是每個分支建構時傳入各自的 in_channels（見 BRANCH_CHANNELS）。"""
+    （m1/m3/m5=10，m3_std=3，m5_std=2）、輸入channel數也不一定相同，也能共用
+    同一個class，只是每個分支建構時傳入各自的 in_channels（見 BRANCH_CHANNELS）。
+
+    2026-07-24：dilated conv（dilation=1,2,4，padding=dilation維持same-length
+    輸出）：感受野公式RF = 1+2*(1+2+4) = 15，蓋過縮小後最長的視窗（m1/m3/m5=
+    10步）還有餘裕。原本搭配30步視窗設計的是4層dilation=1,2,4,8（RF=31），視窗
+    縮小到10步後那組態明顯過深/過度覆蓋，改回3層對應更保守的capacity。"""
 
     def __init__(self, in_channels: int, embed_dim: int = 32):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv1d(in_channels, 16, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels, 16, kernel_size=3, padding=1, dilation=1),
             nn.BatchNorm1d(16),
             nn.ReLU(),
-            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.Conv1d(16, 32, kernel_size=3, padding=2, dilation=2),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Conv1d(32, embed_dim, kernel_size=3, padding=1),
+            nn.Conv1d(32, embed_dim, kernel_size=3, padding=4, dilation=4),
             nn.BatchNorm1d(embed_dim),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
