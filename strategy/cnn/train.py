@@ -723,7 +723,7 @@ if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     #  VS Code按F5：在這裡直接改變數，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "train"  # train / evaluate_hours / confidence_hours
+    mode = "confidence_hours"  # train / evaluate_hours / confidence_hours
     test_days = 30
     max_rounds = 10  # 最多跑幾輪全部資料
     chunk_size = 1_000_000  # 每個chunk的筆數
@@ -735,9 +735,9 @@ if __name__ == "__main__":
     batch_size = 256
     lr = 1e-3
     patience = 3
-    start_date = "2024-01-01"  # 先縮小到2026-01起（約7個月），看勝率會不會提高
+    start_date = "2024-01-01"  # 擴大到約2.5年，看訓練資料量對勝率的影響
     end_date = ""
-    force_rebuild = False  # 2026-01/02這兩個月還沒用新schema建過，需要重建
+    force_rebuild = False  # 不用整包重建：新月份會被逐月新鮮度檢查自動抓出來建，已建好的月份會跳過
 
     main(
         mode=mode,
