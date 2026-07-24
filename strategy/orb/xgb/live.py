@@ -11,6 +11,9 @@ build_prewarm_cache 全部沿用 strategy/orb 本體的實作，不重複寫一�
 THRESHOLD 查 strategy/orb/config.py 的 THRESHOLD_BY_MODEL["xgb"]，不要直接
 import該檔案的 THRESHOLD——那個是跟著 ORB_MODEL_TYPE 走的，可能對到別的模型
 （2026-07-22發現的bug，見 config.py 的說明）。
+
+DIRECTIONS：只送做多訊號（2026-07-23討論：orb 的標籤是二分類 Triple
+Barrier，「跌」代表突破失敗，不是放空訊號）。
 """
 
 from strategy.orb.config import SESSION_END, SESSION_START, THRESHOLD_BY_MODEL
@@ -18,10 +21,11 @@ from strategy.orb.predict import build_prewarm_cache, predict_live
 from strategy.orb.train import load_model_by_type
 
 THRESHOLD = THRESHOLD_BY_MODEL["xgb"]
+DIRECTIONS = {"up"}
 
 
 def load_model():
     return load_model_by_type("xgb")
 
 
-__all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "build_prewarm_cache", "THRESHOLD"]
+__all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "build_prewarm_cache", "THRESHOLD", "DIRECTIONS"]

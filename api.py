@@ -390,7 +390,9 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
     GET /strategies 查詢——例如要動態渲染幾組監控面板、每組叫什麼名字，不用
     等第一筆 monitoring/signals 事件送到才知道有幾個模型。
 
-    strategies: [{"name":..., "session_start":"HH:MM", "session_end":"HH:MM"}, ...]
+    strategies: [{"name":..., "session_start":"HH:MM", "session_end":"HH:MM",
+    "directions": ["up"]|["down"]|["up","down"]}, ...]——directions 給前端依此
+    幫策略欄位上色（2026-07-23討論：orb/rally 目前只做多，mkt 多空都送）。
     """
     global _strategies_registry
     _strategies_registry = {"strategies": strategies, "consensus_top_n": consensus_top_n}
@@ -588,7 +590,7 @@ def push_signals(minute_str: str, signals: list, strategy: str = ""):
                 "strategy": strategy,
                 "stock_id": s["stock_id"],
                 "name": s.get("name", s["stock_id"]),
-                "direction": "buy",
+                "direction": s.get("direction", "buy"),
                 "score": int(s["proba"] * 100),
                 "status": "signal_only",
                 "pnl_pct": None,
@@ -602,7 +604,7 @@ def push_signals(minute_str: str, signals: list, strategy: str = ""):
                 "stock_id": s["stock_id"],
                 "strategy": strategy,
                 "name": s.get("name", s["stock_id"]),
-                "direction": "buy",
+                "direction": s.get("direction", "buy"),
                 "signal_time": minute_str[11:],
                 "signal_price": s["price"],
                 "filled_avg": None,

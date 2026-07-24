@@ -52,9 +52,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 from data.query import load_day, load_m1, load_m3, load_m3_std, load_m5, load_m5_std
-from strategy.mkt.config import IDX_SYMBOL
+from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, TOP_N
 from strategy.mkt.features import (
     FEATURES,
+    add_atr5,
     add_bar_features,
     add_idx_gap_pct,
     add_m3_m5_features,
@@ -87,12 +88,13 @@ def _source_mtime() -> float:
 
 
 def _cache_path_for(top_n: int) -> Path:
-    """top_n=100（預設）用原本那份共用cache，跟現有行為完全一致；其他
-    top_n值各自存獨立檔案（2026-07-22討論）——top_n是在_prepare_data()
-    內部就套用的流動性過濾，不像start_date是事後才篩，如果共用同一份
-    cache，不同top_n會互相覆蓋、讀到錯的資料（例如拿top_n=300算出來的
-    cache，被誤判成新鮮的top_n=100結果直接回傳）。"""
-    return _CACHE_PATH if top_n == 100 else _ROOT / f"cache/mkt_prepared_top{top_n}.parquet"
+    """top_n=TOP_N（config.py正式設定，2026-07-25起=300）用原本那份共用
+    cache（mkt_prepared.parquet）；其他top_n值各自存獨立檔案（2026-07-22
+    討論）——top_n是在_prepare_data()內部就套用的流動性過濾，不像
+    start_date是事後才篩，如果共用同一份cache，不同top_n會互相覆蓋、
+    讀到錯的資料（例如拿top_n=100算出來的cache，被誤判成新鮮的
+    top_n=300結果直接回傳）。"""
+    return _CACHE_PATH if top_n == TOP_N else _ROOT / f"cache/mkt_prepared_top{top_n}.parquet"
 
 
 def _cache_is_fresh(cache_path: Path) -> bool:
@@ -102,7 +104,12 @@ def _cache_is_fresh(cache_path: Path) -> bool:
 
 
 def _prepare_data(
-    top_n: int = 100, hour: int = 9, minute_min: int = 11, minute_max: int = 30, use_cache: bool = False
+    top_n: int = TOP_N,
+    hour: int = 9,
+    minute_min: int = 11,
+    minute_max: int = 30,
+    use_cache: bool = False,
+    atr5_threshold: float = ATR5_FILTER_THRESHOLD,
 ) -> pd.DataFrame:
     """
     use_cache（2026-07-21討論）：
@@ -116,14 +123,24 @@ def _prepare_data(
                 流程並覆蓋掉舊cache。不用手動清cache、不用設定過期時間。
 
     top_n 不同值各自有獨立cache，見 _cache_path_for() 的說明。
+
+    atr5_threshold（2026-07-25新增）：只給 experiments/ 拿來測試不同ATR5
+    門檻用，預設就是正式設定 config.ATR5_FILTER_THRESHOLD。⚠️ 只要傳的值
+    跟正式設定不同，就完全跳過cache讀寫（不讀舊cache、也不寫檔案）——
+    cache只用 top_n 當key，不知道atr5_threshold是什麼，如果讓非預設門檻
+    也去讀寫同一份cache，會弄髒正式pipeline在用的cache檔案。這代表用非
+    預設門檻呼叫這支函式每次都會重新跑一次完整流程，比較慢，但只有
+    experiments/ 會這樣用，不影響正式train/predict。
     """
     cache_path = _cache_path_for(top_n)
-    if use_cache and cache_path.exists():
-        print(f"use_cache=True，直接讀取cache（不檢查來源資料有沒有更新）... [{cache_path.name}]")
-        return pd.read_parquet(cache_path)
-    if not use_cache and _cache_is_fresh(cache_path):
-        print(f"cache比來源資料新，直接讀取cache... [{cache_path.name}]")
-        return pd.read_parquet(cache_path)
+    skip_cache = atr5_threshold != ATR5_FILTER_THRESHOLD
+    if not skip_cache:
+        if use_cache and cache_path.exists():
+            print(f"use_cache=True，直接讀取cache（不檢查來源資料有沒有更新）... [{cache_path.name}]")
+            return pd.read_parquet(cache_path)
+        if not use_cache and _cache_is_fresh(cache_path):
+            print(f"cache比來源資料新，直接讀取cache... [{cache_path.name}]")
+            return pd.read_parquet(cache_path)
 
     print("載入分K...")
     m1 = load_m1()
@@ -158,6 +175,9 @@ def _prepare_data(
     # 上面 rolling 版意義不同，見 features.py::add_m3_m5_std_features() 的說明。
     df = add_m3_m5_std_features(df, load_m3_std(), load_m5_std())
 
+    print("算atr5（只拿來過濾用，不進FEATURES，見add_atr5()的說明）...")
+    df = add_atr5(df)
+
     print("計算3分類標籤（漲=2/平=1/跌=0）...")
     df["target"] = make_barrier_labels_3class(df)
 
@@ -168,9 +188,23 @@ def _prepare_data(
         (df["date"].dt.hour == hour) & (df["date"].dt.minute >= minute_min) & (df["date"].dt.minute < minute_max)
     ].copy()
 
+    print(f"ATR5平盤過濾：atr5>={atr5_threshold}（絕對門檻，跌/平/漲三類都篩，2026-07-23討論）...")
+    # ⚠️ 一定要放在所有lag/rolling特徵（add_bar_features/add_m3_m5_features/
+    # add_m3_m5_std_features）都算完、時段過濾之後才篩——這裡會刪列，放
+    # 太早會破壞shift(1)這類lag運算的分鐘連續性，見
+    # strategy/mkt/features.py::filter_by_atr5_percentile() 的說明（雖然
+    # 這裡沒有直接呼叫那支函式，但原理跟警告完全一樣）。
+    before_atr5 = len(df)
+    df = df[df["atr5"] >= atr5_threshold].copy()
+    print(f"  樣本數: {before_atr5:,} → {len(df):,}")
+
     df = df.dropna(subset=FEATURES + ["target"])
     df["target"] = df["target"].astype(int)
     print(f"有效樣本: {len(df):,} 筆")
+
+    if skip_cache:
+        print("atr5_threshold非正式設定，跳過cache寫入（避免弄髒正式cache）")
+        return df
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache_path)
@@ -553,13 +587,26 @@ _LOAD_MODEL_BY_TYPE = {"rfc": load_model, "xgb": load_model_xgb, "lgbm": load_mo
 _TRAIN_BY_TYPE = {"rfc": train, "xgb": train_xgb, "lgbm": train_lgbm}
 
 
+_model_cache: dict[str, object] = {}
+
+
 def load_model_by_type(model_type: str):
     """依 config.MODEL_TYPE（"rfc"/"xgb"/"lgbm"）載入對應模型，
     run_backtest.py 跟 live.py 共用這支，切換模型只要改 config.py 一個地方，
-    比照 strategy/rally/train.py、strategy/orb/train.py 的做法。"""
+    比照 strategy/rally/train.py、strategy/orb/train.py 的做法。
+
+    2026-07-25加記憶體快取（同一個 model_type 只從磁碟讀一次）：strategy/mkt/up、
+    strategy/mkt/down 這種「同一個模型、只是过濾方向不同」的變體，開機時會各自
+    呼叫一次 load_model_by_type(MODEL_TYPE)，沒有快取的話會重複 joblib.load()
+    出兩個不同物件，多佔記憶體；main/live_trader.py::on_minute() 的 predict_live()
+    結果快取也是靠「model物件是否同一個」判斷能不能共用同一分鐘的推論結果
+    （見該檔案說明），這裡回傳同一個物件，那層快取才會生效。
+    """
     if model_type not in _LOAD_MODEL_BY_TYPE:
         raise ValueError(f"未知 model_type: {model_type!r}，可用: {list(_LOAD_MODEL_BY_TYPE)}")
-    return _LOAD_MODEL_BY_TYPE[model_type]()
+    if model_type not in _model_cache:
+        _model_cache[model_type] = _LOAD_MODEL_BY_TYPE[model_type]()
+    return _model_cache[model_type]
 
 
 def main(

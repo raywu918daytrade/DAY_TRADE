@@ -14,7 +14,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from strategy.mkt.config import HOLD_BARS, IDX_SYMBOL, SL_PCT, TP_PCT
+from strategy.mkt.config import HOLD_BARS, IDX_SYMBOL, SL_PCT, TOP_N, TP_PCT
 
 
 def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFrame:
@@ -192,6 +192,62 @@ def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
     return m1
 
 
+def add_atr5(m1: pd.DataFrame) -> pd.DataFrame:
+    """
+    1分鐘K ATR(5)相對波動（True Range 5根滾動平均 / 當日開盤價），算法
+    跟 add_bar_features() 裡的 atr7 完全一樣，只是window改5（2026-07-23
+    討論）。除以day_open是為了讓不同股價水準的股票可以互相比較——同樣
+    5元的True Range，對NT$500的股票只是1%波動，對NT$20的股票卻是25%，
+    不除以股價沒辦法跨股票比較，這裡沿用atr7/range_pct/body_pct同樣的
+    慣例。
+
+    只拿來當 filter_by_atr5_percentile() 過濾「平盤」樣本的依據，**不進
+    FEATURES當模型輸入**——理由跟atr7/range_pct被拿掉一樣，這種純波動
+    幅度指標（不帶方向）當模型輸入時會被樹拿去做投機分裂、稀釋掉
+    ret_vs_idx等真正有方向性的訊號（見 FEATURES 那段 discussion note）。
+    當「篩選條件」用就沒有這個問題，因為它根本不會進到模型的輸入裡。
+
+    m1 需已有 stock_id/day_date/open/high/low/close 欄位。
+    """
+    m1 = m1.copy()
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    day_open = g_day["open"].transform("first").replace(0, np.nan)
+    prev_close = g_day["close"].shift(1).fillna(m1["open"])
+    m1["_tr5"] = np.maximum(
+        np.maximum((m1["high"] - m1["low"]).abs(), (m1["high"] - prev_close).abs()),
+        (m1["low"] - prev_close).abs(),
+    )
+    g_tr = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    m1["atr5"] = g_tr["_tr5"].transform(lambda x: x.rolling(5, min_periods=5).mean()) / day_open
+    m1 = m1.drop(columns=["_tr5"])
+    return m1
+
+
+def filter_by_atr5_percentile(m1: pd.DataFrame, min_pr: float = 0.3) -> pd.DataFrame:
+    """
+    跨股票、同一分鐘的ATR5排名過濾（2026-07-23討論）：同一分鐘，候選股票
+    互相比波動度，濾掉排名最後（最平盤）的一部分，只留下相對比較活躍的
+    股票。用「跨股票、同一時刻」排名而不是「同一支股票、自己的歷史分布」
+    ——沒有lookahead問題（不用回顧過去N天的歷史，只跟同一分鐘的其他候選
+    股票比），即時推論可以直接套用同一套邏輯，不用像day-K那些特徵一樣
+    處理「今天還沒收盤」的問題。
+
+    min_pr：百分位門檻（0~1），例如0.3代表濾掉每分鐘裡ATR5排名最後30%的
+    股票。⚠️ 目前是隨便先設的預設值，還沒看過實際分布/label密度驗證過，
+    正式使用前要先分析不同門檻對樣本量、「漲」樣本密度的影響再決定
+    （2026-07-23討論）。
+
+    ⚠️ 一定要放在 add_bar_features()/add_m3_m5_features()/
+    add_m3_m5_std_features() 等所有lag/rolling特徵都算完之後才呼叫——這裡
+    會刪列，如果放在算特徵之前，shift(1)這類lag運算會把不相鄰的兩根K棒
+    誤判成相鄰，特徵全部悄悄算錯（2026-07-23討論）。
+
+    m1 需已有 atr5 欄位（先呼叫 add_atr5()）、date 欄位。
+    """
+    pr = m1.groupby("date")["atr5"].rank(pct=True)
+    return m1[pr >= min_pr]
+
+
 def add_m3_m5_features(m1: pd.DataFrame, m3: pd.DataFrame, m5: pd.DataFrame) -> pd.DataFrame:
     """
     加 m3（3分鐘K）、m5（5分鐘K）的收盤價、成交量特徵（2026-07-20討論），
@@ -297,7 +353,7 @@ def top_n_by_prev_day_volume(m1: pd.DataFrame, n: int = 500) -> pd.DataFrame:
     return m1.merge(keep, on=["stock_id", "day_date"], how="inner")
 
 
-def top_n_stock_ids_by_latest_volume(m1_hist: pd.DataFrame, n: int = 100) -> set:
+def top_n_stock_ids_by_latest_volume(m1_hist: pd.DataFrame, n: int = TOP_N) -> set:
     """給即時推論用：從歷史 m1（load_m1()，不含今天，因為 db/m1 是收盤後才
     更新）取「最後一個交易日」全天成交量前 n 名股票代號，當作「今天」的
     流動性篩選名單。

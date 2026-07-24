@@ -100,86 +100,102 @@ set_strategies(
             "name": _s.name,
             "session_start": f"{_s.session_start[0]:02d}:{_s.session_start[1]:02d}",
             "session_end": f"{_s.session_end[0]:02d}:{_s.session_end[1]:02d}",
+            "directions": sorted(_s.directions),  # 前端依此上色（見 dashboard.html）
         }
         for _s in state.strategies.values()
     ],
     consensus_top_n=CONSENSUS_TOP_N,
 )
 
-print("載入模型...")
-sys.stdout.flush()
-try:
-    for _s in state.strategies.values():
-        _s.model = _s.load_model()
-        print(f"✓ [{_s.name}] 模型載入成功（{type(_s.model).__name__}）", flush=True)
-    _log_sys(f"模型載入成功：{[(s.name, type(s.model).__name__) for s in state.strategies.values()]}")
-except Exception as e:
-    print(f"✗ 模型載入失敗: {e}", flush=True)
-    raise
+def _startup():
+    """開機序列（模型載入／當沖標的清單／日K／盤前快取／交易引擎），搬進背景
+    執行緒跑（2026-07-25討論）：refresh_tickers() 拿掉 DAILY_REFRESH_TICKERS
+    開關後，每次開機都要重新跑一次均量排序+逐支查 canBuyDayTrade（811支×
+    sleep(0.25)≈3~4分鐘，見 fubon/subscribe_list.py::_filter_day_tradable()
+    的說明），這段邏輯寫在模組最外層、卡在 uvicorn.Server().run() 前面時，
+    整個 API 都還沒起來、前端連 SSE 一律「連線中斷」，要等這幾分鐘跑完
+    才能連上。搬成背景執行緒後 uvicorn 立刻起來，這些資料背景慢慢補齊。
 
-print("更新當沖標的清單...", flush=True)
-try:
-    _premarket.refresh_tickers(state)
-    print(f"  當沖標的（API）：{len(state.tickers)} 支", flush=True)
-except Exception as e:
-    print(f"✗ 取得當沖標的失敗: {e}", flush=True)
-    state.tickers = {}
-    state.day_trade_stocks = None
-
-# 盤中才有標的清單，非盤中跳過日K載入（省記憶體）；_daily_refresh 在 06:00 補載
-if state.day_trade_stocks:
-    print(f"[D1] 載入日K（{Phase.PRE_MARKET.value}）...", flush=True)
+    可以放心搬的原因：各策略 predict_live() 本來就有 model=None 時自動
+    load_model_by_type() 的 fallback（見 strategy/*/predict.py），collector
+    提早開始收資料、on_minute() 提早呼叫 predict_live() 也不會出錯，只是
+    model 還沒背景載完的那幾次呼叫會各自重新讀一次模型檔，效能小損失換
+    前端能立刻連上。
+    """
+    print("載入模型...")
+    sys.stdout.flush()
     try:
-        _premarket.refresh_day(state)
-        _d1_last = state.day["date"].max() if not state.day.empty else "無"
-        print(
-            f"✓ [D1] {len(state.day):,} 筆，{state.day['stock_id'].nunique():,} 支，最新日期：{_d1_last}",
-            flush=True,
-        )
-        _log_sys(f"D1 載入完成：{state.day['stock_id'].nunique() if not state.day.empty else 0} 支，最新 {_d1_last}")
+        for _s in state.strategies.values():
+            _s.model = _s.load_model()
+            print(f"✓ [{_s.name}] 模型載入成功（{type(_s.model).__name__}）", flush=True)
+        _log_sys(f"模型載入成功：{[(s.name, type(s.model).__name__) for s in state.strategies.values()]}")
     except Exception as e:
-        print(f"✗ [D1] 載入失敗: {e}", flush=True)
-        _log_sys(f"D1 載入失敗: {e}", "error")
+        print(f"✗ 模型載入失敗: {e}", flush=True)
+        return
+
+    print("更新當沖標的清單...", flush=True)
+    try:
+        _premarket.refresh_tickers(state)
+        print(f"  當沖標的（API）：{len(state.tickers)} 支", flush=True)
+    except Exception as e:
+        print(f"✗ 取得當沖標的失敗: {e}", flush=True)
+        state.tickers = {}
+        state.day_trade_stocks = None
+
+    # 盤中才有標的清單，非盤中跳過日K載入（省記憶體）；_daily_refresh 在 06:00 補載
+    if state.day_trade_stocks:
+        print(f"[D1] 載入日K（{Phase.PRE_MARKET.value}）...", flush=True)
+        try:
+            _premarket.refresh_day(state)
+            _d1_last = state.day["date"].max() if not state.day.empty else "無"
+            print(
+                f"✓ [D1] {len(state.day):,} 筆，{state.day['stock_id'].nunique():,} 支，最新日期：{_d1_last}",
+                flush=True,
+            )
+            _log_sys(f"D1 載入完成：{state.day['stock_id'].nunique() if not state.day.empty else 0} 支，最新 {_d1_last}")
+        except Exception as e:
+            print(f"✗ [D1] 載入失敗: {e}", flush=True)
+            _log_sys(f"D1 載入失敗: {e}", "error")
+            state.day = pd.DataFrame()
+    else:
         state.day = pd.DataFrame()
-else:
-    state.day = pd.DataFrame()
-    print("[D1] 非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
+        print("[D1] 非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
 
-print("盤前預算快取...", flush=True)
-try:
-    _premarket.refresh_prewarm(state)
-    print(f"✓ 盤前快取完成：{ {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()} }", flush=True)
-except Exception as e:
-    print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
-
-# 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
-run_startup_backfill(state)
-
-_threshold_str = ", ".join(f"{s.name}={s.threshold}" for s in state.strategies.values())
-print(f"就緒，等待盤中訊號（各策略門檻預設：{_threshold_str}）...", flush=True)
-
-if TRADE_MODE != "off":
+    print("盤前預算快取...", flush=True)
     try:
-        from sinopac.run_execute import make_executor
-
-        state.executor = make_executor(
-            TRADE_MODE,
-            TOTAL_CAPITAL,
-            name_lookup=lambda sid: state.tickers.get(sid, sid),
-        )
-        print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}", flush=True)
-        _log_sys(f"交易引擎啟動：{TRADE_MODE} 模式，資金={TOTAL_CAPITAL:,.0f}")
-        if hasattr(state.executor, "sync_from_broker"):
-            state.executor.sync_from_broker()
-        if hasattr(state.executor, "startup_sltp_check"):
-            state.executor.startup_sltp_check()
-        if hasattr(state.executor, "close_stock_now"):
-            from api import register_close_now
-
-            register_close_now(state.executor.close_stock_now)
+        _premarket.refresh_prewarm(state)
+        print(f"✓ 盤前快取完成：{ {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()} }", flush=True)
     except Exception as e:
-        print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
-        _log_sys(f"交易模組載入失敗: {e}", "error")
+        print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
+
+    # 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
+    run_startup_backfill(state)
+
+    _threshold_str = ", ".join(f"{s.name}={s.threshold}" for s in state.strategies.values())
+    print(f"就緒，等待盤中訊號（各策略門檻預設：{_threshold_str}）...", flush=True)
+
+    if TRADE_MODE != "off":
+        try:
+            from sinopac.run_execute import make_executor
+
+            state.executor = make_executor(
+                TRADE_MODE,
+                TOTAL_CAPITAL,
+                name_lookup=lambda sid: state.tickers.get(sid, sid),
+            )
+            print(f"交易模式：{TRADE_MODE}，資金={TOTAL_CAPITAL:,.0f}", flush=True)
+            _log_sys(f"交易引擎啟動：{TRADE_MODE} 模式，資金={TOTAL_CAPITAL:,.0f}")
+            if hasattr(state.executor, "sync_from_broker"):
+                state.executor.sync_from_broker()
+            if hasattr(state.executor, "startup_sltp_check"):
+                state.executor.startup_sltp_check()
+            if hasattr(state.executor, "close_stock_now"):
+                from api import register_close_now
+
+                register_close_now(state.executor.close_stock_now)
+        except Exception as e:
+            print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
+            _log_sys(f"交易模組載入失敗: {e}", "error")
 
 
 def _daily_refresh():
@@ -307,7 +323,21 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         volume_map = dict(zip(df["stock_id"].astype(str), df["volume"].astype(int)))
 
     all_signals = []
-    top_by_strategy: dict[str, list[dict]] = {}  # 各策略前N名（依proba排名，不管有沒有過門檻），給下面重疊比對用
+    # 各策略前N名，依方向分開存（見 main/config.py::CONSENSUS_TOP_N 的說明），
+    # 2026-07-23討論：mkt 同時有 up/down 兩種訊號，共識比對不能把兩個方向
+    # 混在一起排名——「A策略看漲、B策略看跌」不是共識，是分歧，一定要同方向
+    # 才算「多個模型都看好同一件事」。
+    top_by_direction: dict[str, dict[str, list[dict]]] = {"up": {}, "down": {}}
+    # 同一分鐘內，如果兩個策略共用同一個 predict_live 函式「且」同一個 model
+    # 物件（例如 mkt_up/mkt_down，見 strategy/mkt/up、strategy/mkt/down/live.py
+    # ——同一顆3分類模型，只是各自濾不同方向），代表算出來的東西完全一樣，
+    # 只是後面篩的方向不同，不用重跑一次推論。key 用 (predict_live函式本身,
+    # model物件) 的 id：orb_xgb/orb_lgbm 這種真的不同模型的，model物件不同、
+    # id不同，不會被誤判成可以共用（見 strategy/mkt/train.py::load_model_by_type()
+    # 的說明——那邊加了快取讓同一個 model_type 只從磁碟讀一次、回傳同一個
+    # 物件，這裡的判斷才會生效）。快取只在這個 on_minute() 呼叫內有效，下一
+    # 分鐘重新算，不用煩惱資料過期。
+    _infer_cache: dict[tuple[int, int], list[dict]] = {}
     for s in state.strategies.values():
         if (h, m) < s.session_start or (h, m) > s.session_end:
             continue  # 這個策略還沒開始/已經過了進場窗口，不產生新訊號（既有持倉SL/TP由下面reconcile統一監控，不受這裡影響）
@@ -318,16 +348,29 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         # 各自一個）。
         threshold = float(get_setting("threshold") or s.threshold)
 
-        all_results = s.predict_live(
-            minute_str,
-            state.day,
-            model=s.model,
-            threshold=0,
-            day_trade_stocks=state.day_trade_stocks,
-            m1_live=m1_live if not m1_live.empty else None,
-            **s.prewarm_cache,
-        )
+        cache_key = (id(s.predict_live), id(s.model))
+        if cache_key in _infer_cache:
+            raw_results = _infer_cache[cache_key]
+        else:
+            raw_results = s.predict_live(
+                minute_str,
+                state.day,
+                model=s.model,
+                threshold=0,
+                day_trade_stocks=state.day_trade_stocks,
+                m1_live=m1_live if not m1_live.empty else None,
+                **s.prewarm_cache,
+            )
+            _infer_cache[cache_key] = raw_results
+
+        # 只保留這個策略設定允許的方向（module.DIRECTIONS，見 main/state.py
+        # 的說明）——orb/rally 目前只送做多，即使哪天 predict_live() 不小心
+        # 也算出跌訊號，這裡會直接濾掉，不會送到前端。沒有 direction 欄位
+        # 的（orb/rally 現況）視為 "up"。dict(r) 淺拷貝一份，下面對 all_results
+        # 逐筆補欄位時才不會動到快取原始資料/另一個策略正在用的那份。
+        all_results = [dict(r) for r in raw_results if r.get("direction", "up") in s.directions]
         for r in all_results:
+            r["direction"] = r.get("direction", "up")
             r["name"] = state.tickers.get(r["stock_id"], r["stock_id"])
             r["strategy"] = s.name  # 保留來源策略，reconcile() 收到的合併清單才分得出是誰產生的
             r["volume"] = volume_map.get(r["stock_id"])
@@ -341,7 +384,10 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         all_signals.extend(signals)
 
         top = sorted(all_results, key=lambda x: -x["proba"])[:5]
-        top_by_strategy[s.name] = sorted(all_results, key=lambda x: -x["proba"])[:CONSENSUS_TOP_N]
+        for direction in ("up", "down"):
+            dir_results = [r for r in all_results if r["direction"] == direction]
+            if dir_results:
+                top_by_direction[direction][s.name] = sorted(dir_results, key=lambda x: -x["proba"])[:CONSENSUS_TOP_N]
         top_str = " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in top)
         print(
             f"  [{s.name}] 推論:{len(all_results)} 支  訊號:{len(signals)} 支（門檻={threshold:.2f}）  top5:[{top_str}]",
@@ -356,9 +402,13 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             _log_sys(f"[{s.name}] 訊號: {sig_str}")
 
     # 多策略共識訊號：等所有策略這分鐘都跑完，比對誰的前N名彼此重疊（見
-    # main/config.py 的 CONSENSUS_TOP_N）。2個以上策略同時看好同一支股票，
-    # 才算共識，跟各策略自己的 monitoring/signals 分開推送，不取代它們。
-    if len(top_by_strategy) >= 2:
+    # main/config.py 的 CONSENSUS_TOP_N）。2個以上策略同時看好同一支股票、
+    # 且方向相同，才算共識，跟各策略自己的 monitoring/signals 分開推送，
+    # 不取代它們。up/down 分開跑，各自可能各自產生一批共識（見上面
+    # top_by_direction 的說明）。
+    for direction, top_by_strategy in top_by_direction.items():
+        if len(top_by_strategy) < 2:
+            continue
         stock_hits: dict[str, dict[str, float]] = {}  # stock_id -> {策略名: proba}
         stock_names: dict[str, str] = {}
         for name, top in top_by_strategy.items():
@@ -369,6 +419,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             {
                 "stock_id": sid,
                 "name": stock_names[sid],
+                "direction": direction,
                 "strategies": sorted(probas.keys()),
                 "probas": probas,
             }
@@ -378,7 +429,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         if consensus:
             consensus.sort(key=lambda c: -sum(c["probas"].values()) / len(c["probas"]))
             push_consensus_signals(minute_str, consensus)
-            print(f"  [共識] {len(consensus)} 支同時進入 {CONSENSUS_TOP_N} 名內: "
+            print(f"  [共識-{direction}] {len(consensus)} 支同時進入 {CONSENSUS_TOP_N} 名內: "
                   + " ".join(f"{c['stock_id']}({'+'.join(c['strategies'])})" for c in consensus), flush=True)
 
     if price_map:
@@ -430,6 +481,9 @@ def _force_close_eod():
 
 
 if __name__ == "__main__":
+    # 開機序列（模型/當沖清單/日K/盤前快取/交易引擎）背景執行緒，讓 uvicorn
+    # 能立刻起來接受連線，不用等這些跑完（見 _startup() 的說明）。
+    threading.Thread(target=_startup, daemon=True).start()
     # 每日 08:45 更新排程
     threading.Thread(target=_daily_refresh, daemon=True).start()
     # 每日 13:25 強制平倉（當沖不過夜）

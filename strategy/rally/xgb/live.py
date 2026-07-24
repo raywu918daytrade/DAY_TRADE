@@ -12,6 +12,11 @@ rally 固定用 xgb 模型的即時交易介面 — 跟 strategy/rally/lgbm 是�
 THRESHOLD 查 strategy/rally/config.py 的 THRESHOLD_BY_MODEL["xgb"]，不要直接
 import該檔案的 THRESHOLD——那個是跟著 RALLY_MODEL_TYPE 走的，可能對到別的
 模型（2026-07-22發現的bug，見 config.py 的說明）。
+
+DIRECTIONS：這個策略只送做多訊號（2026-07-23討論：rally 的標籤是「先碰
+停利=漲/先碰停損=跌」，「跌」代表這次做多失敗，不是可以放空的訊號，模型
+沒學過「這支該放空」這件事，硬送出來品質會很差）。main/live_trader.py
+用這個過濾 predict_live() 回傳結果，不屬於這個集合的方向不會送到前端。
 """
 
 from strategy.rally.config import SESSION_END, SESSION_START, THRESHOLD_BY_MODEL
@@ -19,10 +24,11 @@ from strategy.rally.predict import predict_live
 from strategy.rally.train import load_model_by_type
 
 THRESHOLD = THRESHOLD_BY_MODEL["xgb"]
+DIRECTIONS = {"up"}
 
 
 def load_model():
     return load_model_by_type("xgb")
 
 
-__all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "THRESHOLD"]
+__all__ = ["load_model", "predict_live", "SESSION_START", "SESSION_END", "THRESHOLD", "DIRECTIONS"]

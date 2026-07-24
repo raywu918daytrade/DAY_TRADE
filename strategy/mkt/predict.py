@@ -17,9 +17,10 @@ import pandas as pd
 
 from data.query import load_day, load_m1, load_m1_live
 from data.resample import compute_m3, compute_m3_std, compute_m5, compute_m5_std
-from strategy.mkt.config import IDX_SYMBOL, MODEL_TYPE
+from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, MODEL_TYPE, TOP_N
 from strategy.mkt.features import (
     FEATURES,
+    add_atr5,
     add_bar_features,
     add_idx_gap_pct,
     add_m3_m5_features,
@@ -30,12 +31,28 @@ from strategy.mkt.features import (
 from strategy.mkt.train import _prepare_data, load_model_by_type
 
 
-def _up_proba(model, df: pd.DataFrame):
-    """取「漲」（class=2）那一欄機率，不假設 classes_ 順序（雖然目前sklearn
-    對整數標籤預設會照數值排序，仍明確用 class_idx 對應，避免哪天標籤改
-    成非數值/亂序時默默取錯欄）。"""
+def _class_proba(model, df: pd.DataFrame, cls: int):
+    """取指定類別（0=跌/1=平/2=漲）那一欄機率，不假設 classes_ 順序（雖然
+    目前sklearn對整數標籤預設會照數值排序，仍明確用 class_idx 對應，避免
+    哪天標籤改成非數值/亂序時默默取錯欄）。"""
     class_idx = {c: i for i, c in enumerate(model.classes_)}
-    return model.predict_proba(df[FEATURES])[:, class_idx[2]]
+    return model.predict_proba(df[FEATURES])[:, class_idx[cls]]
+
+
+def _up_proba(model, df: pd.DataFrame):
+    """取「漲」（class=2）那一欄機率——回測（predict()）跟共用回測引擎
+    backtest/intraday_platform.py 只吃單一（做多）機率矩陣，這裡維持原樣
+    不動；即時訊號（predict_live()）另外用 _down_proba() 補「跌」訊號，
+    見該函式說明。"""
+    return _class_proba(model, df, 2)
+
+
+def _down_proba(model, df: pd.DataFrame):
+    """取「跌」（class=0）那一欄機率——2026-07-23討論：這欄之前算出來後
+    直接被丟掉，即時訊號只看得到做多訊號。只加在 predict_live()（訊號層，
+    給前端顯示用），不動 predict()/共用回測引擎——那邊只認單一機率矩陣，
+    沒有方向概念，要支援回測/實際下單放空是完全另一個規模的工程。"""
+    return _class_proba(model, df, 0)
 
 
 def predict(model=None, test_days: int = 30, test_only: bool = True, use_cache: bool = False) -> pd.DataFrame:
@@ -66,7 +83,7 @@ def predict(model=None, test_days: int = 30, test_only: bool = True, use_cache: 
     return df_proba
 
 
-def build_prewarm_cache(top_n: int = 100) -> dict:
+def build_prewarm_cache(top_n: int = TOP_N) -> dict:
     """
     盤前預算快取 — 給 strategy/prewarm.py 統一呼叫的介面，比照
     strategy/orb/predict.py、strategy/rally/predict.py 的 build_prewarm_cache()。
@@ -120,7 +137,12 @@ def predict_live(
     先篩掉，之後就沒有基準可以算。所以這裡先對完整 m1_live 算完 ret_vs_idx，
     才排除 0050 本身、套用 top_n_stock_ids/day_trade_stocks 篩選。
 
-    回傳格式：[{"stock_id": ..., "proba": ..., "price": ...}, ...]
+    回傳格式：[{"stock_id": ..., "proba": ..., "price": ..., "direction": "up"|"down"}, ...]
+    ——同一支股票在同一分鐘理論上只會出現一次（做多機率、做空機率各自比
+    threshold，兩邊都沒過就不會出現；兩邊都過門檻的話兩筆都會回傳，但
+    「同時看漲又看跌」機率上幾乎不會發生，3分類機率加總=1，除非門檻設
+    很低）。純訊號，不是下單指令——direction 只是標記model判斷的方向，
+    見 2026-07-23 討論。
     """
     if model is None:
         model = load_model_by_type(MODEL_TYPE)
@@ -184,7 +206,17 @@ def predict_live(
     m5_std_live = compute_m5_std(df)
     df = add_m3_m5_std_features(df, m3_std_live, m5_std_live)
 
+    # atr5只拿來過濾用，不進FEATURES，見 features.py::add_atr5() 的說明。
+    df = add_atr5(df)
+
     current = df[df["date"] == pd.Timestamp(minute_str)]
+    if current.empty:
+        return []
+
+    # ATR5平盤過濾（絕對門檻，跌/平/漲一視同仁，2026-07-23討論）：跟
+    # train.py::_prepare_data() 用同一個門檻，train/test/上線推論三邊一致，
+    # 見 strategy/mkt/config.py::ATR5_FILTER_THRESHOLD 的說明。
+    current = current[current["atr5"] >= ATR5_FILTER_THRESHOLD]
     if current.empty:
         return []
 
@@ -192,10 +224,16 @@ def predict_live(
     if valid.empty:
         return []
 
-    proba = _up_proba(model, valid)
-    signals = [
-        {"stock_id": row["stock_id"], "proba": float(p), "price": float(row["close"])}
-        for (_, row), p in zip(valid.iterrows(), proba)
-        if p >= threshold
-    ]
+    up_proba = _up_proba(model, valid)
+    down_proba = _down_proba(model, valid)
+    signals = []
+    for (_, row), up_p, down_p in zip(valid.iterrows(), up_proba, down_proba):
+        if up_p >= threshold:
+            signals.append(
+                {"stock_id": row["stock_id"], "proba": float(up_p), "price": float(row["close"]), "direction": "up"}
+            )
+        if down_p >= threshold:
+            signals.append(
+                {"stock_id": row["stock_id"], "proba": float(down_p), "price": float(row["close"]), "direction": "down"}
+            )
     return sorted(signals, key=lambda x: -x["proba"])

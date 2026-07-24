@@ -31,6 +31,7 @@
         stocks = all_normal_stocks()    # 每次呼叫都現抓，不經過存檔的候選清單
 """
 import os
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -45,6 +46,37 @@ load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 _SUBSCRIBE_PATH = _ROOT / "db/fubon_subscribe/subscribe_list.parquet"
+
+# fubon_neo SDK 底層沒有設定任何 timeout（翻過套件原始碼確認過），網路/伺服器
+# 卡住的話 REST 呼叫可能無限期不回應，2026-07-25 討論加這層保護。
+_TICKER_CHECK_TIMEOUT = float(os.environ.get("FUBON_TICKER_CHECK_TIMEOUT", "8"))
+
+
+def _call_with_timeout(fn, timeout: float, *args):
+    """幫沒有內建 timeout 的呼叫包一個逾時保護。用 daemon thread（不是
+    concurrent.futures.ThreadPoolExecutor）——ThreadPoolExecutor 預設會在
+    process 結束時等所有丟進去的任務 join 完，真的卡住不回應的呼叫會讓
+    程式沒辦法乾淨結束；daemon thread 不會擋 process 退出，逾時就直接放棄
+    等待，底下那條線程若之後真的回應了，結果被丟棄，不影響呼叫端。
+    每次呼叫都開一支新的 thread（不是共用 pool），確保某支股票卡住不會
+    連帶拖慢後面要查的股票（各自獨立逾時，不會排隊等前一支放棄）。
+    """
+    result: dict = {}
+
+    def _target():
+        try:
+            result["value"] = fn(*args)
+        except Exception as e:  # noqa: BLE001
+            result["error"] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"逾時 {timeout} 秒未回應")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 def _fubon_normal_tickers() -> dict[str, str]:
@@ -90,7 +122,12 @@ def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
 
     放在 ranked_candidates() 之後（均量排序+截斷到 MAX_SUBSCRIPTIONS 之後）才做，
     只查最後入選的候選股，不用對全市場 ~2700 支都查一次（300次/分鐘的話要
-    9分鐘，候選股通常只有 1000 支內，約 4 分鐘內）。"""
+    9分鐘，候選股通常只有 1000 支內，約 4 分鐘內）。
+
+    每支呼叫都包 _call_with_timeout()（預設8秒，.env 的 FUBON_TICKER_CHECK_TIMEOUT
+    可調）——fubon_neo SDK 本身沒有 timeout，網路/伺服器卡住的話單一支股票可能
+    無限期不回應，2026-07-25 討論加這層保護，逾時當作查詢失敗、直接跳過那支，
+    不會拖住後面的股票（見 _call_with_timeout() 的說明）。"""
     from fubon import fubon_api as trade_api
 
     sdk, _ = trade_api.login()
@@ -99,13 +136,15 @@ def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
         trade_api.init_market_data(sdk)
         for sid in stock_ids:
             try:
-                info = trade_api.intraday_ticker(sdk, sid)
+                info = _call_with_timeout(trade_api.intraday_ticker, _TICKER_CHECK_TIMEOUT, sdk, sid)
                 # canDayTrade 先註解掉，不要求（2026-07-22：0050 這種正常標的
                 # 也會 canDayTrade=False/canBuyDayTrade=True，兩個都要求會把
                 # 它濾掉，先只看 canBuyDayTrade；不要刪，之後確認 canDayTrade
                 # 的正確用法再決定要不要恢復）。
                 if info.get("canBuyDayTrade"):  # and info.get("canDayTrade")
                     tradable.append(sid)
+            except TimeoutError as e:
+                print(f"  警告：{sid} intraday_ticker {e}，略過", flush=True)
             except Exception as e:
                 print(f"  警告：{sid} intraday_ticker 查詢失敗，略過: {e}", flush=True)
             time.sleep(0.25)  # 300次/分鐘上限，留緩衝

@@ -23,6 +23,13 @@ class StrategyState:
         # THRESHOLD 的做法（2026-07-21 討論：三個模型的機率校準不一定一樣，
         # 共用同一個門檻可能對某些策略太鬆或太嚴）。
         self.threshold = module.THRESHOLD
+        # 這個策略允許送出的訊號方向（module.DIRECTIONS，見各策略 live.py 的
+        # 說明）——2026-07-23討論：orb/rally 目前只有做多訊號堪用（{"up"}），
+        # mkt 多空都送（{"up","down"}）。on_minute() 依這個過濾
+        # predict_live() 回傳結果，不屬於這個集合的方向不會送到前端；也是
+        # 共識訊號拆成「多方」「空方」兩欄分開比對時，判斷這個策略算不算
+        # 進哪一欄的依據。
+        self.directions = module.DIRECTIONS
         self.model = None
         self.prewarm_cache: dict = {}
 
