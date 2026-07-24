@@ -6,10 +6,11 @@ cnn 策略 — 多解析度 1D CNN（CLI 進入點）
 不手工設計特徵，改把 5 種不同時間解析度的原始報價序列（m1/m3/m5 rolling、
 m3_std/m5_std 獨立K棒）各自接一個 Conv1D 分支（見 model.py），讓網路自己從
 多尺度原始序列裡學形狀。候選/label 比照 rally：全天每一根 m1 K 都是候選，
-label 是通用 triple barrier（未來 HOLD_BARS 根先漲 TP_PCT% 還是跌 SL_PCT%），
-不像 orb 那樣預先定義「事件觸發」規則去篩候選——用 CNN 的目的就是讓網路自己
-找形狀，人工先篩事件等於先用規則過濾掉可能學到的模式（rally 已實測過事件
-篩選的小樣本專門模型輸給全樣本通用模型，見 rally/experiments/breakout_specialist.py）。
+label 是3類 triple barrier（未來 HOLD_BARS 根先漲 TP_PCT% =漲、先跌 SL_PCT%
+=跌、都沒碰到=平，2026-07-24從2類改成3類），不像 orb 那樣預先定義「事件
+觸發」規則去篩候選——用 CNN 的目的就是讓網路自己找形狀，人工先篩事件等於
+先用規則過濾掉可能學到的模式（rally 已實測過事件篩選的小樣本專門模型輸給
+全樣本通用模型，見 rally/experiments/breakout_specialist.py）。
 
 本檔比照 strategy/mkt/train.py 的慣例：argparse + __main__ 直接寫在這支檔案
 自己身上，不另外開 entry.py 純轉發（cnn 是全新模組，直接照 mkt 這個較新、
@@ -21,16 +22,18 @@ confidence報表都還沒做，等這裡先證明有訊號了再回頭補。
 
 == Main 模式 ==
 
-train             一整包訓練（所有月份合併成一個資料集）。範圍小（1~2個月）
-                  適用，範圍大（7個月以上）在24GB機器上容易OOM，見
-                  train_sequential 的說明。
-train_sequential  分月漸進訓練，同一時間只有一個月的資料在記憶體裡，不會
-                  隨月份數增加而長大，範圍大時改用這個（2026-07-23新增）。
+train             分chunk漸進訓練（固定筆數切成好幾個chunk，一次只載入一個
+                  chunk訓練、練完立刻釋放），記憶體不會隨資料總量增加而長大，
+                  範圍再大也不會OOM（2026-07-23新增、2026-07-24確認沒有明顯
+                  缺點後取代掉原本「所有月份合併成一包」的舊版train）。
 evaluate          讀已存模型，在 test set 上印 accuracy/AUC/混淆矩陣
+evaluate_hours    跟 evaluate 一樣，但只看候選時間戳落在特定時段（例如
+                  9~10點）的樣本（2026-07-24新增）。
 """
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +47,14 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from strategy.cnn.config import DEVICE
-from strategy.cnn.dataset import BRANCH_NAMES, available_months, build_dataset, load_shard_branch, load_shard_meta
+from strategy.cnn.dataset import (
+    BRANCH_NAMES,
+    N_CLASSES,
+    available_months,
+    build_dataset,
+    load_shard_branch,
+    load_shard_meta,
+)
 from strategy.cnn.model import MultiScaleCNN
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -92,7 +102,7 @@ class ShardedMultiScaleDataset(Dataset):
             branch: torch.from_numpy(np.array(self._branch_arrays[(month, branch)][local_idx])).float()
             for branch in BRANCH_NAMES
         }
-        y = torch.tensor(self.target[i], dtype=torch.float32)
+        y = torch.tensor(self.target[i], dtype=torch.long)  # CrossEntropyLoss 要class index（long），不是float
         return x, y
 
 
@@ -103,7 +113,7 @@ def _month_bound(date_str: str) -> str:
 
 def _resolve_months_and_cutoff(test_days: int, start_date: str, end_date: str, force_rebuild: bool):
     """共用邏輯：確保cache建好、篩出符合範圍的月份、算出test/train切分的
-    cutoff日期。_split_data()/_load_test_ds()/train_sequential() 都靠這支
+    cutoff日期。_load_test_ds()/_load_test_ds_hours()/train() 都靠這支
     共用，避免每個地方各自重寫一份月份篩選+cutoff計算邏輯。"""
     build_dataset(start_date=start_date, end_date=end_date, force_rebuild=force_rebuild)
 
@@ -122,26 +132,6 @@ def _resolve_months_and_cutoff(test_days: int, start_date: str, end_date: str, f
     return months, metas, cutoff
 
 
-def _split_data(test_days: int, start_date: str = "", end_date: str = "", force_rebuild: bool = False):
-    """依日期切分 train/test，跟 rally/mkt 一致：test_days 是最後 N 天當測試集，
-    避免 in-sample 資料把績效灌水。回傳兩個 ShardedMultiScaleDataset（train/test），
-    不會把任何分支tensor整包讀進RAM（見 ShardedMultiScaleDataset 說明）。
-
-    只有 train()（一整包訓練，同時需要train_ds+test_ds）才呼叫這支——單純
-    評估用 _load_test_ds()，不要在這裡多建根本用不到的 train_ds。"""
-    months, metas, cutoff = _resolve_months_and_cutoff(test_days, start_date, end_date, force_rebuild)
-
-    train_filters, test_filters = {}, {}
-    for m, meta in metas.items():
-        dates = meta["date"].to_numpy()
-        train_filters[m] = np.nonzero(dates <= cutoff)[0]
-        test_filters[m] = np.nonzero(dates > cutoff)[0]
-
-    train_ds = ShardedMultiScaleDataset(months, train_filters)
-    test_ds = ShardedMultiScaleDataset(months, test_filters)
-    return train_ds, test_ds
-
-
 def _load_test_ds(
     test_days: int, start_date: str = "", end_date: str = "", force_rebuild: bool = False
 ) -> ShardedMultiScaleDataset:
@@ -153,97 +143,36 @@ def _load_test_ds(
     return ShardedMultiScaleDataset(months, test_filters)
 
 
-def train(
-    test_days: int = 10,
-    epochs: int = 10,
-    batch_size: int = 256,
-    lr: float = 1e-3,
-    patience: int = 3,
+def _load_test_ds_hours(
+    test_days: int,
+    hour_start: int,
+    hour_end: int,
     start_date: str = "",
     end_date: str = "",
     force_rebuild: bool = False,
-):
-    """patience：test_loss連續這麼多個epoch沒有改善就提早停止訓練（early
-    stopping），避免像2026-07-22半年/雙月測試那次一樣，train_loss一路降、
-    test_loss後段卻暴衝（過擬合），卻還是把最後一個epoch的model存下來。
-    最後存檔的一律是「test_loss最低那個epoch」的權重，不是最後一個epoch。"""
-    train_ds, test_ds = _split_data(test_days, start_date, end_date, force_rebuild)
-    print(f"\n訓練: {len(train_ds):,} 筆  測試: {len(test_ds):,} 筆")
-    print(f"訓練集標籤分佈: {pd.Series(train_ds.target).value_counts(normalize=True).round(4).to_dict()}")
+) -> ShardedMultiScaleDataset:
+    """跟 _load_test_ds() 一樣，但只保留候選時間戳落在 [hour_start, hour_end)
+    的樣本（例如9~10點窗口），evaluate_hours() 專用（2026-07-24新增）——
+    用來驗證模型在特定時段（例如最活躍的開盤前段）表現是否比整體平均更好。"""
+    months, metas, cutoff = _resolve_months_and_cutoff(test_days, start_date, end_date, force_rebuild)
+    test_filters = {}
+    for m, meta in metas.items():
+        dates = meta["date"]
+        hour = dates.dt.hour
+        mask = (dates.to_numpy() > cutoff) & (hour >= hour_start).to_numpy() & (hour < hour_end).to_numpy()
+        test_filters[m] = np.nonzero(mask)[0]
+    return ShardedMultiScaleDataset(months, test_filters)
 
-    # num_workers>0：ShardedMultiScaleDataset的資料是memmap（磁碟後端），shuffle=True
-    # 打亂順序後每個batch要湊的256筆會分散在磁碟各處，單一process逐筆讀取會變I/O瓶頸
-    # （2026-07-23實測：20分鐘CPU使用率只有~20%，一個epoch都跑不完）。開worker
-    # process平行讀取可以大幅緩解，不會改變任何訓練結果，只是加速資料讀取。
-    #
-    # ⚠️ 只有 train_loader 需要：test_loader 是 shuffle=False（循序讀取，本來就
-    # 沒有隨機存取I/O瓶頸）。第一次修的時候兩邊都開了 num_workers=4+
-    # persistent_workers=True，等於同時常駐 4+4=8 個worker process，每個都要
-    # 各自映射整批shard檔案，疊起來直接把訓練process搞死（2026-07-23實測：
-    # process被強制終止，只留下17個洩漏的semaphore警告）。train_loader也只用
-    # num_workers=2（不是4），降低同時存在的process數，避免重蹈覆轍。
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, persistent_workers=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
 
-    model = MultiScaleCNN().to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    # 類別不平衡加權：2026-07-22實測發現模型會偷懶學「無腦猜多數類別」
-    # （訓練集跌:漲=62:38時，AUC≈0.53、漲類別recall≈0）。pos_weight=負/正
-    # 樣本數比例，跟rally/mkt樹模型的class_weight="balanced"是同樣的概念，
-    # 只是BCEWithLogitsLoss這裡要自己算比例傳進去。
-    n_pos = int((train_ds.target == 1).sum())
-    n_neg = int((train_ds.target == 0).sum())
-    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32, device=DEVICE)
-    print(f"訓練集 漲:跌 = {n_pos}:{n_neg}，pos_weight={pos_weight.item():.4f}")
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    best_test_loss = float("inf")
-    best_state = None
-    epochs_without_improve = 0
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for x, y in train_loader:
-            x = {k: v.to(DEVICE) for k, v in x.items()}
-            y = y.to(DEVICE)
-            optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * len(y)
-        train_loss = total_loss / len(train_ds)
-
-        model.eval()
-        total_test_loss = 0.0
-        with torch.no_grad():
-            for x, y in test_loader:
-                x = {k: v.to(DEVICE) for k, v in x.items()}
-                y = y.to(DEVICE)
-                logits = model(x)
-                total_test_loss += criterion(logits, y).item() * len(y)
-        test_loss = total_test_loss / len(test_ds)
-        print(f"epoch {epoch}/{epochs}  train_loss={train_loss:.4f}  test_loss={test_loss:.4f}")
-
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            epochs_without_improve = 0
-        else:
-            epochs_without_improve += 1
-            if epochs_without_improve >= patience:
-                print(f"test_loss連續{patience}個epoch沒有改善，第{epoch}個epoch提早停止")
-                break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    _MODEL_PATH.parent.mkdir(exist_ok=True)
-    torch.save(model.state_dict(), _MODEL_PATH)
-    print(f"模型已存至 {_MODEL_PATH}（best test_loss={best_test_loss:.4f}）")
-    return model
+def _class_weights(target: np.ndarray) -> torch.Tensor:
+    """3類（跌/平/漲）的類別不平衡加權，跟rally/mkt樹模型的
+    class_weight="balanced"是同樣的概念：weight_c = 總筆數 / (類別數 × 該類別筆數)，
+    數量越少的類別權重越高，逼模型認真學稀有類別，不要偷懶只猜多數類別
+    （2026-07-22實測：不加權時模型會學會「無腦猜多數」這個偷懶策略）。"""
+    counts = np.array([(target == c).sum() for c in range(N_CLASSES)], dtype=np.float64)
+    counts = np.maximum(counts, 1)  # 避免除以0
+    weights = len(target) / (N_CLASSES * counts)
+    return torch.tensor(weights, dtype=torch.float32, device=DEVICE)
 
 
 def _build_row_chunks(
@@ -275,10 +204,11 @@ def _build_row_chunks(
     return chunks
 
 
-def train_sequential(
+def train(
     test_days: int = 30,
     max_rounds: int = 10,
     chunk_size: int = 1_000_000,
+    eval_every: int = 1,
     batch_size: int = 256,
     lr: float = 1e-3,
     patience: int = 3,
@@ -286,12 +216,12 @@ def train_sequential(
     end_date: str = "",
     force_rebuild: bool = False,
 ):
-    """分批漸進訓練——跟 train() 不同，不會把所有月份合併成一個大的
-    ShardedMultiScaleDataset。任何時間點記憶體裡只有「當下這一個chunk
-    （固定 chunk_size 筆，可能橫跨多個月份）的訓練資料」+「固定的小測試集」，
-    不會隨著資料總量增加而長大（2026-07-23實測：train() 那種一次開全部
-    月份memmap、shuffle打亂全範圍樣本的做法，7個月資料在24GB機器上就會逼近
-    OOM邊緣，18個月以上幾乎必炸）。
+    """分批漸進訓練——不會把所有月份合併成一個大的 ShardedMultiScaleDataset。
+    任何時間點記憶體裡只有「當下這一個chunk（固定 chunk_size 筆，可能橫跨
+    多個月份）的訓練資料」+「固定的小測試集」，不會隨著資料總量增加而長大
+    （2026-07-23實測：一次開全部月份memmap、shuffle打亂全範圍樣本的做法，
+    7個月資料在24GB機器上就會逼近OOM邊緣，18個月以上幾乎必炸，2026-07-24
+    確認分chunk版本沒有明顯缺點後直接取代掉那個版本，不再保留）。
 
     改成固定筆數切（不是按月份切）的原因：每個月份實際筆數差滿多（例如
     2月106萬筆、6月233萬筆，差超過2倍），按月切的話每個chunk記憶體用量會
@@ -300,7 +230,18 @@ def train_sequential(
 
     做法：外層跑最多 max_rounds 輪，每一輪依時間順序把訓練集切成的所有
     chunk依序各訓練1個epoch、訓練完立刻釋放該chunk資料，換下一個chunk；
-    每個chunk訓練完都用同一組固定測試集評估一次，記錄目前最佳checkpoint。
+    每 eval_every 個chunk才用固定測試集評估一次，記錄目前最佳checkpoint。
+
+    eval_every（2026-07-24新增）：2026-07-24實測發現，對165萬筆固定測試集
+    做一次推論本身要花不少時間，而原本「每個chunk都評估」等於這筆開銷被
+    重複幾十次（一次19個月的訓練切成35個chunk，就要重複評估35次以上），
+    很可能是訓練總耗時的主要來源。改成每eval_every個chunk才評估一次可以
+    大幅省下這筆重複開銷；代價是「抓到的best checkpoint」可能不是絕對最佳
+    點、而是附近稍微次佳的點（loss曲線通常連續變化，差異不大），且early
+    stopping會晚一點觸發（中間跳過的幾個chunk如果剛好在變差，要等下一次
+    評估點才會發現）——但因為存的一律是「目前為止最佳」的checkpoint，不是
+    「最後一個」，最終存下來的模型品質不會受影響，只是可能多訓練了幾個
+    無謂的chunk才停止（見討論）。
 
     ⚠️ Early stopping只在跑完「第一輪」（模型第一次看過完整時間範圍的廣度）
     之後才開始生效——第一輪進行中，模型可能只看過前面幾個chunk，評估結果
@@ -324,21 +265,22 @@ def train_sequential(
 
     # 類別不平衡加權：跟 train() 一樣的概念，這裡用全部月份訓練集部分的
     # target分佈先算好，訓練過程中固定不變。
-    n_pos = sum(
-        int((meta["target"].to_numpy()[meta["date"].to_numpy() <= cutoff] == 1).sum()) for meta in metas.values()
+    train_targets_per_month = [meta["target"].to_numpy()[meta["date"].to_numpy() <= cutoff] for meta in metas.values()]
+    all_train_targets = np.concatenate(train_targets_per_month)
+    class_weights = _class_weights(all_train_targets)
+    print(
+        f"訓練集標籤數: {[(all_train_targets == c).sum() for c in range(N_CLASSES)]}，"
+        f"class_weights={class_weights.tolist()}"
     )
-    n_neg = sum(
-        int((meta["target"].to_numpy()[meta["date"].to_numpy() <= cutoff] == 0).sum()) for meta in metas.values()
-    )
-    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32, device=DEVICE)
-    print(f"訓練集 漲:跌 = {n_pos}:{n_neg}，pos_weight={pos_weight.item():.4f}")
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    del train_targets_per_month, all_train_targets
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     best_test_loss = float("inf")
     best_state = None
     epochs_without_improve = 0
     stopped = False
 
+    chunk_counter = 0
     for round_idx in range(1, max_rounds + 1):
         for chunk_idx, row_filters in enumerate(chunks, start=1):
             chunk_months = list(row_filters.keys())
@@ -352,6 +294,7 @@ def train_sequential(
             # 不像train()合併版要面對1300萬筆，I/O瓶頸的嚴重度應該小很多。
             train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
 
+            train_t0 = time.time()
             model.train()
             total_loss = 0.0
             for x, y in train_loader:
@@ -365,8 +308,21 @@ def train_sequential(
                 total_loss += loss.item() * len(y)
             train_loss = total_loss / len(train_ds)
             n_train = len(train_ds)
+            train_sec = time.time() - train_t0
             del train_loader, train_ds  # 釋放這個chunk的memmap參照，才能真正回收記憶體
 
+            chunk_counter += 1
+            if chunk_counter % eval_every != 0:
+                # 跳過這次評估（見eval_every說明）：165萬筆測試集做一次推論本身
+                # 不便宜，每個chunk都評估等於這筆開銷被重複幾十次，是訓練總
+                # 耗時的主要來源之一。
+                print(
+                    f"round {round_idx}/{max_rounds}  chunk {chunk_idx}/{len(chunks)}  train_n={n_train:,}  "
+                    f"train_loss={train_loss:.4f}  train_sec={train_sec:.1f}  (跳過評估，eval_every={eval_every})"
+                )
+                continue
+
+            eval_t0 = time.time()
             model.eval()
             total_test_loss = 0.0
             with torch.no_grad():
@@ -376,9 +332,10 @@ def train_sequential(
                     logits = model(x)
                     total_test_loss += criterion(logits, y).item() * len(y)
             test_loss = total_test_loss / len(test_ds)
+            eval_sec = time.time() - eval_t0
             print(
                 f"round {round_idx}/{max_rounds}  chunk {chunk_idx}/{len(chunks)}  train_n={n_train:,}  "
-                f"train_loss={train_loss:.4f}  test_loss={test_loss:.4f}"
+                f"train_loss={train_loss:.4f}  test_loss={test_loss:.4f}  train_sec={train_sec:.1f}  eval_sec={eval_sec:.1f}"
             )
 
             if test_loss < best_test_loss:
@@ -414,36 +371,69 @@ def load_model() -> MultiScaleCNN:
     return model
 
 
-def evaluate(test_days: int = 10, start_date: str = "", end_date: str = "", batch_size: int = 256):
-    model = load_model()
-    test_ds = _load_test_ds(test_days, start_date, end_date)
+def _run_inference_and_report(model: MultiScaleCNN, test_ds: ShardedMultiScaleDataset, batch_size: int) -> None:
+    """對 test_ds 跑推論，印出 accuracy/AUC/混淆矩陣/分類報告——evaluate()跟
+    evaluate_hours()共用同一份報表邏輯，只差在test_ds怎麼篩出來的。"""
     test_target = test_ds.target
-    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    print(f"\n測試集: {len(test_target):,} 筆")
+    if len(test_target) == 0:
+        print("這個範圍沒有樣本可以評估。")
+        return
 
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
     all_probs = []
     with torch.no_grad():
         for x, _y in loader:
             x = {k: v.to(DEVICE) for k, v in x.items()}
-            probs = torch.sigmoid(model(x)).cpu().numpy()
+            probs = torch.softmax(model(x), dim=1).cpu().numpy()
             all_probs.append(probs)
-    probs = np.concatenate(all_probs)
-    y_pred = (probs >= 0.5).astype(int)
+    probs = np.concatenate(all_probs)  # (N, 3)
+    y_pred = probs.argmax(axis=1)
 
-    print(f"\n測試集: {len(test_target):,} 筆")
     print(f"Accuracy: {accuracy_score(test_target, y_pred):.4f}")
-    print(f"AUC: {roc_auc_score(test_target, probs):.4f}")
-    print("\n混淆矩陣（列=實際，欄=預測，順序 跌/漲）:")
-    print(confusion_matrix(test_target, y_pred, labels=[0, 1]))
+    # multi_class="ovr"：3分類沒有單一條ROC曲線，改用one-vs-rest各類別分別算
+    # AUC再平均，是sklearn處理多分類AUC的標準做法。
+    print(f"AUC (one-vs-rest): {roc_auc_score(test_target, probs, multi_class='ovr', labels=[0, 1, 2]):.4f}")
+    print("\n混淆矩陣（列=實際，欄=預測，順序 跌/平/漲）:")
+    print(confusion_matrix(test_target, y_pred, labels=[0, 1, 2]))
     print("\n分類報告:")
-    print(classification_report(test_target, y_pred, labels=[0, 1], target_names=["跌", "漲"], zero_division=0))
+    print(
+        classification_report(test_target, y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"], zero_division=0)
+    )
+
+
+def evaluate(test_days: int = 10, start_date: str = "", end_date: str = "", batch_size: int = 256):
+    model = load_model()
+    test_ds = _load_test_ds(test_days, start_date, end_date)
+    _run_inference_and_report(model, test_ds, batch_size)
+
+
+def evaluate_hours(
+    hour_start: int = 9,
+    hour_end: int = 10,
+    test_days: int = 10,
+    start_date: str = "",
+    end_date: str = "",
+    batch_size: int = 256,
+):
+    """只評估候選時間戳落在 [hour_start, hour_end) 的樣本（預設9~10點），
+    2026-07-24新增——用來驗證模型在特定時段（例如當沖最活躍的開盤前段）
+    表現是否比整體平均更好或更差，跟一開始討論LOOKBACK_MINUTES時想讓推論
+    盡量涵蓋9-10點活躍時段的初衷呼應。"""
+    model = load_model()
+    test_ds = _load_test_ds_hours(test_days, hour_start, hour_end, start_date, end_date)
+    print(f"時段篩選: {hour_start}:00~{hour_end}:00")
+    _run_inference_and_report(model, test_ds, batch_size)
 
 
 def main(
     mode: str = "",
-    test_days: int = 10,
-    epochs: int = 10,
+    test_days: int = 30,
     max_rounds: int = 10,
     chunk_size: int = 1_000_000,
+    eval_every: int = 1,
+    hour_start: int = 9,
+    hour_end: int = 10,
     batch_size: int = 256,
     lr: float = 1e-3,
     patience: int = 3,
@@ -455,15 +445,18 @@ def main(
     長度自動判斷用哪一種，兩者不會互相打架）：
 
       1. VS Code按F5：直接改下面 __main__ 裡的變數，不用打字。
-      2. 終端機帶參數：python -m strategy.cnn.train train --test_days 10
+      2. 終端機帶參數：python -m strategy.cnn.train train --test_days 30
 
     start_date/end_date：限制資料範圍（YYYY-MM-DD），第一次跑建議先限縮
     月份範圍，避免全量22個月資料第一次就跑很久（見 dataset.py 的效能備註）。
 
-    train 跟 train_sequential 的差異（2026-07-23討論）：train 把所有請求月份
-    合併成一包訓練，範圍一大（7個月以上）在24GB機器上容易OOM；train_sequential
-    改成依固定筆數（chunk_size）切成好幾個chunk、一次只載入一個chunk訓練、練完
-    立刻釋放，記憶體不會隨資料總量增加而長大，範圍大時改用這個。
+    train 依固定筆數（chunk_size）把資料切成好幾個chunk、一次只載入一個chunk
+    訓練、練完立刻釋放，記憶體不會隨資料總量增加而長大（2026-07-24：原本
+    另外有一個「一整包訓練」的版本，範圍一大就容易在24GB機器上OOM，實測後
+    確認分chunk版本沒有明顯缺點就直接取代掉，只留這一個）。
+
+    evaluate_hours：跟 evaluate 一樣讀已存模型評估，但只看候選時間戳落在
+    [hour_start, hour_end) 的樣本（預設9~10點，2026-07-24新增）。
     """
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(description="cnn 策略 — 多解析度 1D CNN")
@@ -471,22 +464,27 @@ def main(
             "mode",
             nargs="?",
             default="train",
-            choices=["train", "train_sequential", "evaluate"],
+            choices=["train", "evaluate", "evaluate_hours"],
             help="執行模式（預設train）",
         )
-        parser.add_argument("--test_days", type=int, default=10, help="測試集天數")
-        parser.add_argument("--epochs", type=int, default=10, help="訓練epoch數（只影響train）")
-        parser.add_argument("--max_rounds", type=int, default=10, help="最多跑幾輪全部資料（只影響train_sequential）")
+        parser.add_argument("--test_days", type=int, default=30, help="測試集天數")
+        parser.add_argument("--max_rounds", type=int, default=10, help="最多跑幾輪全部資料（只影響train）")
+        parser.add_argument("--chunk_size", type=int, default=1_000_000, help="每個chunk的筆數（只影響train）")
         parser.add_argument(
-            "--chunk_size", type=int, default=1_000_000, help="每個chunk的筆數（只影響train_sequential）"
+            "--eval_every",
+            type=int,
+            default=1,
+            help="每幾個chunk才評估一次（只影響train，預設1=每個都評估）",
         )
+        parser.add_argument("--hour_start", type=int, default=9, help="只影響evaluate_hours：起始小時（含）")
+        parser.add_argument("--hour_end", type=int, default=10, help="只影響evaluate_hours：結束小時（不含）")
         parser.add_argument("--batch_size", type=int, default=256, help="batch size")
-        parser.add_argument("--lr", type=float, default=1e-3, help="learning rate（只影響train/train_sequential）")
+        parser.add_argument("--lr", type=float, default=1e-3, help="learning rate（只影響train）")
         parser.add_argument(
             "--patience",
             type=int,
             default=3,
-            help="early stopping耐心值：test_loss連續幾次沒改善就停止（只影響train/train_sequential）",
+            help="early stopping耐心值：test_loss連續幾次沒改善就停止（只影響train）",
         )
         parser.add_argument("--start_date", type=str, default="", help="資料起日 YYYY-MM-DD")
         parser.add_argument("--end_date", type=str, default="", help="資料迄日 YYYY-MM-DD")
@@ -494,9 +492,11 @@ def main(
         args = parser.parse_args()
         mode = args.mode
         test_days = args.test_days
-        epochs = args.epochs
         max_rounds = args.max_rounds
         chunk_size = args.chunk_size
+        eval_every = args.eval_every
+        hour_start = args.hour_start
+        hour_end = args.hour_end
         batch_size = args.batch_size
         lr = args.lr
         patience = args.patience
@@ -509,19 +509,9 @@ def main(
     if mode == "train":
         train(
             test_days=test_days,
-            epochs=epochs,
-            batch_size=batch_size,
-            lr=lr,
-            patience=patience,
-            start_date=start_date,
-            end_date=end_date,
-            force_rebuild=force_rebuild,
-        )
-    elif mode == "train_sequential":
-        train_sequential(
-            test_days=test_days,
             max_rounds=max_rounds,
             chunk_size=chunk_size,
+            eval_every=eval_every,
             batch_size=batch_size,
             lr=lr,
             patience=patience,
@@ -531,32 +521,45 @@ def main(
         )
     elif mode == "evaluate":
         evaluate(test_days=test_days, start_date=start_date, end_date=end_date, batch_size=batch_size)
+    elif mode == "evaluate_hours":
+        evaluate_hours(
+            hour_start=hour_start,
+            hour_end=hour_end,
+            test_days=test_days,
+            start_date=start_date,
+            end_date=end_date,
+            batch_size=batch_size,
+        )
     else:
-        print(f"未知模式: {mode}，可用: train / train_sequential / evaluate")
+        print(f"未知模式: {mode}，可用: train / evaluate / evaluate_hours")
 
 
 if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     #  VS Code按F5：在這裡直接改變數，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "evaluate"  # train / train_sequential / evaluate
+    mode = "evaluate"  # train / evaluate / evaluate_hours
     test_days = 30
-    epochs = 10  # 只影響 train（一整包）
-    max_rounds = 10  # 只影響 train_sequential（分chunk）
-    chunk_size = 1_000_000  # 只影響 train_sequential，每個chunk的筆數
+    max_rounds = 10  # 最多跑幾輪全部資料
+    chunk_size = 1_000_000  # 每個chunk的筆數
+    eval_every = 1  # 每幾個chunk評估一次（1=每個都評估）
+    hour_start = 9  # 只影響 evaluate_hours
+    hour_end = 10  # 只影響 evaluate_hours
     batch_size = 256
     lr = 1e-3
     patience = 3
-    start_date = "2026-01-01"  # 先限縮範圍測試基本架構跑不跑得通，之後再放寬
+    start_date = "2025-01-01"  # 先限縮範圍測試基本架構跑不跑得通，之後再放寬
     end_date = ""
     force_rebuild = False
 
     main(
         mode=mode,
         test_days=test_days,
-        epochs=epochs,
         max_rounds=max_rounds,
         chunk_size=chunk_size,
+        eval_every=eval_every,
+        hour_start=hour_start,
+        hour_end=hour_end,
         batch_size=batch_size,
         lr=lr,
         patience=patience,

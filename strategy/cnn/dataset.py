@@ -57,16 +57,28 @@ _ROOT = Path(__file__).parent.parent.parent
 _CACHE_DIR = _ROOT / "cache/cnn"
 _SOURCE_DIRS = ["db/m1", "db/m3", "db/m5", "db/m3_std", "db/m5_std"]
 
-_WIDE_FEATURE_COLS = [
-    "m1_open", "m1_high", "m1_low", "m1_close", "m1_volume",
-    "m3_open", "m3_high", "m3_low", "m3_close", "m3_volume",
-    "m5_open", "m5_high", "m5_low", "m5_close", "m5_volume",
-]
-_STD_FEATURE_COLS = ["open", "high", "low", "close", "volume"]
+_M1_COLS = ["m1_open", "m1_high", "m1_low", "m1_close", "m1_volume"]
+# m3/m5 都多帶 vol_ratio/direction 兩個爆量方向特徵（2026-07-24新增，見
+# _add_volume_surge）——m3先加是因為3分K比5分K更快收出一根，同樣30分鐘窗口內
+# 能比等5分K早最多2分鐘偵測到爆量訊號。m1不用，因為m1本身已經是最細的顆粒度，
+# 沒有更快的timeframe可以提前偵測。_build_windows_for_keys()切分branch時要
+# 對齊這個長度。
+_M3_COLS = ["m3_open", "m3_high", "m3_low", "m3_close", "m3_volume", "m3_vol_ratio", "m3_direction"]
+_M5_COLS = ["m5_open", "m5_high", "m5_low", "m5_close", "m5_volume", "m5_vol_ratio", "m5_direction"]
+_WIDE_FEATURE_COLS = _M1_COLS + _M3_COLS + _M5_COLS
+
+# m3_std/m5_std 都多帶 vol_ratio/direction（跟rolling版本同樣的概念，算在
+# 獨立K棒上），兩者共用同一份欄位清單（_load_std_frame()統一都會算這兩欄）。
+_STD_FEATURE_COLS = ["open", "high", "low", "close", "volume", "vol_ratio", "direction"]
 
 BRANCH_NAMES = ["m1", "m3", "m5", "m3_std", "m5_std"]
 BRANCH_LENGTHS = {"m1": M1_LEN, "m3": M3_LEN, "m5": M5_LEN, "m3_std": M3STD_LEN, "m5_std": M5STD_LEN}
-N_CHANNELS = 5  # open/high/low/close/volume
+# 2026-07-24：m3/m3_std/m5/m5_std都多了vol_ratio/direction兩個爆量方向
+# channel（只有m1沒有），不再是每個分支都一樣的N_CHANNELS，改用per-branch的
+# BRANCH_CHANNELS（model.py靠這個決定每個分支的Conv1d輸入channel數）。
+BRANCH_CHANNELS = {"m1": 5, "m3": 7, "m5": 7, "m3_std": 7, "m5_std": 7}
+N_CHANNELS = 5  # open/high/low/close/volume（只有m1用，其餘另見BRANCH_CHANNELS）
+N_CLASSES = 3  # 跌/平/漲（2026-07-24從2類triple barrier改成3類，見 _barrier_label_numba）
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -83,6 +95,13 @@ def _barrier_label_numba(
     tp_pct: float,
     sl_pct: float,
 ) -> np.ndarray:
+    """3類 triple barrier（2026-07-24從2類改成3類）：
+      0 = 跌（SL先到）
+      1 = 平（完整 hold_bars 根都沒碰到 +tp_pct/-sl_pct 任一邊界）
+      2 = 漲（TP先到）
+    「平」不是門檻式定義（例如±0.5%），而是「兩個barrier都沒被觸發」這個
+    單純的事件——只要完整掃完hold_bars根都沒碰到任一邊，就算平，不看最後
+    一根的相對位置（舊版2類的做法）。"""
     n = len(closes)
     labels = np.full(n, np.nan)
     for i in range(n - 1):
@@ -107,11 +126,12 @@ def _barrier_label_numba(
                 hit = 0
                 break
         if hit == 1:
-            labels[i] = 1.0
+            labels[i] = 2.0  # 漲
         elif hit == 0:
-            labels[i] = 0.0
+            labels[i] = 0.0  # 跌
         elif last_j - i == hold_bars:
-            labels[i] = 1.0 if closes[last_j] > entry else 0.0
+            labels[i] = 1.0  # 平：完整掃完都沒碰到任一邊界
+        # else：當日剩餘bar數不足hold_bars且都沒碰到，維持NaN（樣本不完整，不算數）
     return labels
 
 
@@ -175,6 +195,50 @@ def _normalize_ohlcv(df: pd.DataFrame, prefix: str, day_open: pd.Series, g_day) 
     df[f"{prefix}_volume"] = df["volume"] / (cum_vol / bar_count).replace(0, np.nan)
 
 
+def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
+    """把 groupby(...).rolling(...) 產生的多層 index 結果攤平回跟原始 df 對齊的
+    Series（比照 rally features.py 的同名 helper）：用原生 GroupBy.rolling 取代
+    transform(lambda ...)，分組數一多（本專案動輒數萬個 stock×day 分組）效能
+    差非常多，前者走 pandas 內建向量化路徑。"""
+    n_key_levels = s.index.nlevels - 1
+    if n_key_levels:
+        s = s.reset_index(level=list(range(n_key_levels)), drop=True)
+    return s.reindex(index)
+
+
+def _add_volume_surge(
+    df: pd.DataFrame,
+    g_day,
+    vol_col: str,
+    open_col: str,
+    close_col: str,
+    ratio_out: str,
+    dir_out: str,
+    baseline_bars: int = 5,
+) -> None:
+    """爆量方向特徵（2026-07-24新增，使用者要求給m5 rolling跟m5_std用，不影響
+    m1/m3/m3_std）：
+      {ratio_out} = 這根量 / 前 baseline_bars 根的均量（不含當根自己，日內不跨日，
+                    比照使用者定義的「大於前5根均量 x 2」爆量門檻——這裡存的是
+                    連續比值，不是二元旗標，門檻判斷交給模型自己學，不硬編碼）
+      {dir_out}   = 這根K棒方向 (close-open)/open
+
+    baseline用「先shift(1)排除當根、再算rolling均值」兩步，都是原生GroupBy
+    操作（shift不用degroup，rolling要degroup），不用效能差的transform(lambda)。
+    """
+    shifted_col = f"_{vol_col}_shift1"
+    df[shifted_col] = g_day[vol_col].shift(1)
+    baseline = _degroup(
+        df.groupby(["stock_id", "day_date"], group_keys=False)[shifted_col].rolling(
+            baseline_bars, min_periods=baseline_bars
+        ).mean(),
+        df.index,
+    )
+    df[ratio_out] = df[vol_col] / baseline.replace(0, np.nan)
+    df[dir_out] = (df[close_col] - df[open_col]) / df[open_col].replace(0, np.nan)
+    df.drop(columns=shifted_col, inplace=True)
+
+
 def _load_wide_frame(start_date: str, end_date: str) -> pd.DataFrame:
     """把 m1/m3/m5（rolling，每分鐘一列）merge 成一張寬表，正規化 + 算 label。"""
     m1 = load_m1()
@@ -202,13 +266,27 @@ def _load_wide_frame(start_date: str, end_date: str) -> pd.DataFrame:
         bar_count = g_day[f"{prefix}_volume_raw"].transform("cumcount") + 1
         wide[f"{prefix}_volume"] = wide[f"{prefix}_volume_raw"] / (cum_vol / bar_count).replace(0, np.nan)
 
+    # 爆量方向特徵（m3/m5都要，2026-07-24新增，見_add_volume_surge說明）。用
+    # {prefix}_volume_raw（原始量，不是已經被累積均量正規化過的{prefix}_volume）
+    # 算比值，open/close此時已正規化過，但direction是比值(close-open)/open，
+    # 正規化不影響結果，順序不影響正確性。
+    for prefix in ["m3", "m5"]:
+        _add_volume_surge(
+            wide, g_day, vol_col=f"{prefix}_volume_raw", open_col=f"{prefix}_open", close_col=f"{prefix}_close",
+            ratio_out=f"{prefix}_vol_ratio", dir_out=f"{prefix}_direction", baseline_bars=5,
+        )
+
     wide["target"] = _make_barrier_labels(wide["stock_id"], wide["day_date"], wide["m1_close"])
     return wide
 
 
 def _load_std_frame(loader, start_date: str, end_date: str) -> pd.DataFrame:
     """m3_std/m5_std（獨立K棒）正規化。day_open 用自己這根K棒所屬交易日的
-    當日開盤價（跟 wide frame 用同一支股票同一天的 open 第一筆，數值上會對上）。"""
+    當日開盤價（跟 wide frame 用同一支股票同一天的 open 第一筆，數值上會對上）。
+
+    額外算vol_ratio/direction兩個爆量方向特徵（2026-07-24新增，m3_std/m5_std都
+    要），必須在volume被正規化覆蓋掉之前、用原始量計算（見_add_volume_surge），
+    所以呼叫順序放在正規化迴圈之前。"""
     df = loader()
     if start_date:
         df = df[df["date"] >= start_date]
@@ -218,6 +296,12 @@ def _load_std_frame(loader, start_date: str, end_date: str) -> pd.DataFrame:
     df["day_date"] = df["date"].dt.date
 
     g_day = df.groupby(["stock_id", "day_date"], group_keys=False)
+
+    _add_volume_surge(
+        df, g_day, vol_col="volume", open_col="open", close_col="close",
+        ratio_out="vol_ratio", dir_out="direction", baseline_bars=5,
+    )
+
     day_open = g_day["open"].transform("first").replace(0, np.nan)
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col] / day_open
@@ -233,7 +317,8 @@ def _load_std_frame(loader, start_date: str, end_date: str) -> pd.DataFrame:
 
 
 def _build_windows_for_keys(wide_groups, keys, m3_std_groups, m5_std_groups) -> tuple[dict, pd.DataFrame]:
-    """回傳 ({branch_name: np.ndarray shape (N, 5, branch_len)}, meta df[stock_id/date/target])，
+    """回傳 ({branch_name: np.ndarray shape (N, channels, branch_len)}, meta df[stock_id/date/target])，
+    channels 依分支不同（m1=5，其餘=7，見 BRANCH_CHANNELS），
     只處理 keys 這個子集的 (stock_id, day_date) 分組——呼叫端一次只傳一個月份的
     keys，藉此把記憶體峰值限制在「一個月的視窗量」（見檔頭「為什麼按月分片存」
     的說明），不是這支函式自己知道月份的概念。
@@ -260,7 +345,7 @@ def _build_windows_for_keys(wide_groups, keys, m3_std_groups, m5_std_groups) -> 
         m5std_day = m5_std_groups.get_group(key)
 
         arr = day_df[_WIDE_FEATURE_COLS].to_numpy(dtype=np.float32)
-        win = sliding_window_view(arr, M1_LEN, axis=0)  # (day_len-M1_LEN+1, 15, M1_LEN)
+        win = sliding_window_view(arr, M1_LEN, axis=0)  # (day_len-M1_LEN+1, 19, M1_LEN) — m1(5)+m3(7)+m5(7)
         cand_local_idx = np.arange(M1_LEN - 1, day_len)
         cand_dates = day_df["date"].to_numpy()[cand_local_idx]
         cand_targets = day_df["target"].to_numpy()[cand_local_idx]
@@ -287,8 +372,8 @@ def _build_windows_for_keys(wide_groups, keys, m3_std_groups, m5_std_groups) -> 
 
         rows3 = j3v[:, None] + offsets3[None, :]  # (n_valid, M3STD_LEN)
         rows5 = j5v[:, None] + offsets5[None, :]
-        w3 = m3std_arr[rows3].transpose(0, 2, 1)  # (n_valid, 5, M3STD_LEN)
-        w5 = m5std_arr[rows5].transpose(0, 2, 1)
+        w3 = m3std_arr[rows3].transpose(0, 2, 1)  # (n_valid, 7, M3STD_LEN)
+        w5 = m5std_arr[rows5].transpose(0, 2, 1)  # (n_valid, 7, M5STD_LEN)
 
         finite_std = np.isfinite(w3).all(axis=(1, 2)) & np.isfinite(w5).all(axis=(1, 2))
         if not finite_std.any():
@@ -305,11 +390,11 @@ def _build_windows_for_keys(wide_groups, keys, m3_std_groups, m5_std_groups) -> 
     if not meta_target:
         return {}, pd.DataFrame(columns=["stock_id", "date", "target"])
 
-    combined = np.concatenate(m1m3m5_list, axis=0)  # (N, 15, M1_LEN)
+    combined = np.concatenate(m1m3m5_list, axis=0)  # (N, 19, M1_LEN) — m1(5)+m3(7)+m5(7)
     branches = {
         "m1": combined[:, 0:5, :],
-        "m3": combined[:, 5:10, :],
-        "m5": combined[:, 10:15, :],
+        "m3": combined[:, 5:12, :],
+        "m5": combined[:, 12:19, :],
         "m3_std": np.concatenate(m3std_list, axis=0),
         "m5_std": np.concatenate(m5std_list, axis=0),
     }
