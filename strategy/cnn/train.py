@@ -29,6 +29,11 @@ train             分chunk漸進訓練（固定筆數切成好幾個chunk，一�
 evaluate          讀已存模型，在 test set 上印 accuracy/AUC/混淆矩陣
 evaluate_hours    跟 evaluate 一樣，但只看候選時間戳落在特定時段（例如
                   9~10點）的樣本（2026-07-24新增）。
+confidence        掃描不同信心度門檻（P(跌)/P(漲)要多高才判斷方向，不是只看
+                  argmax），驗證信心度高的預測是不是真的比較準，比照
+                  rally/mkt的confidence_report慣例（2026-07-24新增）。
+confidence_hours  跟 confidence 一樣，但只看候選時間戳落在特定時段（例如
+                  9~10點）的樣本（2026-07-24新增）。
 """
 
 import argparse
@@ -426,6 +431,84 @@ def evaluate_hours(
     _run_inference_and_report(model, test_ds, batch_size)
 
 
+def _predict_with_threshold(probs: np.ndarray, threshold: float | None) -> np.ndarray:
+    """threshold=None 用 argmax（機率最高的類別勝出，沒有信心度門檻概念）；
+    設 0~1 的數字時，改成「信心度夠了才判跌/漲，不然算平」的門檻式判法——
+    P(跌)>=threshold 判跌、P(漲)>=threshold 判漲（兩個都過門檻取機率較高的
+    那個），否則一律判平（class 1）。跟 strategy/mkt/train.py 的
+    _predict_with_threshold() 同樣的概念（2026-07-24新增）。"""
+    if threshold is None:
+        return probs.argmax(axis=1)
+
+    p_down = probs[:, 0]
+    p_up = probs[:, 2]
+    y_pred = np.ones(len(probs), dtype=int)  # 預設判平
+    down_pass = p_down >= threshold
+    up_pass = p_up >= threshold
+    y_pred[down_pass & ~up_pass] = 0
+    y_pred[up_pass & ~down_pass] = 2
+    both = down_pass & up_pass
+    y_pred[both] = np.where(p_up[both] >= p_down[both], 2, 0)
+    return y_pred
+
+
+_DEFAULT_THRESHOLDS: list[float | None] = [None, 0.4, 0.5, 0.6, 0.7, 0.8]
+
+
+def confidence_report(
+    test_days: int = 10,
+    thresholds: list[float | None] | None = None,
+    hour_start: int | None = None,
+    hour_end: int | None = None,
+    start_date: str = "",
+    end_date: str = "",
+    batch_size: int = 256,
+):
+    """掃描不同信心度門檻，看precision/recall/覆蓋率會不會隨門檻拉高而變好
+    ——驗證「模型自己覺得有把握的那些預測，是不是真的比準argmax（無門檻）
+    的預測還準」，比照 rally/mkt 的 confidence_report 慣例（2026-07-24新增）。
+    只跑一次推論、算好機率矩陣後，每個門檻只是重新篩選、不用重跑模型。
+
+    hour_start/hour_end 都給定時（2026-07-24新增），只評估候選時間戳落在
+    [hour_start, hour_end) 的樣本，跟 evaluate_hours() 同樣的篩選邏輯；
+    留 None（預設）就是全天，不篩時段。"""
+    thresholds = thresholds if thresholds is not None else _DEFAULT_THRESHOLDS
+
+    model = load_model()
+    if hour_start is not None and hour_end is not None:
+        test_ds = _load_test_ds_hours(test_days, hour_start, hour_end, start_date, end_date)
+        print(f"時段篩選: {hour_start}:00~{hour_end}:00")
+    else:
+        test_ds = _load_test_ds(test_days, start_date, end_date)
+    test_target = test_ds.target
+    print(f"\n測試集: {len(test_target):,} 筆")
+    if len(test_target) == 0:
+        print("測試集沒有樣本可以評估。")
+        return
+
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    all_probs = []
+    with torch.no_grad():
+        for x, _y in loader:
+            x = {k: v.to(DEVICE) for k, v in x.items()}
+            p = torch.softmax(model(x), dim=1).cpu().numpy()
+            all_probs.append(p)
+    probs = np.concatenate(all_probs)
+
+    for threshold in thresholds:
+        y_pred = _predict_with_threshold(probs, threshold)
+        label = "argmax（無門檻）" if threshold is None else f"信心度門檻={threshold:.2f}"
+        coverage = (y_pred != 1).mean()  # 判斷成跌/漲（不是平）的比例
+        print(f"\n── {label}，判斷覆蓋率(非平)={coverage:.4f} ──")
+        print(f"Accuracy: {accuracy_score(test_target, y_pred):.4f}")
+        print(confusion_matrix(test_target, y_pred, labels=[0, 1, 2]))
+        print(
+            classification_report(
+                test_target, y_pred, labels=[0, 1, 2], target_names=["跌", "平", "漲"], zero_division=0
+            )
+        )
+
+
 def main(
     mode: str = "",
     test_days: int = 30,
@@ -434,6 +517,7 @@ def main(
     eval_every: int = 1,
     hour_start: int = 9,
     hour_end: int = 10,
+    thresholds: list[float] | None = None,
     batch_size: int = 256,
     lr: float = 1e-3,
     patience: int = 3,
@@ -457,6 +541,9 @@ def main(
 
     evaluate_hours：跟 evaluate 一樣讀已存模型評估，但只看候選時間戳落在
     [hour_start, hour_end) 的樣本（預設9~10點，2026-07-24新增）。
+
+    confidence：掃描不同信心度門檻（P(跌)/P(漲)要多高才判斷方向，不是只看
+    argmax），驗證信心度高的預測是不是真的比較準（2026-07-24新增）。
     """
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(description="cnn 策略 — 多解析度 1D CNN")
@@ -464,7 +551,7 @@ def main(
             "mode",
             nargs="?",
             default="train",
-            choices=["train", "evaluate", "evaluate_hours"],
+            choices=["train", "evaluate", "evaluate_hours", "confidence", "confidence_hours"],
             help="執行模式（預設train）",
         )
         parser.add_argument("--test_days", type=int, default=30, help="測試集天數")
@@ -478,6 +565,13 @@ def main(
         )
         parser.add_argument("--hour_start", type=int, default=9, help="只影響evaluate_hours：起始小時（含）")
         parser.add_argument("--hour_end", type=int, default=10, help="只影響evaluate_hours：結束小時（不含）")
+        parser.add_argument(
+            "--thresholds",
+            type=float,
+            nargs="*",
+            default=None,
+            help="只影響confidence：信心度門檻清單（例：--thresholds 0.5 0.6 0.7），留空用預設清單",
+        )
         parser.add_argument("--batch_size", type=int, default=256, help="batch size")
         parser.add_argument("--lr", type=float, default=1e-3, help="learning rate（只影響train）")
         parser.add_argument(
@@ -497,6 +591,7 @@ def main(
         eval_every = args.eval_every
         hour_start = args.hour_start
         hour_end = args.hour_end
+        thresholds = args.thresholds
         batch_size = args.batch_size
         lr = args.lr
         patience = args.patience
@@ -530,21 +625,40 @@ def main(
             end_date=end_date,
             batch_size=batch_size,
         )
+    elif mode == "confidence":
+        confidence_report(
+            test_days=test_days,
+            thresholds=thresholds if thresholds else None,
+            start_date=start_date,
+            end_date=end_date,
+            batch_size=batch_size,
+        )
+    elif mode == "confidence_hours":
+        confidence_report(
+            test_days=test_days,
+            thresholds=thresholds if thresholds else None,
+            hour_start=hour_start,
+            hour_end=hour_end,
+            start_date=start_date,
+            end_date=end_date,
+            batch_size=batch_size,
+        )
     else:
-        print(f"未知模式: {mode}，可用: train / evaluate / evaluate_hours")
+        print(f"未知模式: {mode}，可用: train / evaluate / evaluate_hours / confidence / confidence_hours")
 
 
 if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     #  VS Code按F5：在這裡直接改變數，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "evaluate"  # train / evaluate / evaluate_hours
+    mode = "confidence"  # train / evaluate / evaluate_hours / confidence
     test_days = 30
     max_rounds = 10  # 最多跑幾輪全部資料
     chunk_size = 1_000_000  # 每個chunk的筆數
     eval_every = 1  # 每幾個chunk評估一次（1=每個都評估）
     hour_start = 9  # 只影響 evaluate_hours
     hour_end = 10  # 只影響 evaluate_hours
+    thresholds = None  # 只影響 confidence，留None用預設清單[None,0.4,0.5,0.6,0.7,0.8]
     batch_size = 256
     lr = 1e-3
     patience = 3
@@ -560,6 +674,7 @@ if __name__ == "__main__":
         eval_every=eval_every,
         hour_start=hour_start,
         hour_end=hour_end,
+        thresholds=thresholds,
         batch_size=batch_size,
         lr=lr,
         patience=patience,
