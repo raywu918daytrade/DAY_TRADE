@@ -43,8 +43,14 @@ def load_d1(stocks: set) -> tuple[pd.DataFrame, set]:
 def _load_d1_local(stocks: set) -> tuple[pd.DataFrame, set]:
     from data.query import load_day
 
-    full = load_day()
-    print(f"  [D1] 本機全量：{len(full):,} 筆，開始均量過濾...", flush=True)
+    # 均量過濾（_volume_filter()）只看每支股票最近20個交易日（.tail(20)），
+    # 策略特徵最長也只到 rolling(20) 左右——不需要 load_day() 預設的全部
+    # 歷史，60天留足夠緩衝應付連假（2026-07-25討論：這裡讀全部歷史是
+    # live_trader.py 記憶體爆掉的主因之一，見 data/query.py::load_day()
+    # 的說明）。
+    start_date = (pd.Timestamp.now() - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+    full = load_day(start_date=start_date)
+    print(f"  [D1] 最近{len(full):,} 筆，開始均量過濾...", flush=True)
     top = set(_volume_filter(stocks, full[["stock_id", "date", "volume"]]))
     # 額外帶上 0050，理由同 _load_d1_from_hf；top（候選股集合）仍不含 0050
     df = full[full["stock_id"].isin(top | {"0050"})].copy()

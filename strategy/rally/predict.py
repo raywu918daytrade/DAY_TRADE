@@ -17,6 +17,14 @@ from data.query import load_day, load_m1_live
 from strategy.rally.features import FEATURES, compute_m3, compute_m5, load_features, make_features
 from strategy.rally.train import load_model
 
+# 即時推論只需要最近一段 rolling window，不需要 load_day() 預設的全部歷史
+# （2026-07-25討論，見 strategy/mkt/predict.py 的說明）。
+_LOOKBACK_DAYS = 60
+
+
+def _recent_start_date() -> str:
+    return (pd.Timestamp.now() - pd.Timedelta(days=_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+
 
 def predict(
     model=None,
@@ -105,7 +113,7 @@ def predict_live(
 
     # make_features 以 day_date 做 merge；今日 day 資料尚不存在，補一行今日摘要
     if day is None:
-        day = load_day()
+        day = load_day(start_date=_recent_start_date())
     day = day.copy()
     day["date"] = pd.to_datetime(day["date"])
     today_ts = pd.Timestamp(date_str)

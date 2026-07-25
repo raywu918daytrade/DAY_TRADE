@@ -30,6 +30,16 @@ from strategy.mkt.features import (
 )
 from strategy.mkt.train import _prepare_data, load_model_by_type
 
+# 即時推論只需要最近一段 rolling window，不需要 load_m1()/load_day() 預設的
+# 全部歷史（2026-07-25討論：load_m1() 讀全部歷史一次要40秒+上百萬列，是
+# process 記憶體爆掉的主因之一）。60天遠超過這裡實際用到的「最後一個交易日
+# 均量排名」「昨收算跳空缺口」需求，留足夠緩衝應付連假。
+_LOOKBACK_DAYS = 60
+
+
+def _recent_start_date() -> str:
+    return (pd.Timestamp.now() - pd.Timedelta(days=_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+
 
 def _class_proba(model, df: pd.DataFrame, cls: int):
     """取指定類別（0=跌/1=平/2=漲）那一欄機率，不假設 classes_ 順序（雖然
@@ -96,7 +106,7 @@ def build_prewarm_cache(top_n: int = TOP_N) -> dict:
     回傳的 dict key 要跟 predict_live() 接受的參數名一致，因為
     main/live_trader.py 會直接 **cache 展開傳進 predict_live()。
     """
-    top_n_stock_ids = top_n_stock_ids_by_latest_volume(load_m1(), n=top_n)
+    top_n_stock_ids = top_n_stock_ids_by_latest_volume(load_m1(start_date=_recent_start_date()), n=top_n)
     return {"top_n_stock_ids": top_n_stock_ids}
 
 
@@ -172,7 +182,7 @@ def predict_live(
     # 理由同舊版day_ret_vs_idx實驗（已刪除）遇到的問題。也是要在排除0050
     # 之前算，理由同add_ret_vs_idx()。
     if day is None:
-        day = load_day()
+        day = load_day(start_date=_recent_start_date())
     day = day.copy()
     day["date"] = pd.to_datetime(day["date"])
     today_ts = pd.Timestamp(date_str)
@@ -185,7 +195,7 @@ def predict_live(
     df = df[df["stock_id"] != IDX_SYMBOL]
 
     if top_n_stock_ids is None:
-        top_n_stock_ids = top_n_stock_ids_by_latest_volume(load_m1())
+        top_n_stock_ids = top_n_stock_ids_by_latest_volume(load_m1(start_date=_recent_start_date()))
     df = df[df["stock_id"].isin(top_n_stock_ids)]
     if day_trade_stocks:
         df = df[df["stock_id"].isin(day_trade_stocks)]

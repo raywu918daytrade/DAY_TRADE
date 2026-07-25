@@ -22,9 +22,36 @@ import pyarrow.dataset as ds
 _ROOT = Path(__file__).parent.parent
 
 
-def load_m1() -> pd.DataFrame:
-    """載入 db/m1/ 全部歷史分K（訓練資料，~2787 支，按月分檔）"""
-    df = ds.dataset(str(_ROOT / "db/m1"), format="parquet").to_table().to_pandas()
+def _dataset_paths(dir_path: Path, start_date: str | None) -> str | list[str]:
+    """依 start_date 決定要讀哪些月份分檔的 parquet（2026-07-25討論）：這些
+    db/m1、db/fugle_day 等資料夾都是按月分檔（檔名格式 YYYY_MM.parquet），
+    即時推論通常只需要最近幾十天的資料算 rolling 特徵，不需要每次都把
+    資料庫存在以來的全部歷史（可能好幾年）都讀進記憶體——2026-07-25 實測
+    live_trader.py 因為這樣吃了快 6GB RSS。
+
+    start_date=None（預設）：回傳整個資料夾路徑，pyarrow 讀全部檔案，行為
+    跟改之前完全一樣，訓練/回測腳本不用改就不受影響。
+    start_date="YYYY-MM-DD"：只回傳「start_date 所在月份」到「最新月份」
+    這段範圍的檔案路徑（按月份粒度篩選，不逐筆篩到剛好那一天——多讀到
+    月初那幾天不影響 rolling 特徵計算，換取不用逐檔讀取後再篩選的複雜度）。
+    """
+    if start_date is None:
+        return str(dir_path)
+    cutoff = pd.Timestamp(start_date).strftime("%Y_%m")
+    files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")
+    return [str(f) for f in files if f.stem >= cutoff]
+
+
+def load_m1(start_date: str | None = None) -> pd.DataFrame:
+    """載入 db/m1/ 分K（訓練資料，~2787 支，按月分檔）。
+
+    start_date：選填 "YYYY-MM-DD"，只讀該月到最新月份的檔案，不重複載入
+    整個歷史（見 _dataset_paths() 的說明）；預設 None = 讀全部（訓練/回測
+    既有行為不變）。"""
+    paths = _dataset_paths(_ROOT / "db/m1", start_date)
+    if not paths:
+        return pd.DataFrame()
+    df = ds.dataset(paths, format="parquet").to_table().to_pandas()
     # 按月分檔的 parquet 中 date 欄位型別可能不一致（string / timestamp 混雜），
     # 用 format="mixed" 讓 pandas 逐筆判斷格式，避免鎖死單一格式時遇到例外格式就整批炸掉
     df["date"] = pd.to_datetime(df["date"], format="mixed")
@@ -32,9 +59,14 @@ def load_m1() -> pd.DataFrame:
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_day() -> pd.DataFrame:
-    """載入 db/fugle_day/ 全部日K（模型特徵用，按月分檔）"""
-    df = ds.dataset(str(_ROOT / "db/fugle_day"), format="parquet").to_table().to_pandas()
+def load_day(start_date: str | None = None) -> pd.DataFrame:
+    """載入 db/fugle_day/ 日K（模型特徵用，按月分檔）。
+
+    start_date：同 load_m1() 的說明，預設 None = 讀全部。"""
+    paths = _dataset_paths(_ROOT / "db/fugle_day", start_date)
+    if not paths:
+        return pd.DataFrame()
+    df = ds.dataset(paths, format="parquet").to_table().to_pandas()
     # 同上：按月分檔可能混雜不同型別的 date 欄位，用 format="mixed" 容忍
     df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
@@ -63,46 +95,66 @@ def load_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
     return df.sort_values("date").reset_index(drop=True)
 
 
-def load_m3() -> pd.DataFrame:
-    """載入 db/m3/ 全部 3 分鐘K，rolling 版本，每分鐘一列（由
-    build_m3_m5_rolling.py 預先聚合）"""
+def load_m3(start_date: str | None = None) -> pd.DataFrame:
+    """載入 db/m3/ 3 分鐘K，rolling 版本，每分鐘一列（由
+    build_m3_m5_rolling.py 預先聚合）。
+
+    start_date：同 load_m1() 的說明，預設 None = 讀全部。"""
     path = _ROOT / "db/m3"
     if not path.exists():
         return pd.DataFrame()
-    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    paths = _dataset_paths(path, start_date)
+    if not paths:
+        return pd.DataFrame()
+    df = ds.dataset(paths, format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_m5() -> pd.DataFrame:
-    """載入 db/m5/ 全部 5 分鐘K，rolling 版本，每分鐘一列（由
-    build_m3_m5_rolling.py 預先聚合）"""
+def load_m5(start_date: str | None = None) -> pd.DataFrame:
+    """載入 db/m5/ 5 分鐘K，rolling 版本，每分鐘一列（由
+    build_m3_m5_rolling.py 預先聚合）。
+
+    start_date：同 load_m1() 的說明，預設 None = 讀全部。"""
     path = _ROOT / "db/m5"
     if not path.exists():
         return pd.DataFrame()
-    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    paths = _dataset_paths(path, start_date)
+    if not paths:
+        return pd.DataFrame()
+    df = ds.dataset(paths, format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_m3_std() -> pd.DataFrame:
-    """載入 db/m3_std/ 全部標準獨立 3 分K棒，一根K棒一列（由
-    build_m3_m5_std.py 預先聚合）"""
+def load_m3_std(start_date: str | None = None) -> pd.DataFrame:
+    """載入 db/m3_std/ 標準獨立 3 分K棒，一根K棒一列（由
+    build_m3_m5_std.py 預先聚合）。
+
+    start_date：同 load_m1() 的說明，預設 None = 讀全部。"""
     path = _ROOT / "db/m3_std"
     if not path.exists():
         return pd.DataFrame()
-    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    paths = _dataset_paths(path, start_date)
+    if not paths:
+        return pd.DataFrame()
+    df = ds.dataset(paths, format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_m5_std() -> pd.DataFrame:
-    """載入 db/m5_std/ 全部標準獨立 5 分K棒，一根K棒一列（由
-    build_m3_m5_std.py 預先聚合）"""
+def load_m5_std(start_date: str | None = None) -> pd.DataFrame:
+    """載入 db/m5_std/ 標準獨立 5 分K棒，一根K棒一列（由
+    build_m3_m5_std.py 預先聚合）。
+
+    start_date：同 load_m1() 的說明，預設 None = 讀全部。"""
     path = _ROOT / "db/m5_std"
     if not path.exists():
         return pd.DataFrame()
-    df = ds.dataset(str(path), format="parquet").to_table().to_pandas()
+    paths = _dataset_paths(path, start_date)
+    if not paths:
+        return pd.DataFrame()
+    df = ds.dataset(paths, format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 

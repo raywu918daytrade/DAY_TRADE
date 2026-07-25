@@ -27,6 +27,16 @@ from strategy.orb.features import (
 )
 from strategy.orb.train import load_model_lgbm
 
+# 即時推論只需要最近一段 rolling window（build_history_tables() 最長用到
+# rolling(20)，約20個交易日≈28個日曆天），不需要 load_m1()/load_day() 預設
+# 的全部歷史（2026-07-25討論，見 strategy/mkt/predict.py 的說明）。60天留
+# 足夠緩衝應付連假。
+_LOOKBACK_DAYS = 60
+
+
+def _recent_start_date() -> str:
+    return (pd.Timestamp.now() - pd.Timedelta(days=_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+
 
 def predict(
     model=None,
@@ -78,7 +88,7 @@ def build_prewarm_cache() -> dict:
     回傳的 dict key 要跟 predict_live() 接受的參數名一致，因為
     main/live_trader.py 會直接 **cache 展開傳進 predict_live()。
     """
-    open_vol_history, hourly_tr_history = build_history_tables(load_m1())
+    open_vol_history, hourly_tr_history = build_history_tables(load_m1(start_date=_recent_start_date()))
     return {"open_vol_history": open_vol_history, "hourly_tr_history": hourly_tr_history}
 
 
@@ -130,10 +140,10 @@ def predict_live(
         return []
 
     if open_vol_history is None or hourly_tr_history is None:
-        open_vol_history, hourly_tr_history = build_history_tables(load_m1())
+        open_vol_history, hourly_tr_history = build_history_tables(load_m1(start_date=_recent_start_date()))
 
     if day is None:
-        day = load_day()
+        day = load_day(start_date=_recent_start_date())
     day = day.copy()
     day["date"] = pd.to_datetime(day["date"])
     today_ts = pd.Timestamp(date_str)
