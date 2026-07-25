@@ -110,8 +110,12 @@ def _parse_candle(raw: bytes | str) -> dict | None:
 class FubonM1Collector:
     """管理最多 5 條 candles WebSocket 連線，收到的分K先 buffer，定期存檔。"""
 
-    def __init__(self, on_minute=None):
+    def __init__(self, on_minute=None, backfill_done=None):
         self._on_minute = on_minute
+        # threading.Event（見 main/state.py::AppState.backfill_done 的說明），
+        # _backfill_intraday() 補完才 set()，讓呼叫端（on_minute）知道資料
+        # 缺口補齊了沒有。留空（手動測試/單獨跑這個檔案時）就不做這個追蹤。
+        self._backfill_done = backfill_done
         self._sdk = None
         self._clients: list = []
         self._buffer: dict[tuple[str, str], dict] = {}  # (stock_id, minute_str) -> row
@@ -166,7 +170,12 @@ class FubonM1Collector:
         _log_sys(f"富邦 WebSocket 訂閱完成：{total} 支（{len(self._clients)} 條連線）")
 
         # WebSocket 已經在收即時資料了，backfill 補「連線前」的缺口丟到背景執行緒，
-        # 不卡住即時資料流入（尤其是盤中重啟的情境）。
+        # 不卡住即時資料流入（尤其是盤中重啟的情境）。先 clear()：每次重新連線
+        # （包含 main/collector.py 自動重試時建立的新 collector 實例）都要重新
+        # 走一次「還沒補完」的狀態，不能沿用上一輪（可能是舊 process 或舊連線）
+        # 留下的、已經 set() 過的舊狀態。
+        if self._backfill_done:
+            self._backfill_done.clear()
         date_str = datetime.now(_TW).strftime("%Y-%m-%d")
         all_symbols = [sid for batch in batches for sid in batch]
         self._total_subscribed = len(all_symbols)
@@ -250,6 +259,8 @@ class FubonM1Collector:
         msg = f"[backfill] 完成，{got[0]}/{len(symbols)} 支有資料（{elapsed:.1f}s）"
         print(msg, flush=True)
         _log_sys(f"富邦 backfill 完成 {date_str}：{got[0]}/{len(symbols)} 支（{elapsed:.1f}s）")
+        if self._backfill_done:
+            self._backfill_done.set()
 
     # ── 定期存檔（只負責把 buffer 寫進 db/m1_live/，不觸發 on_minute）──────
 

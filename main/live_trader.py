@@ -380,9 +380,19 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     # 物件，這裡的判斷才會生效）。快取只在這個 on_minute() 呼叫內有效，下一
     # 分鐘重新算，不用煩惱資料過期。
     _infer_cache: dict[tuple[int, int], list[dict]] = {}
+    # 盤中重啟時 db/m1_live/ 可能有缺口，collector 的 _backfill_intraday()
+    # 補完前先跳過整段推論（2026-07-25討論）——資料不完整時貿然推論，算出來
+    # 的機率不可靠。K線/報價（上面已經推送）不受影響照常更新；既有持倉的
+    # SL/TP 監控（下面 reconcile()）也不受影響，只有「這一分鐘要不要產生
+    # 新訊號」被擋住。見 main/state.py::AppState.backfill_done 的說明。
+    _backfill_pending = not state.backfill_done.is_set()
+    if _backfill_pending:
+        print(f"[on_minute] {minute_str[11:16]} 分K缺口還沒補完，這一分鐘先跳過推論", flush=True)
     for s in state.strategies.values():
         if (h, m) < s.session_start or (h, m) > s.session_end:
             continue  # 這個策略還沒開始/已經過了進場窗口，不產生新訊號（既有持倉SL/TP由下面reconcile統一監控，不受這裡影響）
+        if _backfill_pending:
+            continue
 
         # 每分鐘從 settings 讀信心度，允許前端即時調整；沒設定才 fallback 該
         # 策略自己的預設值（見 main/state.py::StrategyState 的說明——三個
@@ -536,7 +546,7 @@ def _run_collector_after_startup():
     collector 開始，確保兩邊不會同時摸到同一個 model。
     """
     _startup_done.wait()
-    _collector.start_collector(on_minute)
+    _collector.start_collector(on_minute, backfill_done=state.backfill_done)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@
 其他模組（premarket.py/backfill.py/collector.py）都吃這個物件的參照，
 不再用模組級 global 變數。
 """
+import threading
+
 import pandas as pd
 
 
@@ -52,3 +54,13 @@ class AppState:
         # 2026-07-13：交易先暫停，多策略同時跑訊號時怎麼分資金/處理同股票
         # 衝突還沒設計，見 main/config.py 的 STRATEGY_MODULES 說明。
         self.executor = None
+
+        # 盤中重啟時，db/m1_live/ 可能有缺口（連線建立前那段沒有即時資料），
+        # fubon/marketdata_ws.py::FubonM1Collector._backfill_intraday() 會用
+        # REST 補這個缺口，補完才 set() 這個 flag（2026-07-25討論）。
+        # main/live_trader.py::on_minute() 用這個決定要不要先跳過推論——沒補完
+        # 前，m1_live 資料不完整，貿然推論算出來的機率不可靠，寧可先不推論
+        # （K線/報價還是照樣更新，不受影響），等補完再開始正常判斷訊號。
+        # 開機前如果 db/m1_live/ 本來就沒有缺口（例如開盤前就啟動），這個
+        # backfill 幾乎瞬間跑完，不會有感覺得到的延遲。
+        self.backfill_done = threading.Event()

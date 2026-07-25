@@ -25,7 +25,7 @@ from api import append_system_log as _log_sys, set_collector_status
 _COLLECTOR_RETRY_DELAY = int(os.environ.get("COLLECTOR_RETRY_DELAY", "10"))
 
 
-def start_collector(on_minute) -> None:
+def start_collector(on_minute, backfill_done=None) -> None:
     """分K收集器背景執行緒，異常時更新 collector 狀態供 /health 回傳，並自動重試。
 
     collector.start() 是長時間 block 的主迴圈（WebSocket 連線），任何未預期
@@ -33,13 +33,17 @@ def start_collector(on_minute) -> None:
     _COLLECTOR_RETRY_DELAY 秒、重新建立一個全新的 collector 實例再試一次
     （不重用崩潰的舊實例，避免帶著壞掉的連線/session 狀態），不設重試上限
     ——只要還在交易時段，就應該持續嘗試恢復，不要停擺到需要人工發現。
+
+    backfill_done：threading.Event（見 main/state.py::AppState.backfill_done
+    的說明），原封不動傳給每一輪新建立的 FubonM1Collector，讓 on_minute()
+    知道這一輪連線的資料缺口補完了沒有。
     """
     from fubon.marketdata_ws import FubonM1Collector
 
     attempt = 0
     while True:
         attempt += 1
-        collector = FubonM1Collector(on_minute=on_minute)
+        collector = FubonM1Collector(on_minute=on_minute, backfill_done=backfill_done)
         try:
             set_collector_status("running")
             collector.start()
