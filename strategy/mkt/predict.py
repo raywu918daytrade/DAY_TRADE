@@ -93,7 +93,7 @@ def predict(model=None, test_days: int = 30, test_only: bool = True, use_cache: 
     return df_proba
 
 
-def build_prewarm_cache(top_n: int = TOP_N) -> dict:
+def build_prewarm_cache(top_n: int = TOP_N, day_trade_stocks: set | None = None) -> dict:
     """
     盤前預算快取 — 給 strategy/prewarm.py 統一呼叫的介面，比照
     strategy/orb/predict.py、strategy/rally/predict.py 的 build_prewarm_cache()。
@@ -102,6 +102,11 @@ def build_prewarm_cache(top_n: int = TOP_N) -> dict:
     前算一次、整天沿用，不要讓 predict_live() 每分鐘都重算一次
     top_n_stock_ids_by_latest_volume(load_m1())（load_m1() 讀全部歷史分K，
     很慢）。
+
+    day_trade_stocks：strategy/prewarm.py 統一傳入的當沖候選清單，這裡不用
+    ——mkt 自己就是要「依均量排名重新選出 top_n」，用途跟 day_trade_stocks
+    那份候選清單不同，收下只是為了跟其他策略維持同一組介面，不要拿去篩資料
+    （會變成拿候選清單去篩「用來決定候選清單的原始資料」，邏輯本末倒置）。
 
     回傳的 dict key 要跟 predict_live() 接受的參數名一致，因為
     main/live_trader.py 會直接 **cache 展開傳進 predict_live()。
@@ -183,6 +188,12 @@ def predict_live(
     # 之前算，理由同add_ret_vs_idx()。
     if day is None:
         day = load_day(start_date=_recent_start_date())
+        if day_trade_stocks:
+            # 0050 一定要留著，不管有沒有在 day_trade_stocks 裡——下面
+            # add_idx_gap_pct() 要靠 day 裡的 0050 列算跳空缺口，被濾掉
+            # 的話這個特徵會整批變 NaN（同樣的坑見 strategy/rally/predict.py
+            # 的說明）。
+            day = day[day["stock_id"].isin(day_trade_stocks | {IDX_SYMBOL})]
     day = day.copy()
     day["date"] = pd.to_datetime(day["date"])
     today_ts = pd.Timestamp(date_str)

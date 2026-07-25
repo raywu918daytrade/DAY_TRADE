@@ -76,7 +76,7 @@ def predict(
     return df_proba
 
 
-def build_prewarm_cache() -> dict:
+def build_prewarm_cache(day_trade_stocks: set | None = None) -> dict:
     """
     盤前預算快取 — 給 strategy/prewarm.py 統一呼叫的介面（見該檔案說明）。
 
@@ -85,10 +85,19 @@ def build_prewarm_cache() -> dict:
     不要讓 predict_live() 每分鐘都自己重跑一次 build_history_tables()
     （那是留給沒有傳快取時的 fallback，不是正常路徑該走的）。
 
+    day_trade_stocks：今天的當沖候選清單（2026-07-25討論）——predict_live()
+    最終只會對這份候選清單裡的股票算特徵，這裡如果不篩、對全市場~3000支都
+    算一次 build_history_tables()，算完的結果裡有 2000 多支根本用不到，
+    白白多花記憶體/時間。有傳的話先篩再算；沒傳（例如手動測試時）就照舊
+    對全市場算，行為不變。
+
     回傳的 dict key 要跟 predict_live() 接受的參數名一致，因為
     main/live_trader.py 會直接 **cache 展開傳進 predict_live()。
     """
-    open_vol_history, hourly_tr_history = build_history_tables(load_m1(start_date=_recent_start_date()))
+    m1 = load_m1(start_date=_recent_start_date())
+    if day_trade_stocks:
+        m1 = m1[m1["stock_id"].isin(day_trade_stocks)]
+    open_vol_history, hourly_tr_history = build_history_tables(m1)
     return {"open_vol_history": open_vol_history, "hourly_tr_history": hourly_tr_history}
 
 
@@ -140,10 +149,15 @@ def predict_live(
         return []
 
     if open_vol_history is None or hourly_tr_history is None:
-        open_vol_history, hourly_tr_history = build_history_tables(load_m1(start_date=_recent_start_date()))
+        _hist_m1 = load_m1(start_date=_recent_start_date())
+        if day_trade_stocks:
+            _hist_m1 = _hist_m1[_hist_m1["stock_id"].isin(day_trade_stocks)]
+        open_vol_history, hourly_tr_history = build_history_tables(_hist_m1)
 
     if day is None:
         day = load_day(start_date=_recent_start_date())
+        if day_trade_stocks:
+            day = day[day["stock_id"].isin(day_trade_stocks)]
     day = day.copy()
     day["date"] = pd.to_datetime(day["date"])
     today_ts = pd.Timestamp(date_str)

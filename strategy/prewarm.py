@@ -17,10 +17,16 @@ build_prewarm_cache() 做法：寫一個同名函式、在該策略的 live.py r
 """
 
 
-def build_prewarm_cache(strategy_module) -> dict:
+def build_prewarm_cache(strategy_module, day_trade_stocks: set | None = None) -> dict:
     """strategy_module 是 main/live_trader.py 用 STRATEGY_MODULE 動態載入好的
-    那個策略模組（例如 strategy.orb.live），這裡不重複 import，直接吃現成的。"""
+    那個策略模組（例如 strategy.orb.live），這裡不重複 import，直接吃現成的。
+
+    day_trade_stocks：今天的當沖候選清單（main/premarket.py::refresh_tickers()
+    算好的，見 refresh_prewarm() 的說明），2026-07-25 起統一傳給每個策略的
+    build_prewarm_cache()——不是每個策略都用得到（例如 mkt 自己算流動性排名，
+    不受這份清單限制），用不到的策略在自己的 build_prewarm_cache() 簽名裡
+    收下、忽略即可，維持所有策略同一組介面。"""
     builder = getattr(strategy_module, "build_prewarm_cache", None)
     if builder is None:
         return {}
-    return builder()
+    return builder(day_trade_stocks=day_trade_stocks)

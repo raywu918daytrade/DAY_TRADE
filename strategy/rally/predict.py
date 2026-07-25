@@ -114,6 +114,13 @@ def predict_live(
     # make_features 以 day_date 做 merge；今日 day 資料尚不存在，補一行今日摘要
     if day is None:
         day = load_day(start_date=_recent_start_date())
+        if day_trade_stocks:
+            # 0050 一定要留著，不管有沒有在 day_trade_stocks 裡——下面
+            # add_idx_day_features()（大盤代理特徵）要靠 day 裡的 0050 列
+            # 算 idx_day_ret_*/idx_day_atr，這些是廣播給全部個股用的，0050
+            # 被濾掉的話這組特徵會整批變 NaN（2026-07-22 在 canDayTrade
+            # 過濾那次踩過同一種坑，見 fubon/subscribe_list.py 的說明）。
+            day = day[day["stock_id"].isin(day_trade_stocks | {"0050"})]
     day = day.copy()
     day["date"] = pd.to_datetime(day["date"])
     today_ts = pd.Timestamp(date_str)

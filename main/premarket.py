@@ -48,6 +48,12 @@ def refresh_day(state) -> None:
 def refresh_prewarm(state) -> None:
     """重算每個策略各自的盤前快取，寫入對應 StrategyState.prewarm_cache。
     策略不需要就回傳空 dict（見 strategy/prewarm.py），predict_live() 展開
-    空 dict 等於沒有額外參數。"""
+    空 dict 等於沒有額外參數。
+
+    帶入 state.day_trade_stocks（2026-07-25討論）：orb 的 build_prewarm_cache()
+    要載入全歷史分K算 open_vol_history/hourly_tr_history，這份候選清單已經
+    先算好了，讓它可以只算候選股那幾百支的歷史彙總表，不用連全市場~3000支
+    都算一次、算完又因為 predict_live() 只吃候選股而白算（見
+    strategy/orb/predict.py::build_prewarm_cache() 的說明）。"""
     for s in state.strategies.values():
-        s.prewarm_cache = build_prewarm_cache(s.module)
+        s.prewarm_cache = build_prewarm_cache(s.module, day_trade_stocks=state.day_trade_stocks)
