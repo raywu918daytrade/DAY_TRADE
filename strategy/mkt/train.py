@@ -744,7 +744,7 @@ if __name__ == "__main__":
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
     model_type = "xgb"  # rfc / xgb / lgbm
     use_cache = True  # 只有 mode="evaluate"/"confidence" 用得到
-    start_date = "2024-07-01"  # 只有 mode="train" 用得到；留 None = 用全部歷史
+    start_date = "2024-01-01"  # 只有 mode="train" 用得到；留 None = 用全部歷史
     main(
         mode=mode,
         test_days=test_days,

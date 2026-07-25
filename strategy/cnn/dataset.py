@@ -282,6 +282,19 @@ def _add_market_relative(df: pd.DataFrame, day_open: pd.Series, idx_symbol: str)
     return df
 
 
+def _normalize_rolling_prefix(df: pd.DataFrame, prefix: str, day_open: pd.Series, g_day) -> None:
+    """m3/m5（rolling版本）正規化：OHLC除以day_open，volume除以累積均量比值。
+    跟_normalize_ohlcv()同樣道理，獨立成一支函式是因為rolling版本欄位命名多一個
+    {prefix}_volume_raw中繼欄（原始量，覆蓋掉之前已經正規化過的{prefix}_volume）。
+    抽出來是2026-07-25新增build_live_candidates()時順便做的重構，避免即時推論
+    跟_load_wide_frame()各自維護一份一模一樣的正規化邏輯、日後容易失去同步。"""
+    for col in ["open", "high", "low", "close"]:
+        df[f"{prefix}_{col}"] = df[f"{prefix}_{col}"] / day_open
+    cum_vol = g_day[f"{prefix}_volume_raw"].transform("cumsum")
+    bar_count = g_day[f"{prefix}_volume_raw"].transform("cumcount") + 1
+    df[f"{prefix}_volume"] = df[f"{prefix}_volume_raw"] / (cum_vol / bar_count).replace(0, np.nan)
+
+
 def _load_wide_frame(start_date: str, end_date: str) -> pd.DataFrame:
     """把 m1/m3/m5（rolling，每分鐘一列）merge 成一張寬表，正規化 + 算 label。"""
     m1 = load_m1()
@@ -311,14 +324,21 @@ def _load_wide_frame(start_date: str, end_date: str) -> pd.DataFrame:
 
     _normalize_ohlcv(wide, "m1", day_open, g_day)
     for prefix in ["m3", "m5"]:
-        for col in ["open", "high", "low", "close"]:
-            wide[f"{prefix}_{col}"] = wide[f"{prefix}_{col}"] / day_open
-        cum_vol = g_day[f"{prefix}_volume_raw"].transform("cumsum")
-        bar_count = g_day[f"{prefix}_volume_raw"].transform("cumcount") + 1
-        wide[f"{prefix}_volume"] = wide[f"{prefix}_volume_raw"] / (cum_vol / bar_count).replace(0, np.nan)
+        _normalize_rolling_prefix(wide, prefix, day_open, g_day)
 
     wide["target"] = _make_barrier_labels(wide["stock_id"], wide["day_date"], wide["m1_close"])
     return wide
+
+
+def _normalize_std_frame(df: pd.DataFrame, g_day, day_open: pd.Series) -> None:
+    """m3_std/m5_std（獨立K棒）正規化：OHLC除以day_open，volume除以累積均量
+    比值——跟_load_std_frame()原本的內容一樣，抽出來給build_live_candidates()
+    即時推論共用，理由同_normalize_rolling_prefix()。"""
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col] / day_open
+    cum_vol = g_day["volume"].transform("cumsum")
+    bar_count = g_day["volume"].transform("cumcount") + 1
+    df["volume"] = df["volume"] / (cum_vol / bar_count).replace(0, np.nan)
 
 
 def _load_std_frame(loader, start_date: str, end_date: str) -> pd.DataFrame:
@@ -333,13 +353,8 @@ def _load_std_frame(loader, start_date: str, end_date: str) -> pd.DataFrame:
     df["day_date"] = df["date"].dt.date
 
     g_day = df.groupby(["stock_id", "day_date"], group_keys=False)
-
     day_open = g_day["open"].transform("first").replace(0, np.nan)
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col] / day_open
-    cum_vol = g_day["volume"].transform("cumsum")
-    bar_count = g_day["volume"].transform("cumcount") + 1
-    df["volume"] = df["volume"] / (cum_vol / bar_count).replace(0, np.nan)
+    _normalize_std_frame(df, g_day, day_open)
     return df
 
 
@@ -441,6 +456,111 @@ def _build_windows_for_keys(wide_groups, keys, m3_std_groups, m5_std_groups) -> 
         "atr5": np.concatenate(meta_atr5).astype(np.float32),
     })
     return branches, meta
+
+
+def build_live_candidates(m1_live: pd.DataFrame, minute_str: str) -> tuple[dict, list, np.ndarray]:
+    """即時推論用（2026-07-25新增，strategy/cnn/predict.py::predict_live()專用）：
+    對m1_live（單日、全部候選股票）算出「當下這一分鐘」每支股票各自最新的
+    5路分支視窗+atr5，不是像_build_windows_for_keys()那樣批次算「一整天所有
+    候選」——即時推論每次呼叫只需要當下這一分鐘的判斷，不需要整天的視窗。
+
+    m3/m5（rolling）跟m3_std/m5_std用data/resample.py共用的compute_m3()/
+    compute_m5()/compute_m3_std()/compute_m5_std()現算（batch版是讀
+    db/m3、db/m3_std等預算檔案，即時版跟rally/orb/mkt的predict_live()一樣，
+    現算才會有「今天」的資料）。正規化/atr5/ma/大盤相對特徵直接重用
+    _load_wide_frame()同一套_add_atr_ma()/_add_market_relative()/
+    _normalize_ohlcv()/_normalize_rolling_prefix()/_normalize_std_frame()，
+    保證跟訓練用的公式完全一致。
+
+    回傳 (branches, stock_ids, atr5)：
+      branches: {branch_name: np.ndarray (N, channels, branch_len)}，N=通過
+                資料完整性檢查（視窗填滿、無NaN）的候選股票數
+      stock_ids: 長度N的股票代號，跟branches/atr5逐列對齊
+      atr5: 長度N，候選當下這一步的atr5（未套用門檻，呼叫端自己決定要不要篩、
+            篩多嚴——見predict.py的ATR5_FILTER_THRESHOLD說明）
+
+    候選股票這一分鐘沒有資料（停牌/無成交）、或視窗涵蓋的歷史不足M1_LEN/
+    M3STD_LEN/M5STD_LEN根、或任何一路分支有NaN（例如m3/m5暖機不足），都會
+    直接跳過，不會出現在回傳結果裡——語意上等同批次版finite/finite_std檢查
+    沒通過就丟棄那筆候選。
+    """
+    from data.resample import compute_m3, compute_m3_std, compute_m5, compute_m5_std
+
+    m1 = m1_live.copy()
+    m1["date"] = pd.to_datetime(m1["date"])
+    m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
+    m1["day_date"] = m1["date"].dt.date
+
+    m3 = compute_m3(m1).rename(
+        columns={"open": "m3_open", "high": "m3_high", "low": "m3_low", "close": "m3_close", "volume": "m3_volume_raw"}
+    )
+    m5 = compute_m5(m1).rename(
+        columns={"open": "m5_open", "high": "m5_high", "low": "m5_low", "close": "m5_close", "volume": "m5_volume_raw"}
+    )
+    wide = m1.merge(m3[["stock_id", "date", "m3_open", "m3_high", "m3_low", "m3_close", "m3_volume_raw"]], on=["stock_id", "date"], how="left")
+    wide = wide.merge(m5[["stock_id", "date", "m5_open", "m5_high", "m5_low", "m5_close", "m5_volume_raw"]], on=["stock_id", "date"], how="left")
+
+    day_open_pre = wide.groupby(["stock_id", "day_date"], group_keys=False)["open"].transform("first").replace(0, np.nan)
+    wide = _add_market_relative(wide, day_open_pre, IDX_SYMBOL)
+
+    g_day = wide.groupby(["stock_id", "day_date"], group_keys=False)
+    day_open = g_day["open"].transform("first").replace(0, np.nan)
+    _add_atr_ma(wide, g_day, day_open)
+    _normalize_ohlcv(wide, "m1", day_open, g_day)
+    for prefix in ["m3", "m5"]:
+        _normalize_rolling_prefix(wide, prefix, day_open, g_day)
+
+    m3_std = compute_m3_std(m1)
+    m5_std = compute_m5_std(m1)
+    for std_df in (m3_std, m5_std):
+        std_df["date"] = pd.to_datetime(std_df["date"])
+        std_df["day_date"] = std_df["date"].dt.date
+        std_g_day = std_df.groupby(["stock_id", "day_date"], group_keys=False)
+        std_day_open = std_g_day["open"].transform("first").replace(0, np.nan)
+        _normalize_std_frame(std_df, std_g_day, std_day_open)
+
+    minute_ts = pd.Timestamp(minute_str)
+    offsets3 = np.arange(-(M3STD_LEN - 1), 1)
+    offsets5 = np.arange(-(M5STD_LEN - 1), 1)
+
+    stock_ids, m1_windows, m3std_windows, m5std_windows, atr5_vals = [], [], [], [], []
+    for sid, day_df in wide[wide["date"] <= minute_ts].groupby("stock_id", sort=False):
+        day_df = day_df.sort_values("date")
+        if len(day_df) < M1_LEN or day_df["date"].iloc[-1] != minute_ts:
+            continue
+        window = day_df.iloc[-M1_LEN:]
+        arr = window[_WIDE_FEATURE_COLS].to_numpy(dtype=np.float32)
+        if not np.isfinite(arr).all():
+            continue
+
+        m3std_day = m3_std[(m3_std["stock_id"] == sid) & (m3_std["date"] <= minute_ts)].sort_values("date")
+        m5std_day = m5_std[(m5_std["stock_id"] == sid) & (m5_std["date"] <= minute_ts)].sort_values("date")
+        if len(m3std_day) < M3STD_LEN or len(m5std_day) < M5STD_LEN:
+            continue
+        w3 = m3std_day[_STD_FEATURE_COLS].to_numpy(dtype=np.float32)[offsets3 + len(m3std_day) - 1]
+        w5 = m5std_day[_STD_FEATURE_COLS].to_numpy(dtype=np.float32)[offsets5 + len(m5std_day) - 1]
+        if not (np.isfinite(w3).all() and np.isfinite(w5).all()):
+            continue
+
+        stock_ids.append(sid)
+        m1_windows.append(arr.T)  # (n_wide_features, M1_LEN)
+        m3std_windows.append(w3.T)  # (len(_STD_FEATURE_COLS), M3STD_LEN)
+        m5std_windows.append(w5.T)  # (len(_STD_FEATURE_COLS), M5STD_LEN)
+        atr5_vals.append(window[_M1_COLS[_ATR5_META_IDX]].iloc[-1])
+
+    if not stock_ids:
+        return {}, [], np.array([], dtype=np.float32)
+
+    combined = np.stack(m1_windows, axis=0)  # (N, len(_WIDE_FEATURE_COLS), M1_LEN)
+    n1, n3 = len(_M1_COLS), len(_M3_COLS)
+    branches = {
+        "m1": combined[:, 0:n1, :],
+        "m3": combined[:, n1 : n1 + n3, :],
+        "m5": combined[:, n1 + n3 :, :],
+        "m3_std": np.stack(m3std_windows, axis=0),
+        "m5_std": np.stack(m5std_windows, axis=0),
+    }
+    return branches, stock_ids, np.array(atr5_vals, dtype=np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -37,3 +37,18 @@ IDX_SYMBOL = "0050"
 
 # ── 訓練裝置 ──────────────────────────────────────────────────────────────
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+
+# ── 即時交易設定（2026-07-25新增，比照strategy/mkt的慣例） ───────────────────
+# train()目前只訓練9~10點候選（見train.py的hour_start/hour_end），
+# SESSION_START/END跟這個範圍對齊，main/state.py::StrategyState讀這兩個常數
+# 決定這個策略哪個時間區間該呼叫predict_live()。
+SESSION_START = (9, 0)
+SESSION_END = (10, 0)
+THRESHOLD = 0.6  # 信心度門檻，2026-07-25驗證：0.6是精準度/涵蓋率較平衡的操作點
+
+# 只篩「平」（訓練時，見train.py::_atr5_mask()）；即時推論不知道真正label，
+# 改成不分類別、對所有候選一視同仁套用（見predict.py::predict_live()的說明）。
+# 數字用strategy/cnn/experiments/atr5_flat_filter_check.py在2026-03~07資料上
+# 算出來的9~10點p90分位數；目前訓練範圍已擴大到2024-01起，這個門檻沿用同一個
+# 數字（2026-07-25討論：先直接沿用，還沒針對擴大後的範圍重新校準）。
+ATR5_FILTER_THRESHOLD = 0.00541
