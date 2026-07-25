@@ -27,6 +27,29 @@
                              → reconcile       → 永豐 / paper / 富邦 下單
 """
 
+# 2026-07-25發現並實測驗證：process 會 100% 重現的 SIGSEGV（macOS crash log
+# 顯示 faulting thread 卡在 libomp.dylib 的 __kmp_launch_worker/
+# __kmp_fork_barrier，不是 Python 例外，不會印 traceback，看起來像「安靜地
+# 自動結束」）。根本原因是 import 順序：strategy/cnn 用 PyTorch（torch），
+# 其他策略用 XGBoost/LightGBM，這幾個套件各自帶了一份 OpenMP 執行期
+# （libomp）。main/strategy_loader.py::load_strategies() 依 STRATEGY_MODULES
+# 順序把所有策略模組一次 import 完，torch 是 module 頂層 import、立刻載入；
+# xgboost/lightgbm 是各自 train.py 裡的 function-local import，要等真的呼叫
+# load_model() 才觸發——如果 torch 先進程序、lightgbm/xgboost 後進，就會
+# SIGSEGV（實測：對調順序，先 import lightgbm/xgboost 再讓 torch 進來，
+# 6個模型全部正常載入；跟多執行緒/_startup()無關，單執行緒同步跑一樣會
+# 炸，已排除是 threading 造成的）。修法：搶在任何策略模組被 import 之前，
+# 這裡先 import lightgbm/xgboost，確保它們永遠比 torch 早進程序，不管
+# STRATEGY_MODULES 怎麼排、以後策略怎麼加都不會踩到這個順序問題。
+# KMP_DUPLICATE_LIB_OK=TRUE 是額外的保險（常見 OpenMP 重複載入建議設定），
+# 實測單獨設這個沒有解決順序問題本身，但保留著無害。
+import os
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import lightgbm  # noqa: F401  只是為了搶在 torch 之前把 libomp 執行期建立好，見上方說明
+import xgboost  # noqa: F401
+
 import builtins as _builtins
 import sys
 import threading
@@ -82,6 +105,10 @@ from data.query import load_m1_live
 _TW = timezone(timedelta(hours=8))
 
 state = AppState()
+# _startup() 跑完（成功或失敗）就會 set，_daily_refresh() 的立即補載判斷要
+# 等這個，避免兩邊背景執行緒同時搶著呼叫 refresh_tickers()（見 _startup()、
+# _daily_refresh() 的說明）。
+_startup_done = threading.Event()
 
 # 可同時載入多個策略模組（見 main/config.py 的 STRATEGY_MODULES）；每個策略
 # 模組都要暴露同一組介面：load_model() / predict_live(...) / SESSION_START /
@@ -131,6 +158,7 @@ def _startup():
         _log_sys(f"模型載入成功：{[(s.name, type(s.model).__name__) for s in state.strategies.values()]}")
     except Exception as e:
         print(f"✗ 模型載入失敗: {e}", flush=True)
+        _startup_done.set()
         return
 
     print("更新當沖標的清單...", flush=True)
@@ -197,18 +225,32 @@ def _startup():
             print(f"[WARN] 交易模組載入失敗，改為僅推訊號: {e}", flush=True)
             _log_sys(f"交易模組載入失敗: {e}", "error")
 
+    _startup_done.set()
+
 
 def _daily_refresh():
     """每天 06:00 更新當沖清單與日K；08:45（開盤前15分）重算盤前策略快取
-    （Render 24小時常駐用）"""
+    （Render 24小時常駐用）。
+
+    2026-07-25 修正：啟動時的立即補載判斷要等 _startup() 跑完（_startup_done
+    這個 threading.Event）才檢查——_startup() 現在是背景執行緒，跟這支函式
+    幾乎同時啟動，如果不等，兩邊會在同一瞬間都判斷「day是空的、已過06:00」
+    而同時各自呼叫 refresh_tickers()，變成兩個執行緒同時登入富邦、同時查
+    候選清單（實際發生過：log 裡「每日更新：當沖標的 + 日K...」跟
+    「載入模型...」交錯出現）。等 _startup() 完成後再檢查，state.day 才會
+    是最終狀態，這裡的判斷才準確。
+    """
     last_refresh = None
     last_prewarm = None
     while True:
         now = datetime.now(_TW)
         today = now.date()
         need_refresh = last_refresh != today and now.hour == 6 and now.minute >= 0
-        # 啟動時若日K是空的（非盤中跳過）且已過 06:00，立即補載
-        need_refresh = need_refresh or (last_refresh is None and state.day.empty and now.hour >= 6)
+        # 啟動時若日K是空的（非盤中跳過）且已過 06:00，立即補載——一定要等
+        # _startup() 完成，避免跟它同時搶著呼叫 refresh_tickers()。
+        need_refresh = need_refresh or (
+            last_refresh is None and _startup_done.is_set() and state.day.empty and now.hour >= 6
+        )
         if need_refresh:
             print(f"[{now.strftime('%H:%M')}] 每日更新：當沖標的 + 日K...")
             try:
@@ -480,6 +522,23 @@ def _force_close_eod():
         time.sleep(30)
 
 
+def _run_collector_after_startup():
+    """等 _startup() 完全跑完才啟動 collector（2026-07-25發現的crash）：
+    _startup() 最後一步 run_startup_backfill() 會在自己這個背景執行緒裡呼叫
+    predict_live()（XGBoost/LightGBM 推論，底層用 OpenMP 平行運算）；collector
+    一開機就自己開始跑、on_minute() 每分鐘固定觸發也會呼叫 predict_live()。
+    _startup() 因為 refresh_tickers() 要跑好幾分鐘，這段時間如果 collector
+    已經自己觸發過 on_minute()，兩個背景執行緒會同時呼叫 XGBoost/LightGBM
+    推論——OpenMP 的執行緒池初始化不是完全執行緒安全的，實測會讓整個
+    process 直接 SIGSEGV（macOS crash log 證實：faulting thread 在
+    libomp.dylib 的 __kmp_launch_worker，不是 Python 例外、不會印
+    traceback，看起來像「安靜地自動結束」）。等 _startup_done 之後才讓
+    collector 開始，確保兩邊不會同時摸到同一個 model。
+    """
+    _startup_done.wait()
+    _collector.start_collector(on_minute)
+
+
 if __name__ == "__main__":
     # 開機序列（模型/當沖清單/日K/盤前快取/交易引擎）背景執行緒，讓 uvicorn
     # 能立刻起來接受連線，不用等這些跑完（見 _startup() 的說明）。
@@ -488,8 +547,10 @@ if __name__ == "__main__":
     threading.Thread(target=_daily_refresh, daemon=True).start()
     # 每日 13:25 強制平倉（當沖不過夜）
     threading.Thread(target=_force_close_eod, daemon=True).start()
-    # 分K收集器在背景執行緒
-    threading.Thread(target=lambda: _collector.start_collector(on_minute), daemon=True).start()
+    # 分K收集器在背景執行緒，等 _startup() 完全跑完才開始（見
+    # _run_collector_after_startup() 的說明，避免跟 _startup() 同時呼叫模型
+    # 推論導致 OpenMP crash）。
+    threading.Thread(target=_run_collector_after_startup, daemon=True).start()
 
     # uvicorn 跑主執行緒（阻塞）
     config = get_uvicorn_config(host="0.0.0.0", port=8000)
