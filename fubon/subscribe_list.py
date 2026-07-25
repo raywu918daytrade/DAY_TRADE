@@ -127,14 +127,22 @@ def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
     每支呼叫都包 _call_with_timeout()（預設8秒，.env 的 FUBON_TICKER_CHECK_TIMEOUT
     可調）——fubon_neo SDK 本身沒有 timeout，網路/伺服器卡住的話單一支股票可能
     無限期不回應，2026-07-25 討論加這層保護，逾時當作查詢失敗、直接跳過那支，
-    不會拖住後面的股票（見 _call_with_timeout() 的說明）。"""
+    不會拖住後面的股票（見 _call_with_timeout() 的說明）。
+
+    _FORCE_INCLUDE（例如0050）的股票直接跳過查詢、無條件視為可以當沖
+    （2026-07-25討論）：這些股票不管 canBuyDayTrade/canDayTrade 回傳什麼都
+    一定要留著（見 _FORCE_INCLUDE 的說明），與其查完API結果又忽略，不如
+    根本不查，省一次API呼叫跟0.25秒等待，語意也更明確——不是「查了但結果
+    被覆蓋」，是「這幾支從一開始就不受這個檢查限制」。"""
     from fubon import fubon_api as trade_api
 
     sdk, _ = trade_api.login()
-    tradable = []
+    tradable = list(_FORCE_INCLUDE)
     try:
         trade_api.init_market_data(sdk)
         for sid in stock_ids:
+            if sid in _FORCE_INCLUDE:
+                continue
             try:
                 info = _call_with_timeout(trade_api.intraday_ticker, _TICKER_CHECK_TIMEOUT, sdk, sid)
                 # canDayTrade 先註解掉，不要求（2026-07-22：0050 這種正常標的
@@ -168,12 +176,10 @@ def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     （富邦 WebSocket 連線本身的 rate limit，定義在 fubon/config.py）。
 
     順序：均量排序＋截斷（ranked_candidates） → canDayTrade/canBuyDayTrade
-    逐支確認（_filter_day_tradable） → 強制加回 _FORCE_INCLUDE → 分連線。"""
+    逐支確認，_FORCE_INCLUDE 的股票不查、無條件視為可以當沖（_filter_day_tradable）
+    → 分連線。"""
     candidates = ranked_candidates(names)
     candidates = _filter_day_tradable(candidates)
-    for sid in _FORCE_INCLUDE:
-        if sid not in candidates:
-            candidates.insert(0, sid)
     batches = [
         candidates[i : i + MAX_PER_CONNECTION]
         for i in range(0, len(candidates), MAX_PER_CONNECTION)
@@ -181,10 +187,27 @@ def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     return batches[:MAX_CONNECTIONS]
 
 
-def build_and_save_subscribe_list() -> pd.DataFrame:
+def build_and_save_subscribe_list(force: bool = False) -> pd.DataFrame:
     """算好分連線的候選股清單（含名稱），存到 db/fubon_subscribe/。
     main/premarket.py::refresh_tickers() 開機、每天 06:00 都會呼叫這個，
-    不用另外排程。"""
+    不用另外排程。
+
+    force=False（預設，2026-07-25新增）：如果 db/fubon_subscribe/subscribe_list.parquet
+    已經是「今天」存的，直接讀取回傳，不重新跑一次 _filter_day_tradable() 那段
+    3~4分鐘、逐支查富邦API的流程——同一天內 main/live_trader.py 重啟多次（開機時
+    的 _startup()、_daily_refresh() 的立即補載都會呼叫這支函式），沒必要每次都
+    重新查一次同一天的候選資格。force=True 才強制整個重跑（例如手動用
+    `python -m fubon.subscribe_list` 想確認今天最新結果、或懷疑舊資料有問題時）。
+    """
+    if not force and _SUBSCRIBE_PATH.exists():
+        existing = pd.read_parquet(_SUBSCRIBE_PATH)
+        if not existing.empty:
+            today = datetime.now(_TW).strftime("%Y-%m-%d")
+            saved_date = str(existing["date"].iloc[0])
+            if saved_date == today:
+                print(f"候選清單已是今天（{today}）存的，直接沿用，不重新查詢 → {_SUBSCRIBE_PATH}", flush=True)
+                return existing
+
     names = _fubon_normal_tickers()
     if not names:
         print("  警告：富邦 API 沒回傳任何股票（非盤中？），清單維持空白", flush=True)
@@ -237,7 +260,8 @@ def load_subscribe_batches() -> list[list[str]]:
 
 
 if __name__ == "__main__":
-    build_and_save_subscribe_list()
+    # 手動跑（單獨測試/預覽）故意強制重跑，不要沿用今天已存的舊結果。
+    build_and_save_subscribe_list(force=True)
     for i, b in enumerate(load_subscribe_batches(), 1):
         preview = "、".join(b[:5])
         print(f"  連線 {i}：{len(b)} 支  前5：{preview}")
