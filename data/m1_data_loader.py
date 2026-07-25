@@ -172,20 +172,25 @@ def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str 
     2026-07-13 實測結果），1.05秒/支（1次API），維持在 60 req/min 以內留緩衝。
 
     token/label：讓 update_m1() 可以開兩條 Fugle 執行緒各用一組帳號
-    （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。"""
+    （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。
+
+    2026-07-26 改：查到空結果（含404）不再標記 _update_flag()——比照
+    data/day_data_loader.py 同一次的修正，避免空結果（可能只是暫時性問題）
+    被誤判成「今天已確認處理過」，當天重跑不會再重試。這裡沒有
+    day_data_loader.py 那個「start_date 窗口逐日滑動」的放大效應（每天固定
+    抓近30日，不會滑過缺口），純粹是跟那邊保持一致的寫法。"""
     for stock_id in stocks:
         try:
             df = _download_m1(stock_id, token=token)
             if not df.empty:
                 _save_m1(df)
                 print(f"[{label}] {stock_id} 下載完成 {len(df)} 筆")
+                _update_flag(stock_id, date_str)
             else:
                 print(f"[{label}] {stock_id} 無資料")
-            _update_flag(stock_id, date_str)
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                print(f"[{label}] {stock_id} 無此股票資料，標記跳過")
-                _update_flag(stock_id, date_str)
+                print(f"[{label}] {stock_id} 無此股票資料")
             else:
                 print(f"[{label}] {stock_id} 失敗: {e}")
         except Exception as e:
@@ -195,16 +200,18 @@ def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str 
 
 def _update_m1_fubon(stocks: list, date_str: str, sdk):
     """富邦那一半：historical/candles 一次就含今天，1.05秒/支（1次API），
-    維持在 60 req/min 以內留緩衝。"""
+    維持在 60 req/min 以內留緩衝。
+
+    空結果不標記完成：說明同 _update_m1_fugle()。"""
     for stock_id in stocks:
         try:
             df = _download_m1_fubon(sdk, stock_id)
             if not df.empty:
                 _save_m1(df)
                 print(f"[富邦] {stock_id} 下載完成 {len(df)} 筆")
+                _update_flag(stock_id, date_str)
             else:
                 print(f"[富邦] {stock_id} 無資料")
-            _update_flag(stock_id, date_str)
         except Exception as e:
             print(f"[富邦] {stock_id} 失敗: {e}")
         time.sleep(1.05)

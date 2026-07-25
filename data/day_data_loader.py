@@ -58,17 +58,6 @@ def _day_file_path(date: str) -> Path:
     return _ROOT / f"db/fugle_day/{ts.year}_{ts.month:02d}.parquet"
 
 
-def _last_stored_date() -> str | None:
-    """掃 db/fugle_day/ 全部檔案，找最大的已存日期（跨月正確）"""
-    day_dir = _ROOT / "db/fugle_day"
-    if not day_dir.exists():
-        return None
-    dataset = ds.dataset(str(day_dir), format="parquet")
-    if dataset.count_rows() == 0:
-        return None
-    return dataset.to_table(columns=["date"]).column("date").to_pandas().max()
-
-
 def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
     """先寫暫存檔再 rename，避免寫入過程被中斷導致 parquet 檔損毀"""
     import tempfile
@@ -236,12 +225,40 @@ def _get_done_stocks(date_str: str) -> set:
     return set(df[df["date"] == date_str]["stock_id"].tolist())
 
 
-def _update_day_fugle(stocks: list, start_date: str, date_str: str, workers: int, token: str = None, label: str = "Fugle"):
+def _last_stored_dates() -> dict[str, str]:
+    """db/fugle_day/ 裡每支股票目前最新的存檔日期，一次掃描全部檔案（比逐支
+    股票各自查一次快很多）。比照 data/backfill_day_history.py::_earliest_dates()
+    的做法，但這裡要的是每支股票的「最新」日期，不是「最早」。股票沒出現過
+    就不在這個 dict 裡（呼叫端要自己 fallback 一個起始日期）。"""
+    day_dir = _ROOT / "db/fugle_day"
+    if not day_dir.exists():
+        return {}
+    dataset = ds.dataset(str(day_dir), format="parquet")
+    if dataset.count_rows() == 0:
+        return {}
+    df = dataset.to_table(columns=["stock_id", "date"]).to_pandas()
+    return df.groupby("stock_id")["date"].max().to_dict()
+
+
+def _update_day_fugle(
+    stocks: list, stock_start_dates: dict[str, str], date_str: str, workers: int, token: str = None, label: str = "Fugle"
+):
     """Fugle 那一份：多執行緒併發，429 交給 Retry-After 被動重試
     （見 _fetch_year()），workers=5 約 5 分鐘下載 1500 支。
 
     token/label：讓 update_day() 可以開兩組 Fugle 執行緒池各用一組帳號
-    （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。"""
+    （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。
+
+    stock_start_dates：逐支股票各自的起始日期（見 update_day() 的說明，
+    2026-07-26 改成不用單一全域 start_date——全域值會讓已經落後的股票
+    永遠只查「今天附近」這一小段，問不到它自己真正缺的那一大段）。
+
+    2026-07-26 改：查到空結果（含404，_fetch_year() 已經把404轉成空
+    DataFrame，不會走到下面的HTTPError分支）不再標記 _update_flag()——
+    空結果可能是暫時性問題（API異常、限流），標記完成的話當天重跑也不會
+    再重試，之前 3055/4707/6174/2466 這幾支卡住好幾週就是類似情況。真的
+    確認有資料才標記完成，避免同一天內對已確認有結果的股票重複打API。
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     completed = 0
@@ -250,14 +267,13 @@ def _update_day_fugle(stocks: list, start_date: str, date_str: str, workers: int
         nonlocal completed
         time.sleep(0.2)  # 每執行緒小延遲，5 執行緒合計 ~1 req/s
         try:
-            df = _download_day(stock_id, start_date, token=token)
+            df = _download_day(stock_id, stock_start_dates[stock_id], token=token)
             if not df.empty:
                 _save_day(df)
-            _update_flag(stock_id, date_str)
+                _update_flag(stock_id, date_str)
             return stock_id, len(df), None
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                _update_flag(stock_id, date_str)
                 return stock_id, 0, None
             return stock_id, 0, str(e)
         except Exception as e:
@@ -274,15 +290,17 @@ def _update_day_fugle(stocks: list, start_date: str, date_str: str, workers: int
                 print(f"  [{label} {completed}/{len(stocks)}] 進度更新")
 
 
-def _update_day_fubon(stocks: list, start_date: str, date_str: str, sdk):
+def _update_day_fubon(stocks: list, stock_start_dates: dict[str, str], date_str: str, sdk):
     """富邦那一半：單一執行緒依序下載，1.05秒/支，維持在 60 req/min 以內留緩衝
-    （比照 data/m1_data_loader.py 的作法）。"""
+    （比照 data/m1_data_loader.py 的作法）。
+
+    stock_start_dates/空結果不標記完成：說明同 _update_day_fugle()。"""
     for i, stock_id in enumerate(stocks, 1):
         try:
-            df = _download_day_fubon(sdk, stock_id, start_date)
+            df = _download_day_fubon(sdk, stock_id, stock_start_dates[stock_id])
             if not df.empty:
                 _save_day(df)
-            _update_flag(stock_id, date_str)
+                _update_flag(stock_id, date_str)
             if i % 100 == 0 or i == len(stocks):
                 print(f"  [富邦 {i}/{len(stocks)}] 進度更新")
         except Exception as e:
@@ -295,6 +313,18 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     日線，flag 避免同日重複下載。待下載清單拆三份，Fugle 兩組帳號
     （FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦一份同時下載。
     workers: 每組 Fugle 執行緒池的並發數（預設 5，約 5 分鐘下載 1500 支）
+
+    start_date：選填，明確指定的話對這次待下載的股票全部套用同一個起始日期
+    （例如手動重跑想強制指定範圍）。**不指定（預設，日常排程走這條）時，
+    2026-07-26 改成逐支查詢各自的起始日期**（每支股票用「db/fugle_day 裡
+    這支自己最新存到哪」當起點，沒資料的股票才 fallback 到這個月1號）——
+    改之前是全部股票共用同一個全域最新日期，一旦某支股票落後（例如某次
+    API暫時異常沒抓到），之後每天都只會查「今天附近」這一小段，永遠問不到
+    這支自己真正缺的那一大段，實測 3055/4707/6174/2466 這4支就是卡在這個
+    問題，最新資料停在好幾週前不會自動追上。比照
+    data/backfill_day_history.py::_earliest_dates() 逐支查詢的做法（那支
+    是查最早日期補「更早的歷史」，這裡查最新日期補「跟上今天」，方向不同
+    但用同一套思路）。
     """
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
@@ -305,20 +335,26 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     date_str = now.strftime("%Y-%m-%d")
     os.makedirs(_ROOT / "db/fugle_day", exist_ok=True)
 
-    if start_date is None:
-        last = _last_stored_date()
-        start_date = last if last else f"{now.year}-{now.month:02d}-01"
-
     candidates = _all_stocks() if stocks is None else stocks
     done = _get_done_stocks(date_str)
     wait_stocks = [s for s in candidates if s not in done]
+
+    if start_date is not None:
+        stock_start_dates = {sid: start_date for sid in wait_stocks}
+        start_date_desc = start_date
+    else:
+        last_dates = _last_stored_dates()
+        default_start = f"{now.year}-{now.month:02d}-01"
+        stock_start_dates = {sid: last_dates.get(sid, default_start) for sid in wait_stocks}
+        behind = sorted(set(stock_start_dates.values()))
+        start_date_desc = f"逐支查詢（{len(behind)} 種不同起始日期，最舊 {behind[0] if behind else '無'}）"
 
     third = len(wait_stocks) // 3
     fugle_half1 = wait_stocks[:third]
     fugle_half2 = wait_stocks[third : 2 * third]
     fubon_half = wait_stocks[2 * third :]
     print(
-        f"start_date={start_date}，Fugle {len(fugle_half1)} 支、"
+        f"start_date={start_date_desc}，Fugle {len(fugle_half1)} 支、"
         f"Fugle(daytrade) {len(fugle_half2)} 支（各 {workers} 並發）、"
         f"富邦 {len(fubon_half)} 支，同時下載..."
     )
@@ -328,12 +364,12 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)
     try:
-        t_fugle1 = threading.Thread(target=_update_day_fugle, args=(fugle_half1, start_date, date_str, workers))
+        t_fugle1 = threading.Thread(target=_update_day_fugle, args=(fugle_half1, stock_start_dates, date_str, workers))
         t_fugle2 = threading.Thread(
             target=_update_day_fugle,
-            args=(fugle_half2, start_date, date_str, workers, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+            args=(fugle_half2, stock_start_dates, date_str, workers, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
         )
-        t_fubon = threading.Thread(target=_update_day_fubon, args=(fubon_half, start_date, date_str, sdk))
+        t_fubon = threading.Thread(target=_update_day_fubon, args=(fubon_half, stock_start_dates, date_str, sdk))
         t_fugle1.start()
         t_fugle2.start()
         t_fubon.start()
