@@ -134,6 +134,17 @@ class OtherFatalError(FatalAPIError):
     不會突然成功，除非外部狀況（額度/token/封鎖）改變了。"""
 
 
+class NetworkError(FatalAPIError):
+    """連線層級失敗（斷線/DNS/timeout），不是 FinMind 回應的 4xx。2026-07-26
+    發現：這種錯誤本來會被 backfill_month()::_one() 的 `except Exception` 當成
+    單筆失敗記錄、繼續往下跑，斷線期間會整批（甚至整個歷史範圍）都被當成
+    失敗跑完，還誤判成「全部月份跑完」正常結束、不會像其他 FatalAPIError
+    一樣暫停等待。故意繼承 FatalAPIError，讓 backfill_month()/backfill_history()/
+    run_forever() 既有的「整批停止→定期呼叫 check_quota() 確認狀況→恢復後
+    自動接著補」邏輯直接適用，不用另外寫一套——網路真的恢復後，
+    check_quota() 自然會成功，跟等 token/額度恢復是同一種等待模式。"""
+
+
 class _RateLimiter:
     """2026-07-14 從「本地模擬伺服器滑動視窗」改成更簡單直接的做法：不猜
     伺服器狀態，每 poll_interval 秒直接呼叫 check_quota() 問FinMind官方
@@ -171,8 +182,17 @@ class _RateLimiter:
         self._dispatch_count_at_last_sync = 0
 
     async def _refresh_usage(self) -> bool:
-        info = await check_quota()
         loop = asyncio.get_event_loop()
+        try:
+            info = await check_quota()
+        except Exception as e:
+            # 2026-07-26：斷線時 check_quota() 本身也會炸例外，這支函式在正常
+            # 請求流程中每 poll_interval 秒都會被呼叫一次（見 acquire()），
+            # 不能讓它把整個 process 弄炸掉——比照下面 msg!="success" 的處理
+            # 方式，當成「這次查詢失敗，沿用舊值，下次再試」。真正讓整批任務
+            # 停下來的是 fetch_kbar_day() 拋出的 NetworkError。
+            print(f"  查詢用量失敗（{e}），沿用上次已知的 {self._usage}")
+            return False
         if info.get("msg") == "success":
             used = int(info.get("user_count")) if isinstance(info.get("user_count"), (int, float)) else None
             if used is not None:
@@ -269,7 +289,14 @@ async def fetch_kbar_day(
         ) as r:
             return r.status, await r.json()
 
-    status, payload = await asyncio.wait_for(_do_request(), timeout=25)
+    try:
+        status, payload = await asyncio.wait_for(_do_request(), timeout=25)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        # 2026-07-26：斷線/DNS失敗/連線逾時，跟 FinMind 有沒有回應無關，重試
+        # 單一請求沒有意義（下一筆一樣會失敗）——當成 FatalAPIError 讓整批
+        # 任務停止，run_forever() 會定期呼叫 check_quota() 確認狀況，網路真的
+        # 恢復後 check_quota() 自然會成功，接著自動繼續（見 NetworkError 說明）。
+        raise NetworkError(f"{stock_id} {date_str} 網路錯誤（{e}），整批任務停止，等網路恢復後自動接著補") from e
     if payload.get("msg") != "success":
         msg = payload.get("msg") or ""
         if status == 403 or "ip banned" in msg.lower():
