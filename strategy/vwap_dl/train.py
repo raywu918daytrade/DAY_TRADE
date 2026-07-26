@@ -135,7 +135,34 @@ def train(
     end_date: str = "",
     force_rebuild: bool = False,
     std_mult: float = 2.0,
-):
+) -> ResNetGRUModel | None:
+    """
+    訓練 ResNet + GRU 混合模型。
+
+    流程：
+      1. 呼叫 build_dataset() 確保 cache 已建好（含 VWAP z-score 候選觸發 + 視窗組裝）。
+      2. 從各月份 shard 載入 meta，依 test_days 切出最後 N 天做固定測試集，
+         其餘資料按 chunk_size 切成 chunk 逐一送訓練。
+      3. 每個 chunk 訓練完後（或每 eval_every 個 chunk）評估一次 test_loss，
+         用 patience 機制 early stopping。
+      4. 存 best test_loss 的模型至 models/vwap_dl_cnngru.pt。
+
+    參數（與 CLI -- 同名參數對應）：
+        test_days: 從資料最後一天往前算 N 天作為固定測試集（預設 30）
+        max_rounds: 最多跑幾輪完整資料（預設 10）
+        chunk_size: 訓練樣本每 chunk 上限（預設 1_000_000，避免整批載入記憶體爆炸）
+        eval_every: 每幾個 chunk 評估一次 test_loss（預設 1）
+        batch_size: DataLoader batch size（預設 256）
+        lr: Adam learning rate（預設 1e-3）
+        patience: test_loss 連續幾次沒改善就提早停止（預設 3）
+        start_date: 資料起日 YYYY-MM-DD（預設空字串＝全部歷史）
+        end_date:   資料迄日 YYYY-MM-DD（預設空字串＝全部歷史）
+        force_rebuild: 是否強制重建 cache（預設 False）
+        std_mult: VWAP z-score 偏離標準差門檻（預設 2.0）
+
+    回傳：
+        訓練好的 ResNetGRUModel，若資料不足則回傳 None。
+    """
     # 確保 cache 建好
     months = build_dataset(start_date=start_date, end_date=end_date, std_mult=std_mult, force_rebuild=force_rebuild)
     months = available_months()
@@ -271,6 +298,19 @@ def train(
 
 
 def load_model() -> ResNetGRUModel:
+    """
+    載入已訓練好的模型 weights（models/vwap_dl_cnngru.pt）。
+
+    每次載入都是新建立一個 ResNetGRUModel instance 再 load_state_dict，
+    不支援 _model_cache 快取（vs vwap_ml/train.py 的記憶體快取），
+    因為 predict.py 只在啟動時載入一次，沒有重複載入的問題。
+
+    Raises:
+        FileNotFoundError: 模型檔案不存在。
+
+    回傳：
+        eval mode 的 ResNetGRUModel。
+    """
     if not _MODEL_PATH.exists():
         raise FileNotFoundError("找不到模型，請先執行 train")
     model = ResNetGRUModel().to(DEVICE)
@@ -280,6 +320,11 @@ def load_model() -> ResNetGRUModel:
 
 
 def _run_inference_and_report(model: ResNetGRUModel, test_ds: ShardedDataset, batch_size: int) -> None:
+    """
+    對測試集跑一次完整推論，輸出 Accuracy / AUC / 混淆矩陣 / 分類報告。
+
+    用在 train() 結尾的「最終測試集評估」以及 evaluate() 模式。
+    """
     test_target = test_ds.target
     print(f"測試集: {len(test_target):,} 筆")
     if len(test_target) == 0:
@@ -310,7 +355,18 @@ def evaluate(
     start_date: str = "",
     end_date: str = "",
     batch_size: int = 256,
-):
+) -> None:
+    """
+    evaluate 模式：載入已訓練模型，對測試集輸出一次混淆矩陣 + 分類報告 + AUC。
+
+    比照 _run_inference_and_report() 的輸出格式，不重新訓練。
+
+    參數：
+        test_days:  從資料最後一天往前算 N 天作為測試集（要跟訓練時一致）
+        start_date: 資料起日 YYYY-MM-DD
+        end_date:   資料迄日 YYYY-MM-DD
+        batch_size: DataLoader batch size
+    """
     model = load_model()
     months = available_months()
     if start_date:
@@ -337,7 +393,22 @@ def confidence_report(
     start_date: str = "",
     end_date: str = "",
     batch_size: int = 256,
-):
+) -> None:
+    """
+    confidence 模式：掃描不同信心度門檻下的 coverage / accuracy / AUC / 混淆矩陣。
+
+    對每個門檻，用 _predict_with_threshold() 決定預測標籤（非簡單 argmax），
+    輸出 AUC (OvR) 及各類別（回歸/無訊號/延續）的單獨 AUC，
+    讓使用者選出 coverage 與 precision 平衡最好的門檻。
+
+    參數：
+        test_days:  從資料最後一天往前算 N 天作為測試集
+        thresholds: 門檻清單，None=argmax（不設門檻）；
+                    預設 [None, 0.4, 0.5, 0.6, 0.7, 0.8]
+        start_date: 資料起日 YYYY-MM-DD
+        end_date:   資料迄日 YYYY-MM-DD
+        batch_size: DataLoader batch size
+    """
     thresholds = thresholds if thresholds is not None else [None, 0.4, 0.5, 0.6, 0.7, 0.8]
     model = load_model()
     months = available_months()
@@ -377,11 +448,36 @@ def confidence_report(
         coverage = (y_pred != 1).mean()
         print(f"\n── {label}，判斷覆蓋率(非無訊號)={coverage:.4f} ──")
         print(f"Accuracy: {accuracy_score(test_target, y_pred):.4f}")
+        # AUC: one-vs-rest（多分類 AUC）
+        auc_ovr = roc_auc_score(test_target, probs, multi_class="ovr", labels=[0, 1, 2])
+        print(f"AUC (OvR): {auc_ovr:.4f}")
+        # AUC per-class（one-vs-rest，各類別的單獨 AUC）
+        for cls, name in enumerate(_TARGET_NAMES):
+            y_bin = (test_target == cls).astype(int)
+            auc_cls = roc_auc_score(y_bin, probs[:, cls])
+            print(f"  AUC({name}): {auc_cls:.4f}")
         print(confusion_matrix(test_target, y_pred, labels=[0, 1, 2]))
         print(classification_report(test_target, y_pred, labels=[0, 1, 2], target_names=_TARGET_NAMES, zero_division=0))
 
 
 def _predict_with_threshold(probs: np.ndarray, threshold: float | None) -> np.ndarray:
+    """
+    依信心度門檻決定預測標籤（非簡單 argmax）。
+
+    規則：
+      - threshold=None: 取機率最高的類別（argmax，等同 model.predict()）
+      - 回歸（class 0）信心度 >= threshold → 判回歸
+      - 延續（class 2）信心度 >= threshold → 判延續
+      - 兩者都未達門檻 → 判無訊號（class 1）
+      - 兩者都達門檻 → 取機率較高者
+
+    參數：
+        probs:     softmax 機率矩陣 (N, 3)
+        threshold: 信心度門檻（0~1），None 表示 argmax
+
+    回傳：
+        y_pred: 預測標籤陣列 (N,)，值域 {0, 1, 2}
+    """
     if threshold is None:
         return probs.argmax(axis=1)
     p_revert = probs[:, 0]
@@ -413,7 +509,22 @@ def main(
     end_date: str = "",
     force_rebuild: bool = False,
     std_mult: float = 2.0,
-):
+) -> None:
+    """
+    CLI 進入點。支援三種模式：
+
+    train        訓練 ResNet + GRU 模型，存至 models/vwap_dl_cnngru.pt
+    evaluate     載入已存模型，對測試集輸出混淆矩陣 + 分類報告 + AUC
+    confidence   掃描不同信心度門檻下的 coverage / AUC / 混淆矩陣
+
+    用法：
+        python -m strategy.vwap_dl.train train
+        python -m strategy.vwap_dl.train evaluate
+        python -m strategy.vwap_dl.train confidence
+        python -m strategy.vwap_dl.train train --start_date 2024-01-01 --max_rounds 10
+
+    若未傳入 CLI 參數也無 mode 引數，預設走 train 模式。
+    """
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(description="vwap_dl 策略 — ResNet + GRU")
         parser.add_argument(
@@ -481,7 +592,14 @@ def main(
 
 
 if __name__ == "__main__":
-    # VS Code F5 用
+    """
+    VS Code F5 快速執行用。
+
+    可用 mode：
+        train        訓練 ResNet + GRU 模型，存至 models/vwap_dl_cnngru.pt
+        evaluate     載入已存模型，對測試集輸出混淆矩陣 + 分類報告 + AUC
+        confidence   掃描不同信心度門檻下的 coverage / AUC / 混淆矩陣
+    """
     mode = "train"
     test_days = 30
     max_rounds = 10
@@ -491,7 +609,7 @@ if __name__ == "__main__":
     batch_size = 256
     lr = 1e-3
     patience = 3
-    start_date = "2026-01-01"
+    start_date = "2024-01-01"
     end_date = ""
     force_rebuild = False
     std_mult = 2.0

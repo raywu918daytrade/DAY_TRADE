@@ -43,3 +43,4 @@ signal*.txt
 !requirements.txt
 *.log
 *.mp3
+models/*
