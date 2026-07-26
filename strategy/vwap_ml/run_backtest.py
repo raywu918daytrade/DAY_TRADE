@@ -36,7 +36,7 @@ def run(
     """
     跑一次 vwap_ml 回測。
 
-    model_type: 要用哪個模型（目前只有lgbm），直接傳參數指定，比照
+    model_type: 要用哪個模型（lgbm/xgb），直接傳參數指定，比照
         strategy/mkt/run_backtest.py 的做法——回測獨立於 config.MODEL_TYPE/
         up/down/live.py 讀的設定，不用繞去改 .env。
     threshold: 信心度門檻，predict() 產生的機率矩陣是「做多」機率（上軌

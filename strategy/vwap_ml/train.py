@@ -1,15 +1,14 @@
 """
-vwap_ml 模型訓練 — LightGBM 三分類（0=回歸VWAP/1=無訊號/2=延續突破）
+vwap_ml 模型訓練 — LightGBM / XGBoost 三分類（0=回歸VWAP/1=無訊號/2=延續突破）
 
-2026-07-26 討論：v1 只實際做了 LightGBM 一種演算法，但比照
-strategy/mkt/train.py 先把 MODEL_TYPE 切換機制建起來（_LOAD_MODEL_BY_TYPE/
-_TRAIN_BY_TYPE 字典＋load_model_by_type()），之後要加 rfc/xgb 只要補一組
-train_xxx()/load_model_xxx() 函式並登記進字典，不用改 predict.py、
-run_backtest.py、up/down/live.py 任何一行。
+2026-07-26 討論：先比照 strategy/mkt/train.py 把 MODEL_TYPE 切換機制建起來
+（_LOAD_MODEL_BY_TYPE/_TRAIN_BY_TYPE 字典＋load_model_by_type()），之後要
+再加其他演算法（例如rfc）只要補一組 train_xxx()/load_model_xxx() 函式並
+登記進字典，不用改 predict.py、run_backtest.py、up/down/live.py 任何一行。
 
 == Main 模式 ==
 
-train        訓練模型（--model_type 選演算法，目前只有 lgbm），存至
+train        訓練模型（--model_type 選演算法，lgbm/xgb），存至
              models/vwap_ml_{model_type}.pkl
 importance   顯示特徵重要性（讀已存的模型，不重訓）
 evaluate     單獨印混淆矩陣 + 分類報告（讀已存的模型，不重訓）
@@ -49,6 +48,7 @@ from strategy.vwap_ml.features import FEATURES, make_features
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH_LGBM = _ROOT / "models/vwap_ml_lgbm.pkl"
+_MODEL_PATH_XGB = _ROOT / "models/vwap_ml_xgb.pkl"
 _CACHE_PATH = _ROOT / "cache/vwap_ml_prepared.parquet"
 _SOURCE_DIRS = [_ROOT / "db/m1", _ROOT / "db/m3", _ROOT / "db/m5"]
 
@@ -220,15 +220,29 @@ def train_lgbm(test_days: int = 30, start_date: str | None = None, use_cache: bo
 
     # class_weight="balanced"：三分類裡「無訊號」大概率佔絕大多數，不加權
     # 模型會偷懶全部猜「無訊號」，用 balanced 強迫模型認真學回歸/延續。
+    #
+    # 2026-07-26：參數改用 experiments/tune_lgbm.py（Optuna，
+    # start_date=2024-01-01、45天val/45天test三段式切分）搜出來的最佳組合
+    # ——選 LGBM 不選 XGB 當正式模型：XGB調參後測試集precision看起來更高
+    # (79.22%)，但依trigger_side拆開一看，下軌(做多)完全沒有任何預測
+    # （n=0），是Optuna挑了一組極保守參數只在少數最有把握的做空案例出手
+    # 取巧堆出來的數字，不能實際交易；LGBM這組雖然precision略低(73.51%)，
+    # 但上軌(做空)876筆/下軌(做多)317筆都有紮實的訊號量，多空都能真的
+    # 交易，見 experiments/tune_lgbm.py 執行紀錄與
+    # strategy/vwap_ml/README.md 的說明。原始參數(n_estimators=300/
+    # num_leaves=31/max_depth=6/learning_rate=0.05/min_child_samples=50/
+    # subsample=0.8/colsample_bytree=0.8)沒調過，只是隨手設的起始值，
+    # 不是什麼值得堅持的基準。
     model = lgb.LGBMClassifier(
-        n_estimators=300,
-        num_leaves=31,
+        n_estimators=600,
+        num_leaves=48,
         max_depth=6,
-        learning_rate=0.05,
-        min_child_samples=50,
-        subsample=0.8,
+        learning_rate=0.05405420735163498,
+        min_child_samples=85,
+        subsample=0.9370412323040285,
         subsample_freq=1,
-        colsample_bytree=0.8,
+        colsample_bytree=0.5052284606961193,
+        reg_lambda=0.16155957844464003,
         random_state=42,
         n_jobs=-1,
         class_weight="balanced",
@@ -257,15 +271,77 @@ def load_model_lgbm():
     return joblib.load(_MODEL_PATH_LGBM)
 
 
-_LOAD_MODEL_BY_TYPE = {"lgbm": load_model_lgbm}
-_TRAIN_BY_TYPE = {"lgbm": train_lgbm}
+def train_xgb(test_days: int = 30, start_date: str | None = None, use_cache: bool = False):
+    """訓練 XGBoost 模型，跟 train_lgbm() 共用 FEATURES/切分邏輯，比照
+    strategy/mkt/train.py::train_xgb() 的寫法（2026-07-26新增）。
+
+    XGBClassifier 沒有像 LGBMClassifier 那樣原生支援多分類的
+    class_weight="balanced"，要自己用
+    sklearn.utils.class_weight.compute_sample_weight("balanced", y) 算出
+    每筆樣本的權重，再用 fit(..., sample_weight=...) 傳進去，效果對應
+    train_lgbm() 的 class_weight="balanced"。
+
+    ⚠️ 目前參數是先抓 orb/mkt 用過的起始值（未針對vwap_ml調過），之後要
+    調參請用 experiments/tune_xgb.py。
+    """
+    from sklearn.utils.class_weight import compute_sample_weight
+    from xgboost import XGBClassifier
+
+    train_df, test_df = _split_data(test_days, use_cache=use_cache, start_date=start_date)
+    print(
+        f"\n訓練: {len(train_df):,} ({train_df['date'].min().strftime('%Y-%m-%d')} ~ "
+        f"{train_df['date'].max().strftime('%Y-%m-%d')})"
+    )
+    print(
+        f"測試: {len(test_df):,} ({test_df['date'].min().strftime('%Y-%m-%d')} ~ "
+        f"{test_df['date'].max().strftime('%Y-%m-%d')})"
+    )
+    print(f"\n訓練集標籤分佈:\n{(train_df['target'].value_counts(normalize=True) * 100).round(2)}")
+
+    sample_weight = compute_sample_weight("balanced", train_df["target"])
+    model = XGBClassifier(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1,
+        eval_metric="mlogloss",
+        verbosity=0,
+    )
+    model.fit(train_df[FEATURES], train_df["target"], sample_weight=sample_weight)
+
+    y_pred = model.predict(test_df[FEATURES])
+    print(f"\nAccuracy: {accuracy_score(test_df['target'], y_pred):.4f}")
+    print("\n混淆矩陣（列=實際，欄=預測，順序 回歸/無訊號/延續）:")
+    print(confusion_matrix(test_df["target"], y_pred, labels=[0, 1, 2]))
+    print("\n分類報告:")
+    print(
+        classification_report(test_df["target"], y_pred, labels=[0, 1, 2], target_names=_TARGET_NAMES, zero_division=0)
+    )
+
+    _MODEL_PATH_XGB.parent.mkdir(exist_ok=True)
+    joblib.dump(model, _MODEL_PATH_XGB)
+    print(f"模型已存至 {_MODEL_PATH_XGB}")
+    return model
+
+
+def load_model_xgb():
+    if not _MODEL_PATH_XGB.exists():
+        raise FileNotFoundError("找不到 XGB 模型，請先執行 train_xgb()")
+    return joblib.load(_MODEL_PATH_XGB)
+
+
+_LOAD_MODEL_BY_TYPE = {"lgbm": load_model_lgbm, "xgb": load_model_xgb}
+_TRAIN_BY_TYPE = {"lgbm": train_lgbm, "xgb": train_xgb}
 
 
 _model_cache: dict[str, object] = {}
 
 
 def load_model_by_type(model_type: str):
-    """依 config.MODEL_TYPE（目前只有 "lgbm"）載入對應模型，
+    """依 config.MODEL_TYPE（"lgbm"/"xgb"）載入對應模型，
     run_backtest.py 跟 up/down/live.py 共用這支，切換模型只要改
     config.py::MODEL_TYPE 一個地方，比照 strategy/mkt/train.py 的做法。
 
@@ -474,7 +550,7 @@ def main(
 ):
     """CLI進入點，比照 strategy/mkt/train.py::main() 的 mode 切換方式。
 
-    model_type：train 用哪個演算法（目前只有 lgbm）；importance/evaluate/
+    model_type：train 用哪個演算法（lgbm/xgb）；importance/evaluate/
     confidence/direction 則是讀哪個演算法已經訓練好的模型來評估，比照
     strategy/mkt/train.py::main() 的說明——這些模式共用同一套
     FEATURES/切分邏輯，只有這個參數決定要用哪個演算法。
@@ -507,7 +583,7 @@ def main(
             "direction只吃第一個，留空=用predict()原本的判法",
         )
         parser.add_argument(
-            "--model_type", type=str, default="lgbm", choices=["lgbm"], help="模型演算法（目前只有lgbm）"
+            "--model_type", type=str, default="lgbm", choices=["lgbm", "xgb"], help="模型演算法（lgbm/xgb）"
         )
         parser.add_argument(
             "--use_cache",
@@ -568,7 +644,7 @@ if __name__ == "__main__":
     mode = "evaluate"  # train / importance / evaluate / confidence / direction
     test_days = 30
     threshold = None  # mode="evaluate"/"direction" 用得到；留 None = 用各自的預設判法
-    model_type = "lgbm"  # 目前只有 lgbm
+    model_type = "lgbm"  # lgbm / xgb
     use_cache = True
     start_date = "2024-01-01"  # 全部mode都會用到，決定讀哪一份cache；留 None = 用全部歷史
     main(
