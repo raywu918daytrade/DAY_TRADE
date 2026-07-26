@@ -30,6 +30,8 @@ def run(
     top_n: int = 5,
     max_positions: int = 10,
     model_type: str = "lgbm",
+    start_date: str | None = None,
+    use_cache: bool = True,
 ):
     """
     跑一次 vwap_ml 回測。
@@ -40,6 +42,11 @@ def run(
     threshold: 信心度門檻，predict() 產生的機率矩陣是「做多」機率（上軌
         延續／下軌回歸，見 predict.py::_direction_probas() 的說明），只有
         proba >= threshold 的候選才會進場。
+    start_date: 要跟訓練那個模型用的 start_date 一致，才會讀到同一份cache
+        （見 train.py::_prepare_data()::_cache_path_for() 的說明）。
+    use_cache: 預設 True（跟 train.py 的預設相反）——回測通常緊接在訓練
+        後面跑，直接沿用剛建好的cache最合理；如果改過 features.py 的
+        計算邏輯，記得手動傳 False 強制重算。
     first_entry_time/last_entry_time 固定用 config.SESSION_START/END
         （9:10~10:00），跟 train.py 的時段過濾保持一致，比照
         strategy/mkt/run_backtest.py 不額外開放參數調整的做法。
@@ -48,7 +55,7 @@ def run(
     """
     model = load_model_by_type(model_type)
 
-    df_proba = predict(model=model, test_days=test_days)
+    df_proba = predict(model=model, test_days=test_days, start_date=start_date, use_cache=use_cache)
     print(f"機率矩陣: {df_proba.shape}，非空值 {df_proba.notna().sum().sum()} 筆")
 
     portfolio_df, trades_df = run_backtest(
@@ -68,4 +75,4 @@ def run(
 
 
 if __name__ == "__main__":
-    run(test_days=30, threshold=0.6)
+    run(test_days=30, threshold=0.6, start_date="2024-01-01")

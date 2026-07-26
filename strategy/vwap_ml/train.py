@@ -15,6 +15,8 @@ importance   顯示特徵重要性（讀已存的模型，不重訓）
 evaluate     單獨印混淆矩陣 + 分類報告（讀已存的模型，不重訓）
 confidence   回歸/延續兩個類別的信心度門檻掃描，看不同機率門檻下的
              precision/recall（讀已存的模型，不重訓）
+direction    把回歸/延續的預測依 trigger_side（上軌/下軌，對應實際做空/
+             做多）拆開看precision/recall（讀已存的模型，不重訓）
 
 用法：
     python -m strategy.vwap_ml.train train
@@ -22,6 +24,7 @@ confidence   回歸/延續兩個類別的信心度門檻掃描，看不同機率
     python -m strategy.vwap_ml.train importance
     python -m strategy.vwap_ml.train evaluate
     python -m strategy.vwap_ml.train confidence
+    python -m strategy.vwap_ml.train direction
 
 ⚠️ evaluate/confidence 用的 test_days 要跟當初訓練那個模型用的 test_days
 一致，不然測試集會跟訓練時看過的資料重疊，評估結果不可信（見
@@ -49,26 +52,56 @@ _MODEL_PATH_LGBM = _ROOT / "models/vwap_ml_lgbm.pkl"
 _CACHE_PATH = _ROOT / "cache/vwap_ml_prepared.parquet"
 _SOURCE_DIRS = [_ROOT / "db/m1", _ROOT / "db/m3", _ROOT / "db/m5"]
 
+
+def _cache_path_for(start_date: str | None) -> Path:
+    """start_date=None（全部歷史）用預設的共用cache路徑；其他start_date
+    各自存獨立檔案，比照 strategy/mkt/train.py::_cache_path_for(top_n) 的
+    做法——start_date 是在載入資料時就套用的範圍限制（不是事後才篩），
+    如果共用同一份cache，不同start_date會互相覆蓋、讀到錯的資料。"""
+    if start_date is None:
+        return _CACHE_PATH
+    return _CACHE_PATH.parent / f"vwap_ml_prepared_{start_date}.parquet"
+
 _TARGET_NAMES = ["回歸", "無訊號", "延續"]
 
 
 def _source_mtime() -> float:
-    """db/m1 裡所有檔案中最新的修改時間戳，比照 strategy/mkt/train.py 的
-    _source_mtime() 寫法。"""
-    mtimes = [f.stat().st_mtime for d in _SOURCE_DIRS if d.exists() for f in d.iterdir() if f.suffix == ".parquet"]
-    return max(mtimes) if mtimes else 0
+    """db/m1/db/m3/db/m5 裡「檔名代表最新月份」那個檔案的修改時間戳，
+    不是掃全部檔案取最大值。
+
+    2026-07-26 討論：原本掃全部檔案取最大mtime，會被完全無關、正在補
+    2019~2023歷史資料缺口的背景程式（finmind.backfill_history）誤觸發
+    ——它會持續改到db/m1裡的舊月份檔案（例如2023_05.parquet），這種
+    更新跟vwap_ml實際會用到的近期資料無關，卻讓cache被判定過期、觸發
+    不必要的10幾分鐘重算（訓練時常用 start_date=2024-01-01之後，2019~
+    2023的資料根本沒被用到）。只看「檔名最新的月份」那個檔案的時間戳，
+    才能正確反映「有沒有新的近期資料進來」這個真正該偵測的情況，不會
+    被補久遠歷史資料的背景作業影響。
+
+    檔名格式 YYYY_MM.parquet，字串排序剛好等於時間排序，按檔名排序取
+    最後一個即可，不用額外解析日期。
+    """
+    latest_mtimes = []
+    for d in _SOURCE_DIRS:
+        if not d.exists():
+            continue
+        files = sorted(f for f in d.iterdir() if f.suffix == ".parquet")
+        if files:
+            latest_mtimes.append(files[-1].stat().st_mtime)
+    return max(latest_mtimes) if latest_mtimes else 0
 
 
-def _cache_is_fresh() -> bool:
-    if not _CACHE_PATH.exists():
+def _cache_is_fresh(cache_path: Path) -> bool:
+    if not cache_path.exists():
         return False
-    return _CACHE_PATH.stat().st_mtime >= _source_mtime()
+    return cache_path.stat().st_mtime >= _source_mtime()
 
 
 def _prepare_data(
     use_cache: bool = False,
     std_mult: float = STD_MULT,
     atr5_threshold: float = ATR5_FILTER_THRESHOLD,
+    start_date: str | None = None,
 ) -> pd.DataFrame:
     """
     use_cache（2026-07-26 改：跟 strategy/mkt/train.py 的慣例相反，故意
@@ -92,21 +125,31 @@ def _prepare_data(
     非預設參數的實驗結果弄髒正式pipeline在用的cache檔案。這代表用非預設
     參數呼叫這支函式每次都會重新跑一次完整流程，比較慢，但只有做實驗時
     才會這樣用，不影響正式train/predict。
+
+    start_date（2026-07-26新增）：直接限制 load_m1()/load_m3()/load_m5()
+    載入的範圍，不是像過去那樣先載入全部歷史、事後才篩選train_df——
+    使用者實際上固定用 start_date="2024-01-01"，先載全部歷史（目前含
+    2019~2023，正在被另一個獨立的 finmind.backfill_history 背景作業
+    持續補資料）再事後過濾，等於白白多算了完全用不到的資料，也讓
+    _cache_is_fresh() 更容易被那個背景作業誤觸發成「過期」。不同
+    start_date 存在各自獨立的cache檔案（見 _cache_path_for()），互不
+    覆蓋。
     """
     skip_cache = std_mult != STD_MULT or atr5_threshold != ATR5_FILTER_THRESHOLD
-    if not skip_cache and use_cache and _cache_is_fresh():
-        print("cache比來源資料新，直接讀取cache...")
-        return pd.read_parquet(_CACHE_PATH)
+    cache_path = _cache_path_for(start_date)
+    if not skip_cache and use_cache and _cache_is_fresh(cache_path):
+        print(f"cache比來源資料新，直接讀取cache... [{cache_path.name}]")
+        return pd.read_parquet(cache_path)
 
-    print("載入分K...")
-    m1 = load_m1()
+    print(f"載入分K...{f'（start_date={start_date}）' if start_date else '（全部歷史）'}")
+    m1 = load_m1(start_date=start_date)
     # 讀現成的 m3/m5 批次快取（data/build_m3_m5_rolling.py 預先算好），不要
     # 讓 make_features() 內部用 compute_m3()/compute_m5() 對全市場全歷史
     # 重新現算一次——那樣等於又製造出兩份跟 m1 一樣大的 dataframe，是
     # 2026-07-26 訓練全歷史資料時記憶體爆掉的主因之一，見
     # features.py::add_vwap_features() 的說明。
-    m3 = load_m3()
-    m5 = load_m5()
+    m3 = load_m3(start_date=start_date)
+    m5 = load_m5(start_date=start_date)
 
     # stock_id 原本是 object（Python字串）dtype，全歷史規模下記憶體被嚴重
     # 放大（2026-07-26實測：db/m1 全歷史1.56億列只有3090種不重複代號，
@@ -139,9 +182,9 @@ def _prepare_data(
         print("std_mult/atr5_threshold非正式設定，跳過cache寫入（避免弄髒正式cache）")
         return df
 
-    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_CACHE_PATH)
-    print(f"cache已存至 {_CACHE_PATH}")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path)
+    print(f"cache已存至 {cache_path}")
     return df
 
 
@@ -150,14 +193,14 @@ def _split_data(test_days: int = 30, use_cache: bool = False, start_date: str | 
     能用「跟訓練時同一份」測試集去評估已存的模型，比照
     strategy/mkt/train.py::_split_data() 的說明。
 
-    start_date：只篩 train_df（不影響 test_df），限制訓練資料從這個日期
-    開始，留空＝用全部歷史。
+    start_date 現在直接轉傳給 _prepare_data()，在載入資料的源頭就限制
+    範圍（見 _prepare_data() 的說明），不再是「先載全部歷史、事後篩掉
+    train_df」的做法，所以 train_df/test_df 都已經是限制範圍後的結果，
+    不用再對 train_df 額外過濾一次。留空＝用全部歷史。
     """
-    df = _prepare_data(use_cache=use_cache)
+    df = _prepare_data(use_cache=use_cache, start_date=start_date)
     cutoff = df["date"].max() - pd.Timedelta(days=test_days)
     train_df, test_df = df[df["date"] <= cutoff], df[df["date"] > cutoff]
-    if start_date is not None:
-        train_df = train_df[train_df["date"] >= pd.Timestamp(start_date)]
     return train_df, test_df
 
 
@@ -270,11 +313,17 @@ def evaluate(
     test_days: int = 30,
     threshold: float | None | list[float | None] = _DEFAULT_THRESHOLDS,
     use_cache: bool = False,
+    start_date: str | None = None,
 ):
-    """單獨印混淆矩陣/分類報告，用已存的模型評估，不用重新跑一次 train()。"""
+    """單獨印混淆矩陣/分類報告，用已存的模型評估，不用重新跑一次 train()。
+
+    start_date 要跟訓練那個模型用的 start_date 一致，才會讀到同一份
+    cache（見 _prepare_data()::_cache_path_for() 的說明），不然會因為
+    cache路徑對不上而觸發不必要的重新計算。
+    """
     if model is None:
         model = load_model_by_type(MODEL_TYPE)
-    _, test_df = _split_data(test_days, use_cache=use_cache)
+    _, test_df = _split_data(test_days, use_cache=use_cache, start_date=start_date)
 
     print(
         f"測試: {len(test_df):,} 筆 ({test_df['date'].min().strftime('%Y-%m-%d')} ~ "
@@ -300,16 +349,25 @@ def evaluate(
     return test_df, (results[0] if len(results) == 1 else results)
 
 
-def confidence_report(model=None, test_days: int = 30, thresholds: list[float] | None = None, use_cache: bool = False):
+def confidence_report(
+    model=None,
+    test_days: int = 30,
+    thresholds: list[float] | None = None,
+    use_cache: bool = False,
+    start_date: str | None = None,
+):
     """依信心度門檻掃描，分別看「回歸」「延續」這兩個類別在不同信心度下的
     precision/recall，比照 strategy/mkt/train.py::confidence_report() 的
-    3分類版寫法。"""
+    3分類版寫法。
+
+    start_date 要跟訓練那個模型用的 start_date 一致，見 evaluate() 的說明。
+    """
     if model is None:
         model = load_model_by_type(MODEL_TYPE)
     if thresholds is None:
         thresholds = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 
-    _, test_df = _split_data(test_days, use_cache=use_cache)
+    _, test_df = _split_data(test_days, use_cache=use_cache, start_date=start_date)
     proba = model.predict_proba(test_df[FEATURES])
     class_idx = {c: i for i, c in enumerate(model.classes_)}
     test_df = test_df.copy()
@@ -331,6 +389,66 @@ def confidence_report(model=None, test_days: int = 30, thresholds: list[float] |
             precision = tp / n
             recall = tp / total_actual if total_actual else 0
             print(f"  {thr:.2f}  {n:>7,}  {tp:>7,}  {precision * 100:>8.2f}%  {recall * 100:>5.2f}%")
+
+    return test_df
+
+
+_SIDE_DIRECTION = {
+    0: {"upper": "做空", "lower": "做多"},  # 回歸：上軌觸發=從高點拉回=做空；下軌觸發=從低點反彈=做多
+    2: {"upper": "做多", "lower": "做空"},  # 延續：上軌觸發=繼續往上=做多；下軌觸發=繼續往下=做空
+}
+
+
+def direction_breakdown(
+    model=None,
+    test_days: int = 30,
+    threshold: float | None = None,
+    use_cache: bool = False,
+    start_date: str | None = None,
+):
+    """
+    2026-07-26 新增：把「回歸」「延續」這兩個類別的預測結果，依觸發時的
+    trigger_side（upper=上軌/+2觸發、lower=下軌/-2觸發）拆開來看precision/
+    recall，比照 predict.py::_direction_probas() 的方向對應表（見
+    _SIDE_DIRECTION）換算成實際做多/做空。
+
+    動機：evaluate()/confidence_report() 印出來的 precision 是「回歸」
+    整體混在一起算的（不分上軌/下軌），但上軌回歸(做空)跟下軌回歸(做多)
+    對應到完全不同的實際交易方向，兩者的準確度可能不一樣（例如台股放空
+    限制多、下軌回歸做多可能表現不同於上軌回歸做空），只看整體
+    precision會被平均掉、看不出來哪個方向比較可靠。
+
+    threshold=None 用 model.predict() 原本判法（機率最高的類別勝出）；
+    設 0~1 的門檻則比照 evaluate()::_predict_with_threshold() 的判法。
+
+    start_date 要跟訓練那個模型用的 start_date 一致，見 evaluate() 的說明。
+
+    df 需已有 trigger_side 欄位（_split_data() 回傳的 test_df 本來就有，
+    不在 FEATURES 清單裡但沒被 dropna() 濾掉）。
+    """
+    if model is None:
+        model = load_model_by_type(MODEL_TYPE)
+    _, test_df = _split_data(test_days, use_cache=use_cache, start_date=start_date)
+
+    y_pred, thr_label = _predict_with_threshold(model, test_df, threshold)
+    test_df = test_df.copy()
+    test_df["_pred"] = y_pred
+
+    print(f"── 依 trigger_side 拆解方向準確度（{thr_label}）──")
+    for cls, name in [(0, "回歸"), (2, "延續")]:
+        print(f"\n{name}（class={cls}）:")
+        for side in ("upper", "lower"):
+            sub = test_df[test_df["trigger_side"] == side]
+            actual_cnt = int((sub["target"] == cls).sum())
+            pred_cnt = int((sub["_pred"] == cls).sum())
+            tp = int(((sub["target"] == cls) & (sub["_pred"] == cls)).sum())
+            precision = tp / pred_cnt if pred_cnt else float("nan")
+            recall = tp / actual_cnt if actual_cnt else float("nan")
+            direction = _SIDE_DIRECTION[cls][side]
+            print(
+                f"  trigger_side={side}（{direction}）: 實際{name}={actual_cnt:,}  "
+                f"預測{name}={pred_cnt:,}  猜中={tp:,}  precision={precision * 100:.2f}%  recall={recall * 100:.2f}%"
+            )
 
     return test_df
 
@@ -357,9 +475,14 @@ def main(
     """CLI進入點，比照 strategy/mkt/train.py::main() 的 mode 切換方式。
 
     model_type：train 用哪個演算法（目前只有 lgbm）；importance/evaluate/
-    confidence 則是讀哪個演算法已經訓練好的模型來評估，比照
-    strategy/mkt/train.py::main() 的說明——三個模式共用同一套
+    confidence/direction 則是讀哪個演算法已經訓練好的模型來評估，比照
+    strategy/mkt/train.py::main() 的說明——這些模式共用同一套
     FEATURES/切分邏輯，只有這個參數決定要用哪個演算法。
+
+    start_date：所有模式都會用到（2026-07-26改），決定讀/建哪一份cache
+    （見 _prepare_data()::_cache_path_for() 的說明）——evaluate/confidence/
+    direction 要跟當初 train 那次用同一個 start_date，才會讀到同一份
+    cache，不然會因為cache路徑對不上而觸發不必要的重新計算。
 
     兩種用法都支援，互不衝突：
       1. VS Code按F5：__main__ 裡直接寫死 mode 變數，不帶任何CLI參數。
@@ -371,7 +494,7 @@ def main(
             "mode",
             nargs="?",
             default="train",
-            choices=["train", "importance", "evaluate", "confidence"],
+            choices=["train", "importance", "evaluate", "confidence", "direction"],
             help="執行模式（預設train）",
         )
         parser.add_argument("--test_days", type=int, default=30, help="測試集天數")
@@ -380,7 +503,8 @@ def main(
             type=float,
             nargs="*",
             default=None,
-            help="evaluate專用：信心度門檻(0~1)，可帶多個一次比較，留空=用predict()原本的判法",
+            help="evaluate/direction專用：信心度門檻(0~1)，evaluate可帶多個一次比較、"
+            "direction只吃第一個，留空=用predict()原本的判法",
         )
         parser.add_argument(
             "--model_type", type=str, default="lgbm", choices=["lgbm"], help="模型演算法（目前只有lgbm）"
@@ -394,7 +518,8 @@ def main(
             "--start_date",
             type=str,
             default=None,
-            help="train專用：只篩訓練資料起始日期（例：2025-01-01），留空=用全部歷史",
+            help="限制載入範圍的起始日期（例：2024-01-01），留空=用全部歷史；"
+            "train/evaluate/confidence/direction 都要傳同一個值才會讀到同一份cache",
         )
         args = parser.parse_args()
         mode = args.mode
@@ -413,13 +538,26 @@ def main(
     elif mode == "evaluate":
         model = _LOAD_MODEL_BY_TYPE[model_type]()
         if threshold is not None:
-            evaluate(model=model, test_days=test_days, threshold=threshold, use_cache=use_cache)
+            evaluate(model=model, test_days=test_days, threshold=threshold, use_cache=use_cache, start_date=start_date)
         else:
-            evaluate(model=model, test_days=test_days, use_cache=use_cache)
+            evaluate(model=model, test_days=test_days, use_cache=use_cache, start_date=start_date)
     elif mode == "confidence":
-        confidence_report(model=_LOAD_MODEL_BY_TYPE[model_type](), test_days=test_days, use_cache=use_cache)
+        confidence_report(
+            model=_LOAD_MODEL_BY_TYPE[model_type](), test_days=test_days, use_cache=use_cache, start_date=start_date
+        )
+    elif mode == "direction":
+        # direction_breakdown() 只吃單一門檻（不像evaluate那樣掃一串），
+        # --threshold 帶多個值時只取第一個
+        single_threshold = threshold[0] if isinstance(threshold, list) and threshold else threshold
+        direction_breakdown(
+            model=_LOAD_MODEL_BY_TYPE[model_type](),
+            test_days=test_days,
+            threshold=single_threshold,
+            use_cache=use_cache,
+            start_date=start_date,
+        )
     else:
-        print(f"未知模式: {mode}，可用: train / importance / evaluate / confidence")
+        print(f"未知模式: {mode}，可用: train / importance / evaluate / confidence / direction")
 
 
 if __name__ == "__main__":
@@ -427,12 +565,12 @@ if __name__ == "__main__":
     VS Code按F5（開發時常用）：直接改下面這幾行變數，不用打字。
     終端機帶參數會覆蓋掉下面寫死的值，見 main() 的說明。
     """
-    mode = "train"  # train / importance / evaluate / confidence
+    mode = "evaluate"  # train / importance / evaluate / confidence / direction
     test_days = 30
-    threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
+    threshold = None  # mode="evaluate"/"direction" 用得到；留 None = 用各自的預設判法
     model_type = "lgbm"  # 目前只有 lgbm
-    use_cache = False
-    start_date = "2024-01-01"  # 只有 mode="train" 用得到；留 None = 用全部歷史
+    use_cache = True
+    start_date = "2024-01-01"  # 全部mode都會用到，決定讀哪一份cache；留 None = 用全部歷史
     main(
         mode=mode,
         test_days=test_days,
