@@ -23,6 +23,7 @@ strategy/rally/features.py 的 vwap_dev 用同一種近似方式，是專案裡�
 """
 
 import sys
+from datetime import datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
 
@@ -35,11 +36,10 @@ import pandas as pd
 from data.resample import compute_m3, compute_m5
 from strategy.vwap_ml.config import (
     ATR5_FILTER_THRESHOLD,
-    HOLD_BARS,
+    LABEL_HORIZON_MINUTES,
     SESSION_END,
     SESSION_START,
     STD_MULT,
-    TIMEFRAME_MINUTES,
 )
 
 
@@ -68,19 +68,45 @@ def _add_vwap_z(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     用法跟 m1 原生欄位一致）。
     """
     df = df.copy()
-    g_day = df.groupby(["stock_id", "day_date"], group_keys=False)
+    g_day = df.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     cum_vol = g_day["volume"].transform("cumsum")
     df["_pv"] = df["close"] * df["volume"]
-    cum_pv = df.groupby(["stock_id", "day_date"])["_pv"].transform("cumsum")
+    cum_pv = df.groupby(["stock_id", "day_date"], observed=True)["_pv"].transform("cumsum")
     vwap = cum_pv / cum_vol.replace(0, np.nan)
     df["_dev"] = df["close"] - vwap
-    g_dev = df.groupby(["stock_id", "day_date"], group_keys=False)
+    g_dev = df.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     dev_std = _degroup(g_dev["_dev"].expanding(min_periods=5).std(), df.index)
     df[f"{prefix}_vwap_z"] = df["_dev"] / dev_std.replace(0, np.nan)
     return df.drop(columns=["_pv", "_dev"])
 
 
-def add_vwap_features(m1: pd.DataFrame, std_mult: float = STD_MULT) -> pd.DataFrame:
+def _trim_to_needed_window(df: pd.DataFrame) -> pd.DataFrame:
+    """只保留到 SESSION_END + LABEL_HORIZON_MINUTES（例如 SESSION_END=
+    10:00、視窗30分鐘 → 保留到10:30）這段時間的列，不動起點（VWAP要從
+    市場開盤就開始累積，起點不能砍）。
+
+    2026-07-26 討論：發現這是全市場全歷史訓練時記憶體爆掉的主因之一——
+    候選只會落在 SESSION_START~SESSION_END（9:10~10:00）這段，且 label
+    最多只需要看到 SESSION_END 之後再 LABEL_HORIZON_MINUTES 分鐘的未來
+    資料，中午/下午盤的資料整個 pipeline 完全用不到，但先前是等最後
+    _filter_session() 才裁掉，前面 VWAP z-score/m3/m5合併/量能特徵/ATR5/
+    label 全部都對整天（9:00~13:30，約270分鐘）跑過一次，多算了好幾倍
+    用不到的資料。改成載入後立刻裁掉尾端，後面所有計算的資料量直接減少。
+    裁掉尾端不影響任何數值——VWAP/z-score都是只看「當下與更早」的累積/
+    expanding計算，跟後面還有沒有資料無關。
+
+    df 需已有 date 欄位（datetime）。
+    """
+    cutoff = (datetime.combine(datetime.min, dtime(*SESSION_END)) + timedelta(minutes=LABEL_HORIZON_MINUTES)).time()
+    return df[df["date"].dt.time <= cutoff]
+
+
+def add_vwap_features(
+    m1: pd.DataFrame,
+    std_mult: float = STD_MULT,
+    m3: pd.DataFrame | None = None,
+    m5: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
     加 m1_vwap_z/m3_vwap_z/m5_vwap_z 三個時間框的 VWAP 偏離 z-score、各自
     的斜率（跟3根前比，diff(3)——正代表偏離擴大中，負代表正在往VWAP收斂），
@@ -98,22 +124,35 @@ def add_vwap_features(m1: pd.DataFrame, std_mult: float = STD_MULT) -> pd.DataFr
     候選門檻比較樣本量、標籤分布、precision，才能定案；預設值仍是
     config.STD_MULT，正式 train/predict 都不傳這個參數就會用預設值。
 
+    m3/m5（2026-07-26 新增）：3分鐘/5分鐘 rolling OHLCV，留空時退回內部
+    用 data/resample.py::compute_m3()/compute_m5() 現算（predict_live() 的
+    「今天」資料要這樣，因為批次快取 db/m3/db/m5 不含「今天」）。訓練/
+    回測（全歷史批次）不應該傳空值——那樣會對全市場全歷史重新現算一次
+    m3/m5，跟 db/m3/db/m5 早就存好的批次快取重複計算，也是造成全歷史訓練
+    記憶體爆掉的另一個主因，train.py::_prepare_data() 改成直接讀
+    data/query.py::load_m3()/load_m5() 傳進來，比照 orb/rally/mkt 訓練時
+    的做法。
+
     m1 需已有 stock_id/date/day_date/open/high/low/close/volume 欄位，
     date 為 datetime，已依 stock_id/date 排序。
     """
     df = _add_vwap_z(m1, "m1")
 
-    m3 = compute_m3(m1)
+    if m3 is None:
+        m3 = compute_m3(m1)
+    m3 = m3.copy()
     m3["day_date"] = m3["date"].dt.date
     m3 = _add_vwap_z(m3, "m3")[["stock_id", "date", "m3_vwap_z"]]
     df = df.merge(m3, on=["stock_id", "date"], how="left")
 
-    m5 = compute_m5(m1)
+    if m5 is None:
+        m5 = compute_m5(m1)
+    m5 = m5.copy()
     m5["day_date"] = m5["date"].dt.date
     m5 = _add_vwap_z(m5, "m5")[["stock_id", "date", "m5_vwap_z"]]
     df = df.merge(m5, on=["stock_id", "date"], how="left")
 
-    g_day = df.groupby(["stock_id", "day_date"], group_keys=False)
+    g_day = df.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     df["m1_vwap_z_slope"] = g_day["m1_vwap_z"].diff(3)
     df["m3_vwap_z_slope"] = g_day["m3_vwap_z"].diff(3)
     df["m5_vwap_z_slope"] = g_day["m5_vwap_z"].diff(3)
@@ -147,7 +186,7 @@ def add_bar_features(m1: pd.DataFrame) -> pd.DataFrame:
     m1 需已有 stock_id/day_date/open/close/volume 欄位。
     """
     m1 = m1.copy()
-    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     day_open = g_day["open"].transform("first").replace(0, np.nan)
     m1["vol_ratio_prev"] = m1["volume"] / g_day["volume"].shift(1).replace(0, np.nan)
     m1["ret_1m"] = g_day["close"].pct_change(1, fill_method=None)
@@ -174,14 +213,14 @@ def add_atr5(m1: pd.DataFrame) -> pd.DataFrame:
     m1 需已有 stock_id/day_date/open/high/low/close 欄位。
     """
     m1 = m1.copy()
-    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     day_open = g_day["open"].transform("first").replace(0, np.nan)
     prev_close = g_day["close"].shift(1).fillna(m1["open"])
     m1["_tr5"] = np.maximum(
         np.maximum((m1["high"] - m1["low"]).abs(), (m1["high"] - prev_close).abs()),
         (m1["low"] - prev_close).abs(),
     )
-    g_tr = m1.groupby(["stock_id", "day_date"], group_keys=False)
+    g_tr = m1.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     m1["atr5"] = g_tr["_tr5"].transform(lambda x: x.rolling(5, min_periods=5).mean()) / day_open
     return m1.drop(columns=["_tr5"])
 
@@ -190,52 +229,79 @@ def add_atr5(m1: pd.DataFrame) -> pd.DataFrame:
 # 三分類標籤（0=回歸VWAP／1=無訊號（盤整）／2=延續突破）
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# 2026-07-26 討論：視窗大小是「觸發的那個時間框自己的後 N 根」，不是跨
-# 時間框統一秒數——m1 觸發看後 HOLD_BARS 根 m1（= HOLD_BARS 分鐘），m5
-# 觸發看後 HOLD_BARS 根 m5（= HOLD_BARS*5 分鐘），用該時間框自己的 z-score
-# 序列（例如 m5_vwap_z）判斷未來走勢，而不是統一都看 m1 的 z。
+# 2026-07-26 討論：視窗大小原本是「觸發的那個時間框自己的後 N 根」（m1
+# 觸發看10分鐘、m3看30分鐘、m5看50分鐘），後來改成三個時間框統一看未來
+# LABEL_HORIZON_MINUTES 分鐘——m1/m3/m5 的 z-score 都是每分鐘更新一次的
+# 序列，「30分鐘」對三者直接就是「未來30根」，不用再乘時間框的分鐘數。
+# 仍然是用觸發的那個時間框自己的 z-score 序列（例如 m5 觸發就看
+# m5_vwap_z）判斷未來走勢，而不是統一都看 m1 的 z。
 #
 # 兩個 barrier 分別是「z 回到 0（回歸完成）」跟「z 進一步擴大超過
 # CONTINUATION_STD_MULT（延續）」，不是像 orb/rally/mkt 那樣固定百分比
 # 報酬——這裡衡量的是「價格相對 VWAP 的位置」，不是絕對報酬率。
 
 
-def _label_group_vwap(z: np.ndarray, horizon_bars: int, continuation_mult: float, std_mult: float) -> np.ndarray:
-    """單一 stock/day 的 z-score 序列，逐 bar 往前看最多 horizon_bars 根，
-    判斷先碰到哪個barrier，或 horizon_bars 內都沒碰到（無訊號）。非候選
-    的列（|z| < std_mult）直接跳過不計算，省時間（後面會被篩掉）。"""
+def _shift_within_group(arr: np.ndarray, group_id: np.ndarray, k: int) -> np.ndarray:
+    """把 arr 往未來位移 k 格（取得「未來第k筆」的值），但只在同一組
+    （group_id相同，即同一支股票同一天）內位移——跨組（跨股票/跨日）的
+    位置回傳 NaN，等同 groupby(...).shift(-k)，但用純 numpy 陣列操作
+    實作，資料本來就已依 stock_id/date 排序、同組的列本來就是連續的，
+    不需要真的呼叫 groupby。
+
+    2026-07-26 討論：原本用 groupby(...).apply() 逐列 Python 迴圈算
+    label，3個月全市場資料要等半天；改成外層只跑 horizon_bars 次
+    （≤50，不是跑列數次，列數是千萬等級）、每次都是整欄向量化運算，
+    去掉了逐列的 Python 直譯器開銷，這是實際的效能瓶頸所在。"""
+    n = len(arr)
+    out = np.full(n, np.nan)
+    if k >= n:
+        return out
+    same_group = group_id[:-k] == group_id[k:]
+    out[:-k][same_group] = arr[k:][same_group]
+    return out
+
+
+def _label_array_vwap(
+    z: np.ndarray, group_id: np.ndarray, horizon_bars: int, continuation_mult: float, std_mult: float
+) -> np.ndarray:
+    """對整欄 z-score（不分股票/日，用 group_id 標記邊界）向量化算三分類
+    label（0=回歸/1=無訊號/2=延續），語意跟舊版逐列迴圈完全一致，只是
+    外層迴圈從「跑列數次」改成「跑 horizon_bars 次」。
+
+    每次迴圈 k（1..horizon_bars）都是整欄一次算完「未來第k根」的訊號，
+    用 revert_idx/cont_idx 記錄「目前為止看過的k裡，最早碰到該barrier的
+    k值」——因為k是遞增順序跑的，第一次寫入的k就是最小的k，之後更大的k
+    不會再覆蓋（k < revert_idx 這個條件只有第一次命中時成立）。
+    """
     n = len(z)
+    side = np.sign(z)
+    revert_idx = np.full(n, horizon_bars + 1)  # 尚未命中的哨兵值
+    cont_idx = np.full(n, horizon_bars + 1)
+    valid_count = np.zeros(n, dtype=int)
+
+    for k in range(1, horizon_bars + 1):
+        z_fut = _shift_within_group(z, group_id, k)
+        signed = side * z_fut
+        valid = np.isfinite(signed)
+        valid_count += valid
+
+        hit_revert = valid & (signed <= 0) & (k < revert_idx)
+        revert_idx = np.where(hit_revert, k, revert_idx)
+
+        hit_cont = valid & (signed >= continuation_mult) & (k < cont_idx)
+        cont_idx = np.where(hit_cont, k, cont_idx)
+
     labels = np.full(n, np.nan)
-    for i in range(n - 1):
-        if not np.isfinite(z[i]) or abs(z[i]) < std_mult:
-            continue
-        side = 1.0 if z[i] > 0 else -1.0
-        future = z[i + 1 : i + 1 + horizon_bars] * side
-        future = future[np.isfinite(future)]
-        if len(future) == 0:
-            continue
-        revert_hit = np.argmax(future <= 0) if (future <= 0).any() else len(future)
-        cont_hit = np.argmax(future >= continuation_mult) if (future >= continuation_mult).any() else len(future)
-        if revert_hit < cont_hit:
-            labels[i] = 0  # 回歸
-        elif cont_hit < revert_hit:
-            labels[i] = 2  # 延續
-        elif len(future) == horizon_bars:
-            labels[i] = 1  # 無訊號：兩個barrier都沒碰到，且視窗完整
-        # else: 太靠近資料尾端，視窗不足，保留 NaN
+    labels[revert_idx < cont_idx] = 0  # 回歸
+    labels[cont_idx < revert_idx] = 2  # 延續
+    # 無訊號：兩個barrier在horizon_bars內都沒碰到，且視窗完整（horizon_bars
+    # 根未來資料都有效，不是因為太靠近資料尾端/日底才沒碰到）
+    neither_hit = (revert_idx > horizon_bars) & (cont_idx > horizon_bars) & (valid_count == horizon_bars)
+    labels[neither_hit] = 1
+
+    not_candidate = ~np.isfinite(z) | (np.abs(z) < std_mult)
+    labels[not_candidate] = np.nan
     return labels
-
-
-def _make_labels_for_tf(df: pd.DataFrame, tf: str, continuation_mult: float, std_mult: float) -> pd.Series:
-    horizon_bars = HOLD_BARS * TIMEFRAME_MINUTES[tf]
-    zcol = f"{tf}_vwap_z"
-
-    def _apply(g):
-        return pd.Series(
-            _label_group_vwap(g[zcol].to_numpy(), horizon_bars, continuation_mult, std_mult), index=g.index
-        )
-
-    return df.groupby(["stock_id", "day_date"], group_keys=False).apply(_apply, include_groups=False)
 
 
 def make_vwap_labels(df: pd.DataFrame, std_mult: float = STD_MULT, continuation_mult: float | None = None) -> pd.Series:
@@ -246,21 +312,36 @@ def make_vwap_labels(df: pd.DataFrame, std_mult: float = STD_MULT, continuation_
 
     std_mult/continuation_mult：見 add_vwap_features() 的說明，兩者要跟
     產生 is_candidate/trigger_tf 時用的 std_mult 一致，否則「候選」跟
-    「label計算時判定candidate」的門檻會對不起來。continuation_mult 留
-    None 時＝ std_mult + 1.0（config.CONTINUATION_STD_MULT 預設值的相對
-    關係），實驗不同 std_mult 時延續門檻跟著等比例調整，不用另外手動算。
+    「label計算時判定candidate」的門檻會對不起來。
 
-    df 需已有 stock_id/day_date/is_candidate/trigger_tf/m1_vwap_z/
-    m3_vwap_z/m5_vwap_z 欄位（先呼叫 add_vwap_features(std_mult=std_mult)）。
+    continuation_mult 留 None 時＝ std_mult * 2（2026-07-26 討論：兩個
+    barrier 到觸發點的「距離」要對稱，觸發點才不會天生偏向某一類——觸發時
+    z 剛好等於 std_mult，回歸 barrier(0) 距離是 std_mult，延續 barrier
+    要距離同樣是 std_mult 才公平，也就是 std_mult + std_mult = std_mult*2
+    （例如 std_mult=2.0 時，延續門檻=4.0，兩邊都要走2.0）。原本用
+    std_mult+1.0（std_mult=2.0時延續門檻=3.0，延續只需走1.0、回歸卻要走
+    2.0），延續距離只有回歸的一半，天生比較容易觸發，訓練出來「延續」
+    label比例(43.72%)明顯比回歸(25.36%)高，這個差距有多少是barrier不對稱
+    造成的假象、有多少是市場真的比較常延續，原本設計沒辦法分開看，改成
+    對稱門檻才能讓label比例真正反映市場行為。實驗不同std_mult時延續門檻
+    跟著等比例調整，不用另外手動算。
     """
     if continuation_mult is None:
-        continuation_mult = std_mult + 1.0
-    label = pd.Series(np.nan, index=df.index)
+        continuation_mult = std_mult * 2
+
+    # group_id：同一支股票同一天標同一個整數，給 _shift_within_group() 判斷
+    # 「未來第k筆」是不是還在同一組內，比逐次呼叫 groupby(...).shift(-k)
+    # 快（只需要算一次，跟 tf 無關）。
+    group_id = df.groupby(["stock_id", "day_date"], sort=False, observed=True).ngroup().to_numpy()
+    trigger_tf = df["trigger_tf"].to_numpy()
+
+    label = np.full(len(df), np.nan)
     for tf in ("m1", "m3", "m5"):
-        s = _make_labels_for_tf(df, tf, continuation_mult, std_mult)
-        mask = df["trigger_tf"] == tf
-        label[mask] = s[mask]
-    return label
+        z = df[f"{tf}_vwap_z"].to_numpy()
+        labels_arr = _label_array_vwap(z, group_id, LABEL_HORIZON_MINUTES, continuation_mult, std_mult)
+        mask = trigger_tf == tf
+        label[mask] = labels_arr[mask]
+    return pd.Series(label, index=df.index)
 
 
 def _filter_session(df: pd.DataFrame, start=SESSION_START, end=SESSION_END) -> pd.DataFrame:
@@ -286,15 +367,21 @@ def make_features(
     m1: pd.DataFrame,
     std_mult: float = STD_MULT,
     atr5_threshold: float = ATR5_FILTER_THRESHOLD,
+    m3: pd.DataFrame | None = None,
+    m5: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     給定全市場的 1 分K（load_m1() 或 load_m1_live() 的輸出），跑完整的
-    vwap_ml pipeline：VWAP z-score → 候選觸發 → label → ATR5平盤過濾 →
-    只保留候選列 → 時段過濾。
+    vwap_ml pipeline：時段裁切 → VWAP z-score → 候選觸發 → label →
+    ATR5平盤過濾 → 只保留候選列 → 時段過濾。
 
     std_mult：候選觸發門檻，見 add_vwap_features()/make_vwap_labels() 的
     說明，實驗不同門檻時傳這裡就好，train.py::_prepare_data() 會轉傳。
     atr5_threshold：ATR5平盤過濾的絕對門檻，見 add_atr5() 的說明。
+    m3/m5：3分鐘/5分鐘 rolling OHLCV，訓練/回測應該傳
+    data/query.py::load_m3()/load_m5() 讀現成批次快取（不要留空自己現算，
+    見 add_vwap_features() 的說明），predict_live() 因為要處理批次快取
+    沒有的「今天」資料，留空即可。
 
     m1 需已有 stock_id/date/open/high/low/close/volume 欄位。
     """
@@ -303,7 +390,17 @@ def make_features(
     m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
     m1["day_date"] = m1["date"].dt.date
 
-    df = add_vwap_features(m1, std_mult=std_mult)
+    # 裁到 SESSION_END + 最長label視窗，中午/下午盤的資料整個pipeline
+    # 都用不到，提前砍掉能讓後面所有計算的資料量降到原本的4成左右，見
+    # _trim_to_needed_window() 的說明（2026-07-26 討論，全歷史訓練記憶體
+    # 爆掉的主因之一）。
+    m1 = _trim_to_needed_window(m1)
+    if m3 is not None:
+        m3 = _trim_to_needed_window(m3)
+    if m5 is not None:
+        m5 = _trim_to_needed_window(m5)
+
+    df = add_vwap_features(m1, std_mult=std_mult, m3=m3, m5=m5)
     df = add_bar_features(df)
     df = add_atr5(df)
     df["target"] = make_vwap_labels(df, std_mult=std_mult)

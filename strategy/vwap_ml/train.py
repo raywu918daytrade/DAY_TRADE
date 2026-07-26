@@ -40,14 +40,14 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from data.query import load_m1
+from data.query import load_m1, load_m3, load_m5
 from strategy.vwap_ml.config import ATR5_FILTER_THRESHOLD, MODEL_TYPE, STD_MULT
 from strategy.vwap_ml.features import FEATURES, make_features
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH_LGBM = _ROOT / "models/vwap_ml_lgbm.pkl"
 _CACHE_PATH = _ROOT / "cache/vwap_ml_prepared.parquet"
-_SOURCE_DIRS = [_ROOT / "db/m1"]
+_SOURCE_DIRS = [_ROOT / "db/m1", _ROOT / "db/m3", _ROOT / "db/m5"]
 
 _TARGET_NAMES = ["回歸", "無訊號", "延續"]
 
@@ -71,10 +71,18 @@ def _prepare_data(
     atr5_threshold: float = ATR5_FILTER_THRESHOLD,
 ) -> pd.DataFrame:
     """
-    use_cache（比照 strategy/mkt/train.py::_prepare_data() 的慣例）：
-        True  = 不管 db/m1 有沒有更新，只要cache檔案存在就直接用
-        False（預設）= 自動判斷：cache存在且比 db/m1 最新的檔案還新，就
-                直接用cache；否則重新跑一次完整流程並覆蓋掉舊cache。
+    use_cache（2026-07-26 改：跟 strategy/mkt/train.py 的慣例相反，故意
+    改成「預設不信任 cache」）：
+        False（預設）= 不管 cache 存不存在、新不新，一律重新計算——
+                cache 的新鮮度比對（_cache_is_fresh()）只看 db/m1/db/m3/
+                db/m5 這些資料檔案的時間戳，偵測不到「features.py 裡的
+                計算邏輯改了」這種情況（這個階段密集調整 label 定義，已經
+                因為這樣誤用過舊cache兩次），預設一律重算才不會沒發現
+                自己在用舊邏輯算出來的結果。
+        True  = 才做新鮮度比對——cache比來源資料新就直接讀，否則照樣重算。
+                只有明確知道「這段期間沒有改過任何計算邏輯，只是想連續
+                看幾次 evaluate/confidence 的結果」時才手動設 True，享受
+                省下重算時間的好處。
 
     std_mult/atr5_threshold（2026-07-26新增，比照
     strategy/mkt/train.py::_prepare_data() 的 atr5_threshold 參數化做法）：
@@ -86,19 +94,43 @@ def _prepare_data(
     才會這樣用，不影響正式train/predict。
     """
     skip_cache = std_mult != STD_MULT or atr5_threshold != ATR5_FILTER_THRESHOLD
-    if not skip_cache:
-        if use_cache and _CACHE_PATH.exists():
-            print("use_cache=True，直接讀取cache（不檢查來源資料有沒有更新）...")
-            return pd.read_parquet(_CACHE_PATH)
-        if not use_cache and _cache_is_fresh():
-            print("cache比來源資料新，直接讀取cache...")
-            return pd.read_parquet(_CACHE_PATH)
+    if not skip_cache and use_cache and _cache_is_fresh():
+        print("cache比來源資料新，直接讀取cache...")
+        return pd.read_parquet(_CACHE_PATH)
 
     print("載入分K...")
     m1 = load_m1()
+    # 讀現成的 m3/m5 批次快取（data/build_m3_m5_rolling.py 預先算好），不要
+    # 讓 make_features() 內部用 compute_m3()/compute_m5() 對全市場全歷史
+    # 重新現算一次——那樣等於又製造出兩份跟 m1 一樣大的 dataframe，是
+    # 2026-07-26 訓練全歷史資料時記憶體爆掉的主因之一，見
+    # features.py::add_vwap_features() 的說明。
+    m3 = load_m3()
+    m5 = load_m5()
+
+    # stock_id 原本是 object（Python字串）dtype，全歷史規模下記憶體被嚴重
+    # 放大（2026-07-26實測：db/m1 全歷史1.56億列只有3090種不重複代號，
+    # deep memory profile顯示這一欄單獨就佔了m1總記憶體12.4GB裡的8.3GB，
+    # 是造成訓練時記憶體衝到40GB的主因——m1/m3/m5三份dataframe的stock_id
+    # 欄位加起來將近25GB）。轉成category（整數編碼+一份代號對照表）大幅
+    # 降低記憶體。三份dataframe要共用同一組categories（各自先
+    # drop_duplicates()取出代號集合再取聯集，不要直接對上億列呼叫
+    # unique()，那一步本身也很花記憶體/時間），這樣後面
+    # merge(on=["stock_id","date"])才不會因為categories不一致，把
+    # category悄悄轉回object，記憶體效果就白做了。
+    stock_ids = pd.unique(
+        pd.concat(
+            [m1["stock_id"].drop_duplicates(), m3["stock_id"].drop_duplicates(), m5["stock_id"].drop_duplicates()],
+            ignore_index=True,
+        )
+    )
+    stock_dtype = pd.CategoricalDtype(categories=stock_ids)
+    m1["stock_id"] = m1["stock_id"].astype(stock_dtype)
+    m3["stock_id"] = m3["stock_id"].astype(stock_dtype)
+    m5["stock_id"] = m5["stock_id"].astype(stock_dtype)
 
     print("算 VWAP z-score / 候選觸發 / 三分類標籤...")
-    df = make_features(m1, std_mult=std_mult, atr5_threshold=atr5_threshold)
+    df = make_features(m1, std_mult=std_mult, atr5_threshold=atr5_threshold, m3=m3, m5=m5)
     df = df.dropna(subset=FEATURES + ["target"])
     df["target"] = df["target"].astype(int)
     print(f"有效樣本: {len(df):,} 筆")
@@ -356,7 +388,7 @@ def main(
         parser.add_argument(
             "--use_cache",
             action="store_true",
-            help="不管來源資料有沒有更新，只要cache存在就直接用",
+            help="cache比來源資料新就直接讀（省時間）；不加這個旗標＝無條件重新計算並覆蓋cache（改過計算邏輯後要用這個）",
         )
         parser.add_argument(
             "--start_date",
@@ -400,7 +432,7 @@ if __name__ == "__main__":
     threshold = None  # 只有 mode="evaluate" 用得到；留 None = 用 evaluate() 自己的預設值
     model_type = "lgbm"  # 目前只有 lgbm
     use_cache = False
-    start_date = "2026-03-01"  # 只有 mode="train" 用得到；留 None = 用全部歷史
+    start_date = "2024-01-01"  # 只有 mode="train" 用得到；留 None = 用全部歷史
     main(
         mode=mode,
         test_days=test_days,

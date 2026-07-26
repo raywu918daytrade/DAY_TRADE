@@ -29,18 +29,24 @@ import os
 # 非預設值跳過cache寫入的做法）。
 STD_MULT = 2.0
 
-# 「延續」判定門檻預設值＝STD_MULT+1.0（例如 std_mult=1.5 時延續門檻=2.5），
-# 這個relationship寫在 features.py::make_vwap_labels() 裡（continuation_mult
-# 留 None 時動態算 std_mult+1.0），這裡不重複定義成獨立常數，避免兩邊
+# 「延續」判定門檻預設值＝STD_MULT*2（例如 std_mult=1.5 時延續門檻=3.0），
+# 讓回歸/延續兩個barrier到觸發點的距離對稱（觸發點z=std_mult，回歸要走到
+# 0、距離=std_mult；延續要走到std_mult*2、距離也是std_mult），不對稱
+# 的話其中一類天生比較容易觸發，label比例會被barrier設計本身扭曲，不是
+# 真實反映市場行為（2026-07-26討論，原本用std_mult+1.0，延續label比例
+# 43.72%明顯比回歸25.36%高，一部分就是這個不對稱造成的假象）。這個
+# relationship寫在 features.py::make_vwap_labels() 裡（continuation_mult
+# 留 None 時動態算 std_mult*2），這裡不重複定義成獨立常數，避免兩邊
 # 各自維護一份、std_mult 做實驗改了但這裡忘記跟著改。
 
 # ── 標籤視窗（比照 orb/rally/mkt 的 triple barrier HOLD_BARS 概念） ───────
-# 2026-07-26 討論：視窗大小是「觸發的那個時間框自己的後 N 根」，不是跨
-# 時間框統一秒數（例如 m1 觸發看後10根m1=10分鐘、m5 觸發看後10根m5=50
-# 分鐘）。先沿用 mkt 的 HOLD_BARS=10 當起點，還沒針對 vwap_ml 重新驗證過
-# 這個數字合不合適。
-HOLD_BARS = 10
-TIMEFRAME_MINUTES = {"m1": 1, "m3": 3, "m5": 5}
+# 2026-07-26 討論：原本視窗大小是「觸發的那個時間框自己的後N根」（m1觸發
+# 看10分鐘、m3看30分鐘、m5看50分鐘），後來改成三個時間框統一看未來
+# LABEL_HORIZON_MINUTES 分鐘——m1/m3/m5 的 z-score 都是「每分鐘更新一次」
+# 的序列（不是每3/5分鐘才有一筆），所以「30分鐘」對三者來說都直接等於
+#「未來30根」，不用再乘時間框的分鐘數。這個數字還沒針對 vwap_ml 重新
+# 驗證過合不合適。
+LABEL_HORIZON_MINUTES = 30
 
 # ── 即時交易信心度門檻預設值 ──────────────────────────────────────────────
 # 跟 predict.py::predict_live() 的 threshold 參數預設值一致，比照
