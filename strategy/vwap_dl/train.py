@@ -600,7 +600,7 @@ if __name__ == "__main__":
         evaluate     載入已存模型，對測試集輸出混淆矩陣 + 分類報告 + AUC
         confidence   掃描不同信心度門檻下的 coverage / AUC / 混淆矩陣
     """
-    mode = "train"
+    mode = "confidence"
     test_days = 30
     max_rounds = 10
     chunk_size = 500_000

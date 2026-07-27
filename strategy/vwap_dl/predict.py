@@ -1,9 +1,12 @@
 """
 即時推論 — predict()（批次機率矩陣，回測用）、predict_live()（即時推論入口）。
 
-跟 vwap_ml/predict.py 同樣的設計：3 分類（回歸=0/無訊號=1/延續=2），配合
-trigger_side 轉成做多/做空方向。只交易「回歸」訊號（同 vwap_ml 的決定，
-延續 precision 不夠可靠）。
+3 分類（回歸=0/無訊號=1/延續=2），配合 trigger_side 轉成做多/做空方向。
+只交易「回歸」訊號（同 vwap_ml 的決定，延續 precision 不夠可靠）。
+
+方向對應（vwap_dl 是做回歸模型，預測價格回到 VWAP）：
+    -2 標準差（trigger_side="lower"，價格低於 VWAP）→ 回歸到 VWAP → 做多 (up)
+    +2 標準差（trigger_side="upper"，價格高於 VWAP）→ 回歸到 VWAP → 做空 (down)
 """
 
 import sys
@@ -33,7 +36,20 @@ from strategy.vwap_ml.features import make_features
 
 
 def _direction_probas(probs: np.ndarray, trigger_sides: np.ndarray):
-    """把「回歸」(class=0) 機率轉成做多/做空機率。"""
+    """把「回歸」(class=0) 機率轉成做多/做空機率。
+
+    VWAP z-score 觸發點與方向的對應（基於回歸到 VWAP 的假設）：
+
+        trigger_side="upper"（z > +2σ，價格在 VWAP 之上）：
+            VWAP = 下方吸引子，回歸到 VWAP → 價格下跌 → 做空 (down)
+        trigger_side="lower"（z < -2σ，價格在 VWAP 之下）：
+            VWAP = 上方吸引子，回歸到 VWAP → 價格上漲 → 做多 (up)
+
+    只用回歸機率（class=0），延續（class=2）不使用——同 vwap_ml 的決定。
+
+    回傳 (p_up, p_down) 兩個跟 probs 等長的 numpy array，
+    同一個 trigger_side 只有對應方向有非零機率。
+    """
     p_revert = probs[:, 0]
     is_upper = trigger_sides == "upper"
     p_up = np.where(is_upper, 0.0, p_revert)
