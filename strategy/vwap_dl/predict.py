@@ -258,13 +258,19 @@ def predict_live(
         m1_live[pd.to_datetime(m1_live["date"]) == pd.Timestamp(minute_str)].set_index("stock_id")["close"].to_dict()
     )
 
+    # trigger_side 決定唯一方向，p_up/p_down 只有一邊非零（_direction_probas
+    # 的遮罩設計）。之前分開判斷 p_up>=threshold / p_down>=threshold，threshold=0
+    # 時（on_minute 傳 threshold=0 取全量做監控）0.0>=0 恆真，導致每支候選股
+    # 兩個方向都會各生一筆（一筆真機率、一筆假的 0.0），讓 vwap_dl_up/down
+    # 同時把同一支股票推進各自的監控清單（2026-07-27 發現）。改成用
+    # trigger_side 直接決定唯一方向，每支候選股最多只出現一筆。
     signals = []
     for i, sid in enumerate(stock_ids):
         price = latest_close.get(sid)
         if price is None:
             continue
-        if float(p_up[i]) >= threshold:
-            signals.append({"stock_id": sid, "proba": float(p_up[i]), "price": price, "direction": "up"})
-        if float(p_down[i]) >= threshold:
-            signals.append({"stock_id": sid, "proba": float(p_down[i]), "price": price, "direction": "down"})
+        direction = "down" if trigger_sides[i] == "upper" else "up"
+        proba = float(p_down[i]) if direction == "down" else float(p_up[i])
+        if proba >= threshold:
+            signals.append({"stock_id": sid, "proba": proba, "price": price, "direction": direction})
     return sorted(signals, key=lambda x: -x["proba"])

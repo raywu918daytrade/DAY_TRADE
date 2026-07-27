@@ -154,15 +154,19 @@ def predict_live(
     if valid.empty:
         return []
 
+    # trigger_side 決定唯一方向，p_up/p_down 只有一邊非零（_direction_probas
+    # 的遮罩設計）。之前分開判斷 up_p>=threshold / down_p>=threshold，
+    # threshold=0 時（on_minute 監控用途傳 threshold=0）0.0>=0 恆真，導致
+    # 被遮罩成0的那個方向也會生一筆假訊號，讓 vwap_ml_up/down 同時把同一支
+    # 股票推進各自監控清單（2026-07-27 vwap_dl 發現同樣的 bug，這裡一起修）。
+    # 改成用 trigger_side 直接決定唯一方向，每支候選股最多只出現一筆。
     p_up, p_down = _direction_probas(model, valid)
     signals = []
     for (_, row), up_p, down_p in zip(valid.iterrows(), p_up, p_down):
-        if up_p >= threshold:
+        direction = "down" if row["trigger_side"] == "upper" else "up"
+        proba = float(down_p) if direction == "down" else float(up_p)
+        if proba >= threshold:
             signals.append(
-                {"stock_id": row["stock_id"], "proba": float(up_p), "price": float(row["close"]), "direction": "up"}
-            )
-        if down_p >= threshold:
-            signals.append(
-                {"stock_id": row["stock_id"], "proba": float(down_p), "price": float(row["close"]), "direction": "down"}
+                {"stock_id": row["stock_id"], "proba": proba, "price": float(row["close"]), "direction": direction}
             )
     return sorted(signals, key=lambda x: -x["proba"])
