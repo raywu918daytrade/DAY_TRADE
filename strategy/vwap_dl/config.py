@@ -24,13 +24,17 @@ ATR5_FILTER_THRESHOLD = 0.01000
 
 # ── DL 模型架構（2026-07-27 改：ResNet + GRU 混合） ────────────────────────
 # ResNet 看近 10 分鐘原始 OHLCV（5 channels × 10 步）
-# GRU 從 9:00 到當下逐分鐘看 14 維特徵（含 VWAP z-score）
+# GRU 從 9:00 到當下逐分鐘看 18 維特徵（2026-07-28 加 4 個大盤 VWAP 特徵）
 LOOKBACK_MINUTES = 10
 
 # CNN embedding 維度 / GRU hidden 維度
 CNN_EMBED_DIM = 32
-# GRU 每步輸入維度：OHLCV(5) + atr5/ma10/ma5/ma3/ret_vs_idx/idx_ret_since_open(6) + m1_vwap_z/m3_vwap_z/m5_vwap_z(3) = 14
-GRU_INPUT_DIM = 14
+# GRU 每步輸入維度：OHLCV(5) + atr5/ma10/ma5/ma3/ret_vs_idx/idx_ret_since_open(6)
+#   + m1_vwap_z/m3_vwap_z/m5_vwap_z(3) + 大盤 VWAP 特徵(4) = 18
+#   2026-07-28 新增 4 個大盤 VWAP 特徵（market_z_score_m5 /
+#   market_vwap_alignment_score / market_vwap_spread_1_5 /
+#   velocity_ratio_to_market），GRU_INPUT_DIM 從 14 改為 18。
+GRU_INPUT_DIM = 18
 GRU_HIDDEN_DIM = 64
 GRU_N_LAYERS = 2
 DROPOUT = 0.3

@@ -72,7 +72,7 @@ class ResNetGRUModel(nn.Module):
     """ResNet + GRU 混合模型。
 
     ResNet 看近 10 分鐘原始 OHLCV → local embedding。
-    GRU 從 9:00 到當下逐分鐘看 14 維特徵 → global hidden。
+    GRU 從 9:00 到當下逐分鐘看 18 維特徵（含 VWAP z-score + 大盤 VWAP 特徵）。
     Concat → MLP → 3 分類 logits。
     """
 

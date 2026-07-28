@@ -31,7 +31,10 @@ _ROOT = Path(__file__).parent.parent.parent
 _CACHE_DIR = _ROOT / "cache/vwap_dl"
 _SOURCE_DIRS = ["db/m1", "db/m3", "db/m5", "db/m3_std", "db/m5_std"]
 
-# GRU 每步 14 維特徵：OHLCV(5) + 技術指標(6) + VWAP z-score(3)
+# GRU 每步 18 維特徵：OHLCV(5) + 技術指標(6) + VWAP z-score(3) + 大盤 VWAP 特徵(4)
+# 2026-07-28 新增 4 個大盤 VWAP 特徵（market_z_score_m5 /
+#   market_vwap_alignment_score / market_vwap_spread_1_5 /
+#   velocity_ratio_to_market），GRU_INPUT_DIM 同步從 14 改為 18。
 _GRU_FEATURE_COLS = [
     "m1_open",
     "m1_high",
@@ -47,6 +50,10 @@ _GRU_FEATURE_COLS = [
     "m1_vwap_z",
     "m3_vwap_z",
     "m5_vwap_z",
+    "market_z_score_m5",
+    "market_vwap_alignment_score",
+    "market_vwap_spread_1_5",
+    "velocity_ratio_to_market",
 ]
 # ResNet 只看原始 OHLCV（5 channels）
 _RESNET_COLS = ["m1_open", "m1_high", "m1_low", "m1_close", "m1_volume"]
@@ -329,6 +336,23 @@ def build_dataset(
     wide["m1_vwap_z"] = wide["m1_vwap_z"].fillna(0)
     wide["m3_vwap_z"] = wide["m3_vwap_z"].fillna(0)
     wide["m5_vwap_z"] = wide["m5_vwap_z"].fillna(0)
+
+    # 2026-07-28 新增：大盤（0050）VWAP 特徵 merge 回 wide（同一分鐘所有股票共用
+    # 同一組大盤值，所以按 date 去重後 merge）。
+    market_cols = candidates[
+        [
+            "date",
+            "market_z_score_m5",
+            "market_vwap_alignment_score",
+            "market_vwap_spread_1_5",
+            "velocity_ratio_to_market",
+        ]
+    ].drop_duplicates("date")
+    wide = wide.merge(market_cols, on="date", how="left")
+    wide["market_z_score_m5"] = wide["market_z_score_m5"].fillna(0)
+    wide["market_vwap_alignment_score"] = wide["market_vwap_alignment_score"].fillna(0)
+    wide["market_vwap_spread_1_5"] = wide["market_vwap_spread_1_5"].fillna(0)
+    wide["velocity_ratio_to_market"] = wide["velocity_ratio_to_market"].fillna(0)
 
     # 依月份分組候選，逐月建視窗
     candidates["_month"] = candidates["date"].apply(_month_key)
