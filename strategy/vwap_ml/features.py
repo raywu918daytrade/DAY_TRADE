@@ -55,13 +55,9 @@ def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
     return s.reindex(index)
 
 
-def _add_vwap_z(df: pd.DataFrame, prefix: str, keep_vwap: bool = False) -> pd.DataFrame:
+def _add_vwap_z(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     """算單一時間框（m1/m3/m5）的累積 VWAP 偏離 z-score，加欄位
     {prefix}_vwap_z（累積 VWAP 本身不留在輸出裡，呼叫端只需要 z-score）。
-
-    2026-07-28 新增 keep_vwap 參數：設為 True 時保留 {prefix}_vwap 欄位
-    （實際 VWAP 值，不是 z-score），供 add_market_vwap_features() 計算
-    大盤 VWAP 特徵使用。預設 False，不影響既有行為。
 
     標準差用「累積至今」的 expanding std，不是全天 std——全天 std 會用到
     未來才知道的資訊（lookahead），expanding 只用當下已經發生的 bar，跟
@@ -82,10 +78,7 @@ def _add_vwap_z(df: pd.DataFrame, prefix: str, keep_vwap: bool = False) -> pd.Da
     g_dev = df.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     dev_std = _degroup(g_dev["_dev"].expanding(min_periods=5).std(), df.index)
     df[f"{prefix}_vwap_z"] = df["_dev"] / dev_std.replace(0, np.nan)
-    drop_cols = ["_pv", "_dev"]
-    if keep_vwap:
-        df[f"{prefix}_vwap"] = vwap
-    return df.drop(columns=[c for c in drop_cols if c in df.columns])
+    return df.drop(columns=["_pv", "_dev"])
 
 
 def _trim_to_needed_window(df: pd.DataFrame) -> pd.DataFrame:
