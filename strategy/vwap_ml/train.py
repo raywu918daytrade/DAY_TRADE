@@ -62,6 +62,7 @@ def _cache_path_for(start_date: str | None) -> Path:
         return _CACHE_PATH
     return _CACHE_PATH.parent / f"vwap_ml_prepared_{start_date}.parquet"
 
+
 _TARGET_NAMES = ["回歸", "無訊號", "延續"]
 
 

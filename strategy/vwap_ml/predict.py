@@ -118,10 +118,14 @@ def predict_live(
     沒實作這個函式的策略模組會自動當作 {}，不影響 main/premarket.py 的
     refresh_prewarm() 流程）。
 
-    day_trade_stocks: 當沖標的 set，若提供則只推論這些股票——vwap_ml 沒有
-    像 mkt 的 ret_vs_idx 需要靠大盤代理股票（0050）當基準的問題，可以在
-    算特徵之前就先篩，不用像 mkt 那樣延後篩選（見 strategy/mkt/predict.py
-    的說明）。
+    day_trade_stocks: 當沖標的 set，若提供則只推論這些股票。
+
+    ⚠️ 跟 mkt 的 predict_live() 一樣：ret_vs_idx 要用 0050 自己的分K資料當
+    基準（見 features.py::add_ret_vs_idx()），如果 0050 不在當沖名單裡就會
+    被先篩掉，之後就沒有基準可以算。所以這裡先對完整 m1_live 算完特徵（含
+    ret_vs_idx），才排除 0050 本身、套用 day_trade_stocks 篩選。這跟
+    make_features() 的設計一致——它也是在篩選候選之前就呼叫 add_ret_vs_idx()。
+    2026-07-27 改：比照 mkt 的做法。
 
     回傳格式：[{"stock_id", "proba", "price", "direction": "up"|"down"}, ...]
     ——同一支股票在同一分鐘理論上只會出現一次（三分類機率加總=1，「同時
@@ -137,12 +141,17 @@ def predict_live(
     if m1_live.empty:
         return []
 
-    if day_trade_stocks:
-        m1_live = m1_live[m1_live["stock_id"].isin(day_trade_stocks)]
-        if m1_live.empty:
-            return []
-
+    # ret_vs_idx 要靠 0050 自己的資料算基準，所以要在排除/篩選之前先算完
+    # （見 features.py::add_ret_vs_idx() 的說明），make_features() 內部在
+    # 篩選候選之前就呼叫 add_ret_vs_idx()，所以不能先篩 day_trade_stocks。
     df = make_features(m1_live)
+    if df.empty:
+        return []
+
+    # 2026-07-27：排除 0050 本身不要當成交易標的 + 套用 day_trade_stocks 篩選
+    df = df[df["stock_id"] != "0050"]
+    if day_trade_stocks:
+        df = df[df["stock_id"].isin(day_trade_stocks)]
     if df.empty:
         return []
 

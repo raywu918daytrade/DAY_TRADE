@@ -36,6 +36,7 @@ import pandas as pd
 from data.resample import compute_m3, compute_m5
 from strategy.vwap_ml.config import (
     ATR5_FILTER_THRESHOLD,
+    IDX_SYMBOL,
     LABEL_HORIZON_MINUTES,
     SESSION_END,
     SESSION_START,
@@ -54,9 +55,13 @@ def _degroup(s: pd.Series, index: pd.Index) -> pd.Series:
     return s.reindex(index)
 
 
-def _add_vwap_z(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+def _add_vwap_z(df: pd.DataFrame, prefix: str, keep_vwap: bool = False) -> pd.DataFrame:
     """算單一時間框（m1/m3/m5）的累積 VWAP 偏離 z-score，加欄位
     {prefix}_vwap_z（累積 VWAP 本身不留在輸出裡，呼叫端只需要 z-score）。
+
+    2026-07-28 新增 keep_vwap 參數：設為 True 時保留 {prefix}_vwap 欄位
+    （實際 VWAP 值，不是 z-score），供 add_market_vwap_features() 計算
+    大盤 VWAP 特徵使用。預設 False，不影響既有行為。
 
     標準差用「累積至今」的 expanding std，不是全天 std——全天 std 會用到
     未來才知道的資訊（lookahead），expanding 只用當下已經發生的 bar，跟
@@ -77,7 +82,10 @@ def _add_vwap_z(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     g_dev = df.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
     dev_std = _degroup(g_dev["_dev"].expanding(min_periods=5).std(), df.index)
     df[f"{prefix}_vwap_z"] = df["_dev"] / dev_std.replace(0, np.nan)
-    return df.drop(columns=["_pv", "_dev"])
+    drop_cols = ["_pv", "_dev"]
+    if keep_vwap:
+        df[f"{prefix}_vwap"] = vwap
+    return df.drop(columns=[c for c in drop_cols if c in df.columns])
 
 
 def _trim_to_needed_window(df: pd.DataFrame) -> pd.DataFrame:
@@ -99,6 +107,201 @@ def _trim_to_needed_window(df: pd.DataFrame) -> pd.DataFrame:
     """
     cutoff = (datetime.combine(datetime.min, dtime(*SESSION_END)) + timedelta(minutes=LABEL_HORIZON_MINUTES)).time()
     return df[df["date"].dt.time <= cutoff]
+
+
+def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFrame:
+    """
+    2026-07-27 新增：算「個股從今日開盤累積到現在的報酬率」減去「0050
+    從今日開盤累積到現在的報酬率」，逐分鐘更新，回傳加了 ret_vs_idx/idx_ret_since_open
+    欄位的 m1（複本，不動傳進來的原始 df）。
+
+    比照 strategy/mkt/features.py::add_ret_vs_idx() 的實作——個股跑輸大盤
+    （ret_vs_idx<0）時，回歸VWAP的機率是否更高？訓練時把這個資訊交給模型
+    自己判斷。
+
+    >0 代表這支股票從開盤到現在，漲得比大盤多（相對強勢）；
+    <0 代表跑輸大盤（相對弱勢）。
+
+    idx_ret_since_open：0050 自己從開盤累積到現在的報酬率，提供大盤自身
+    的方向資訊（同樣 ret_vs_idx=-2%，大盤漲2%個股沒漲 vs 大盤跌1%個股跌3%
+    意義完全不同）。
+
+    ⚠️ 一定要在 user 篩選 day_trade_stocks / 排除 0050 之前呼叫（0050 被
+    篩掉後就沒有基準可以算了），predict_live() 比照 mkt 的做法——先對完整
+    m1_live 算特徵，才排除 0050 跟套用 day_trade_stocks 篩選。
+
+    m1 需已有 stock_id/date/day_date/open/close 欄位，date 需為 datetime。
+    """
+    m1 = m1.copy()
+    g_day = m1.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
+    day_open = g_day["open"].transform("first").replace(0, np.nan)
+    ret_since_open = m1["close"] / day_open - 1
+
+    idx = m1[m1["stock_id"] == idx_symbol][["date", "close", "open"]].drop_duplicates("date").copy()
+    idx_g_day = idx.groupby(idx["date"].dt.date, group_keys=False)
+    idx_day_open = idx_g_day["open"].transform("first").replace(0, np.nan)
+    idx["idx_ret_since_open"] = idx["close"] / idx_day_open - 1
+    idx = idx[["date", "idx_ret_since_open"]]
+
+    m1 = m1.merge(idx, on="date", how="left")
+    m1["ret_vs_idx"] = ret_since_open - m1["idx_ret_since_open"]
+    return m1
+
+
+def add_market_vwap_features(
+    df: pd.DataFrame,
+    m3: pd.DataFrame | None = None,
+    m5: pd.DataFrame | None = None,
+    idx_symbol: str = IDX_SYMBOL,
+) -> pd.DataFrame:
+    """
+    2026-07-28 新增：大盤（0050）的 VWAP 相關特徵，共 4 個欄位：
+
+    1. market_z_score_m5
+       大盤 M5 VWAP 的偏離 z-score。
+       當個股觸及 +2σ 且大盤自己也嚴重過熱時，是個股+大盤共振回歸空單點。
+       直接從 df 裡的 0050 m5_vwap_z 廣播，不額外算。
+
+    2. market_vwap_alignment_score
+       大盤 M1/M3/M5 三個時間框的 VWAP 排列方向：
+         +1 = M1 VWAP > M3 VWAP > M5 VWAP（多頭強勢排列，短線最強）
+          0 = 盤整或纏繞（不符合上述兩種情況）
+         -1 = M1 VWAP < M3 VWAP < M5 VWAP（空頭強勢排列，短線最弱）
+       當個股突破 +2σ 且 alignment=+1 → 大盤帶動的真突破，做延續勝率高
+       當個股突破 +2σ 但 alignment≤0  → 個股自己暴衝，大盤沒跟，做回歸
+
+    3. market_vwap_spread_1_5
+       大盤 M1 VWAP 與 M5 VWAP 的距離： (M1_VWAP - M5_VWAP) / M5_VWAP
+       高 Expansion（絕對值大）→ 大盤處在趨勢擴張期，做延續勝率高
+       低 Compression（絕對值接近 0）→ 大盤無量盤整，做回歸勝率高
+
+    4. velocity_ratio_to_market
+       個股價格斜率 vs 大盤 M1 VWAP 斜率的比值：
+         slope_stock = close - close_shift(3)  （3分鐘價格變動）
+         slope_market = market_m1_vwap - market_m1_vwap_shift(3)
+         速度比過高（個股暴衝，大盤沒跟）→ 情緒性過熱，做回歸
+         速度比適中（大盤與個股同步加速）→ 全面性突破，做延續
+
+    df 需已有 stock_id/day_date/date/close/volume 欄位，且已執行過
+    add_vwap_features()（確保 m1_vwap_z/m3_vwap_z/m5_vwap_z 存在）。
+    m3/m5（選填）：3分鐘/5分鐘 rolling OHLCV，跟 make_features() 的慣例
+    一致——訓練/回測傳 data/query.py::load_m3()/load_m5()，predict_live()
+    留空（會對 0050 的 m1 現算）。
+    """
+    df = df.copy()
+
+    # ── 提取 0050 的資料 ──
+    idx_mask = df["stock_id"] == idx_symbol
+    idx_rows = df[idx_mask]
+    if idx_rows.empty:
+        # 沒有 0050 就無法算大盤特徵，安靜地回傳原 df
+        return df
+
+    # ════════════════════════════════════════════════════════════════
+    # 1. market_z_score_m5
+    # ════════════════════════════════════════════════════════════════
+    # 0050 的 m5_vwap_z 已經在 df 裡（add_vwap_features() 算的），
+    # 直接廣播到同一分鐘的所有股票。
+    idx_m5_z = idx_rows[["date", "m5_vwap_z"]].drop_duplicates("date")
+    z_score = df.merge(
+        idx_m5_z.rename(columns={"m5_vwap_z": "market_z_score_m5"}),
+        on="date",
+        how="left",
+    )["market_z_score_m5"]
+    df["market_z_score_m5"] = z_score
+
+    # ════════════════════════════════════════════════════════════════
+    # 2. market_vwap_alignment_score & 3. market_vwap_spread_1_5
+    # ════════════════════════════════════════════════════════════════
+    # 需要 0050 的 M1/M3/M5 VWAP 值。M1 直接從 df 算，M3/M5 從傳入的
+    # m3/m5 DataFrame 或現算 compute_m3()/compute_m5() 取得。
+
+    # -- M1 VWAP（從 df 裡的 0050 資料算累積 VWAP）--
+    idx_m1 = idx_rows[["date", "close", "volume", "day_date"]].drop_duplicates("date").copy()
+    idx_m1["_pv"] = idx_m1["close"] * idx_m1["volume"]
+    g_m1 = idx_m1.groupby("day_date", group_keys=False, observed=True)
+    idx_m1["_cum_pv"] = g_m1["_pv"].cumsum()
+    idx_m1["_cum_vol"] = g_m1["volume"].cumsum().replace(0, np.nan)
+    idx_m1["_m1_vwap"] = idx_m1["_cum_pv"] / idx_m1["_cum_vol"]
+
+    # -- M3 VWAP --
+    if m3 is None:
+        # 從 df（含所有股票的 M1）現算 M3
+        m3_df = compute_m3(df)
+    else:
+        m3_df = m3.copy()
+    idx_m3 = m3_df[m3_df["stock_id"] == idx_symbol][["date", "close", "volume"]].drop_duplicates("date").copy()
+    if not idx_m3.empty:
+        idx_m3["day_date"] = idx_m3["date"].dt.date
+        idx_m3["_pv"] = idx_m3["close"] * idx_m3["volume"]
+        g_m3 = idx_m3.groupby("day_date", group_keys=False, observed=True)
+        idx_m3["_cum_pv"] = g_m3["_pv"].cumsum()
+        idx_m3["_cum_vol"] = g_m3["volume"].cumsum().replace(0, np.nan)
+        idx_m3["_m3_vwap"] = idx_m3["_cum_pv"] / idx_m3["_cum_vol"]
+
+    # -- M5 VWAP --
+    if m5 is None:
+        m5_df = compute_m5(df)
+    else:
+        m5_df = m5.copy()
+    idx_m5 = m5_df[m5_df["stock_id"] == idx_symbol][["date", "close", "volume"]].drop_duplicates("date").copy()
+    if not idx_m5.empty:
+        idx_m5["day_date"] = idx_m5["date"].dt.date
+        idx_m5["_pv"] = idx_m5["close"] * idx_m5["volume"]
+        g_m5 = idx_m5.groupby("day_date", group_keys=False, observed=True)
+        idx_m5["_cum_pv"] = g_m5["_pv"].cumsum()
+        idx_m5["_cum_vol"] = g_m5["volume"].cumsum().replace(0, np.nan)
+        idx_m5["_m5_vwap"] = idx_m5["_cum_pv"] / idx_m5["_cum_vol"]
+
+    # merge VWAP 回 df
+    vwap_m1 = idx_m1[["date", "_m1_vwap"]].drop_duplicates("date")
+    df = df.merge(vwap_m1, on="date", how="left")
+    if not idx_m3.empty:
+        vwap_m3 = idx_m3[["date", "_m3_vwap"]].drop_duplicates("date")
+        df = df.merge(vwap_m3, on="date", how="left")
+    else:
+        df["_m3_vwap"] = np.nan
+    if not idx_m5.empty:
+        vwap_m5 = idx_m5[["date", "_m5_vwap"]].drop_duplicates("date")
+        df = df.merge(vwap_m5, on="date", how="left")
+    else:
+        df["_m5_vwap"] = np.nan
+
+    # alignment score
+    cond_bullish = (df["_m1_vwap"] > df["_m3_vwap"]) & (df["_m3_vwap"] > df["_m5_vwap"])
+    cond_bearish = (df["_m1_vwap"] < df["_m3_vwap"]) & (df["_m3_vwap"] < df["_m5_vwap"])
+    df["market_vwap_alignment_score"] = np.select(
+        [cond_bullish, cond_bearish],
+        [1, -1],
+        default=0,
+    )
+
+    # spread 1-5
+    m5_vwap_safe = df["_m5_vwap"].replace(0, np.nan)
+    df["market_vwap_spread_1_5"] = (df["_m1_vwap"] - df["_m5_vwap"]) / m5_vwap_safe
+
+    # ════════════════════════════════════════════════════════════════
+    # 4. velocity_ratio_to_market
+    # ════════════════════════════════════════════════════════════════
+    # 個股價格斜率：diff(3) of close
+    # 大盤 M1 VWAP 斜率：diff(3) of market_m1_vwap
+    g_day = df.groupby(["stock_id", "day_date"], group_keys=False, observed=True)
+    stock_slope = g_day["close"].diff(3)
+    # 大盤 VWAP 斜率是逐日、同一支（0050）的 diff(3)，但廣播到所有股票後
+    # 需要跨 stock_id 同一分鐘的值一樣，不能用 groupby 算（會逐股逐日 diff）
+    # → 先算 0050 自己的 slope，再 merge 回 df
+    idx_slope = df[idx_mask][["date", "_m1_vwap"]].drop_duplicates("date").copy()
+    idx_slope["day_date"] = idx_slope["date"].dt.date
+    g_idx = idx_slope.groupby("day_date", group_keys=False, observed=True)
+    idx_slope["_market_slope"] = g_idx["_m1_vwap"].diff(3)
+    market_slope = idx_slope[["date", "_market_slope"]].drop_duplicates("date")
+    df = df.merge(market_slope, on="date", how="left")
+    market_slope_safe = df["_market_slope"].replace(0, np.nan)
+    df["velocity_ratio_to_market"] = stock_slope / market_slope_safe
+
+    # 清理暫存欄位
+    df = df.drop(columns=["_m1_vwap", "_m3_vwap", "_m5_vwap", "_market_slope"])
+    return df
 
 
 def add_vwap_features(
@@ -372,8 +575,8 @@ def make_features(
 ) -> pd.DataFrame:
     """
     給定全市場的 1 分K（load_m1() 或 load_m1_live() 的輸出），跑完整的
-    vwap_ml pipeline：時段裁切 → VWAP z-score → 候選觸發 → label →
-    ATR5平盤過濾 → 只保留候選列 → 時段過濾。
+    vwap_ml pipeline：時段裁切 → VWAP z-score → 候選觸發 → ret_vs_idx →
+    大盤 VWAP 特徵 → label → ATR5平盤過濾 → 只保留候選列 → 時段過濾。
 
     std_mult：候選觸發門檻，見 add_vwap_features()/make_vwap_labels() 的
     說明，實驗不同門檻時傳這裡就好，train.py::_prepare_data() 會轉傳。
@@ -401,6 +604,17 @@ def make_features(
         m5 = _trim_to_needed_window(m5)
 
     df = add_vwap_features(m1, std_mult=std_mult, m3=m3, m5=m5)
+
+    # 2026-07-27 新增：個股 vs 大盤（0050）的累積報酬率差值。
+    # ⚠️ 一定要在篩選 day_trade_stocks / 排除 0050 之前呼叫（0050 被篩掉
+    # 後就沒有基準可以算了），predict_live() 比照 mkt 的做法——先對完整
+    # m1_live 算特徵，才排除 0050 跟套用 day_trade_stocks 篩選。
+    df = add_ret_vs_idx(df)
+
+    # 2026-07-28 新增：大盤（0050）的 VWAP 特徵（alignment / spread / z-score /
+    # velocity ratio），跟 ret_vs_idx 一樣需要在排除 0050 前先算。
+    df = add_market_vwap_features(df, m3=m3, m5=m5)
+
     df = add_bar_features(df)
     df = add_atr5(df)
     df["target"] = make_vwap_labels(df, std_mult=std_mult)
@@ -411,7 +625,7 @@ def make_features(
     df = df[df["is_candidate"]]
 
     # ATR5平盤過濾（絕對門檻，三個class都篩，2026-07-26討論）：濾掉
-    #「本來就沒什麼波動、z只是分母（累積偏離標準差）太小才被撐大」的假
+    # 「本來就沒什麼波動、z只是分母（累積偏離標準差）太小才被撐大」的假
     # 候選，見 add_atr5() 的說明。跟 train/predict_live 三邊用同一個門檻。
     df = df[df["atr5"] >= atr5_threshold]
 
@@ -427,6 +641,12 @@ def make_features(
 # （model要知道是哪個時間框觸發，因為三個時間框的label視窗長度不同，隱含
 # 的意義也不同）＋少數量能/報酬率特徵，之後依 feature_importance() 驗證
 # 結果逐步加減，不一次補滿。
+# 2026-07-27：加 ret_vs_idx（個股累積報酬率 vs 0050累積報酬率差值）、
+# idx_ret_since_open（0050自己的累積報酬率）。
+# 2026-07-28：加 market_z_score_m5（大盤 M5 VWAP 偏離程度）、
+# market_vwap_alignment_score（大盤 M1/M3/M5 VWAP 排列方向）、
+# market_vwap_spread_1_5（大盤 M1 vs M5 VWAP 擴張度）、
+# velocity_ratio_to_market（個股 vs 大盤 VWAP 的速度比）。
 FEATURES = [
     "m1_vwap_z",
     "m3_vwap_z",
@@ -434,6 +654,12 @@ FEATURES = [
     "m1_vwap_z_slope",
     "m3_vwap_z_slope",
     "m5_vwap_z_slope",
+    "ret_vs_idx",
+    "idx_ret_since_open",
+    "market_z_score_m5",
+    "market_vwap_alignment_score",
+    "market_vwap_spread_1_5",
+    "velocity_ratio_to_market",
     "vol_ratio_prev",
     "ret_1m",
     "body_pct",
