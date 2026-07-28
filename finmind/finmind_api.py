@@ -367,6 +367,30 @@ def _save_m1(new_df: pd.DataFrame, year: int, month: int):
     _atomic_to_parquet(new_df, file_path, index=False, compression="zstd")
 
 
+def _m1_empty_file_path(year: int, month: int) -> Path:
+    """記錄 FinMind 確認過『真的沒有資料』（msg=success 但 data=[]）的
+    (股票,交易日) 組合，跟真正的K棒資料分開存在 db/m1_empty/，不要混進
+    db/m1/——其他讀 db/m1 的 pipeline（m1_data_loader.py、push_m1_to_hf.py）
+    預期的是 OHLCV schema，混進標記用途的資料會壞事。_existing_pairs() 會
+    把這裡的組合也當成『已處理過』，2026-07-29 發現：沒有這層記錄的話，
+    FinMind 真的沒有資料的組合會被永遠當成『還要補』，每次重跑都對同一批
+    註定拿到空結果的請求重複發送，白白浪費 rate limit 額度。"""
+    return _ROOT / f"db/m1_empty/{year}_{month:02d}.parquet"
+
+
+def _save_empty_pairs(pairs: list[tuple[str, str]], year: int, month: int):
+    """合併進 db/m1_empty/{year}_{month}.parquet（見 _m1_empty_file_path()
+    說明），跟現有資料 dedupe。"""
+    new_df = pd.DataFrame(pairs, columns=["stock_id", "date"])
+    file_path = _m1_empty_file_path(year, month)
+    if file_path.exists():
+        old_df = pd.read_parquet(file_path)
+        new_df = pd.concat([old_df, new_df], ignore_index=True)
+    new_df.drop_duplicates(inplace=True)
+    new_df.sort_values(["date", "stock_id"], inplace=True)
+    _atomic_to_parquet(new_df, file_path, index=False, compression="zstd")
+
+
 def _month_universe(
     year: int, month: int, top_n_by_volume: int | None = None
 ) -> tuple[list[str], list[str]]:
@@ -397,14 +421,21 @@ def _month_universe(
 
 
 def _existing_pairs(year: int, month: int) -> set[tuple[str, str]]:
-    """db/m1 該月檔案裡已經有的 (stock_id, 日期) 組合，用來跳過已經補過的，
-    節省 rate limit 額度；重跑這支腳本時天然可以從中斷處續傳。"""
+    """db/m1 該月檔案裡已經有的 (stock_id, 日期) 組合，加上 db/m1_empty 裡
+    FinMind 確認過『真的沒有資料』的組合（見 _m1_empty_file_path()），兩者
+    都算『已處理過』、跳過不再請求，節省 rate limit 額度；重跑這支腳本時
+    天然可以從中斷處續傳。"""
+    pairs: set[tuple[str, str]] = set()
     path = _m1_file_path(year, month)
-    if not path.exists():
-        return set()
-    df = pd.read_parquet(path, columns=["stock_id", "date"])
-    days = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    return set(zip(df["stock_id"], days))
+    if path.exists():
+        df = pd.read_parquet(path, columns=["stock_id", "date"])
+        days = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+        pairs |= set(zip(df["stock_id"], days))
+    empty_path = _m1_empty_file_path(year, month)
+    if empty_path.exists():
+        edf = pd.read_parquet(empty_path, columns=["stock_id", "date"])
+        pairs |= set(zip(edf["stock_id"], edf["date"]))
+    return pairs
 
 
 async def backfill_month(
@@ -454,13 +485,16 @@ async def backfill_month(
 
     sem = asyncio.Semaphore(_CONCURRENCY)
     done = 0
+    got_data = 0
+    confirmed_empty = 0
     failed: list[tuple[str, str, str]] = []
     buffer: list[pd.DataFrame] = []
+    empty_buffer: list[tuple[str, str]] = []
     stop_event = asyncio.Event()
     fatal_error_holder: list[FatalAPIError] = []
 
     async def _one(session: aiohttp.ClientSession, sid: str, day: str):
-        nonlocal done
+        nonlocal done, got_data, confirmed_empty
         if stop_event.is_set():
             return  # 已經有 fatal error，不要再送新請求
         async with sem:
@@ -479,7 +513,14 @@ async def backfill_month(
             if done % 200 == 0 or done == len(pairs):
                 print(f"  [{done}/{len(pairs)}] 進度...")
             if not df.empty:
+                got_data += 1
                 buffer.append(df)
+            else:
+                # FinMind 回應成功但沒有資料（msg=success, data=[]），跟請求
+                # 失敗不同——記下來以後跳過，不要每次重跑都對同一批註定拿到
+                # 空結果的組合重複發請求（見 _m1_empty_file_path() 說明）。
+                confirmed_empty += 1
+                empty_buffer.append((sid, day))
 
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(pairs), flush_every):
@@ -491,6 +532,10 @@ async def backfill_month(
                 _save_m1(pd.concat(buffer, ignore_index=True), year, month)
                 print(f"  已寫入 {len(buffer)} 組結果到 {_m1_file_path(year, month).name}")
                 buffer.clear()
+            if empty_buffer:
+                _save_empty_pairs(empty_buffer, year, month)
+                print(f"  記錄 {len(empty_buffer)} 組確認無資料，之後不會重複請求")
+                empty_buffer.clear()
             if stop_event.is_set():
                 break
 
@@ -500,7 +545,10 @@ async def backfill_month(
         print("  整批任務停止，處理好問題後重跑這支腳本會自動從中斷處繼續")
         raise e
 
-    print(f"{year}-{month:02d} 補齊完成，成功 {done} 組，失敗 {len(failed)} 組")
+    print(
+        f"{year}-{month:02d} 補齊完成：{got_data} 組有資料、"
+        f"{confirmed_empty} 組確認無資料（已記錄跳過）、失敗 {len(failed)} 組"
+    )
     if failed:
         print("失敗清單（沒有寫入db/m1，重跑這支腳本會自動重試，因為沒被記錄成『已有』）：")
         for sid, day, err in failed[:20]:
