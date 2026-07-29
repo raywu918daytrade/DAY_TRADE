@@ -182,6 +182,18 @@ class AbcdBullDetector(BasePatternDetector):
         p_a, p_b, p_c, p_d, bc_ratio, cd_ratio, ab_bars, cd_bars, t_ratio = best_match
 
         # 構建 3 條連線線段 (AB, BC, CD)
+        dx_ab = max(1, p_b.index - p_a.index)
+        s_ab = float((p_b.price - p_a.price) / dx_ab)
+        icpt_ab = float(p_a.price - s_ab * p_a.index)
+
+        dx_bc = max(1, p_c.index - p_b.index)
+        s_bc = float((p_c.price - p_b.price) / dx_bc)
+        icpt_bc = float(p_b.price - s_bc * p_b.index)
+
+        dx_cd = max(1, p_d.index - p_c.index)
+        s_cd = float((p_d.price - p_c.price) / dx_cd)
+        icpt_cd = float(p_c.price - s_cd * p_c.index)
+
         line_ab = TrendLine(
             start_index=int(p_a.index),
             end_index=int(p_b.index),
@@ -189,8 +201,8 @@ class AbcdBullDetector(BasePatternDetector):
             end_date=str(p_b.date),
             start_price=float(p_a.price),
             end_price=float(p_b.price),
-            slope=float((p_b.price - p_a.price) / max(1, p_b.index - p_a.index)),
-            intercept=0.0,
+            slope=s_ab,
+            intercept=icpt_ab,
             r_squared=0.95,
             line_type="support",  # 上升段 AB
         )
@@ -202,8 +214,8 @@ class AbcdBullDetector(BasePatternDetector):
             end_date=str(p_c.date),
             start_price=float(p_b.price),
             end_price=float(p_c.price),
-            slope=float((p_c.price - p_b.price) / max(1, p_c.index - p_b.index)),
-            intercept=0.0,
+            slope=s_bc,
+            intercept=icpt_bc,
             r_squared=0.95,
             line_type="resistance",  # 拉回段 BC
         )
@@ -215,8 +227,8 @@ class AbcdBullDetector(BasePatternDetector):
             end_date=str(p_d.date),
             start_price=float(p_c.price),
             end_price=float(p_d.price),
-            slope=float((p_d.price - p_c.price) / max(1, p_d.index - p_c.index)),
-            intercept=0.0,
+            slope=s_cd,
+            intercept=icpt_cd,
             r_squared=0.95,
             line_type="support",  # 攻擊段 CD
         )

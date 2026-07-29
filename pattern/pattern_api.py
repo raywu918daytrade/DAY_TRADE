@@ -14,7 +14,9 @@ import pandas as pd
 
 from pattern.abcd_bear.detector import AbcdBearDetector
 from pattern.abcd_bull.detector import AbcdBullDetector
+from pattern.cup_handle.detector import CupHandleDetector
 from pattern.data_loader import get_all_stocks_candles, get_latest_candle_timestamp, get_stock_candles, get_stocks_10d_avg_vol_lots
+from pattern.head_shoulders_bottom.detector import HeadShouldersBottomDetector
 from pattern.m_top.detector import MTopDetector
 from pattern.triangle.detector import TriangleDetector
 from pattern.w_bottom.detector import WBottomDetector
@@ -28,6 +30,8 @@ DETECTORS = {
     "abcd_bear": AbcdBearDetector(),
     "w_bottom": WBottomDetector(),
     "m_top": MTopDetector(),
+    "head_shoulders_bottom": HeadShouldersBottomDetector(),
+    "cup_handle": CupHandleDetector(),
 }
 
 # 記憶體快取 (In-Memory Cache)
@@ -64,7 +68,7 @@ def get_pattern_types() -> Dict[str, Any]:
 
 @router.get("/scan", summary="過濾篩選符合特定型態與時區的股票清單")
 def scan_patterns(
-    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear"),
+    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle"),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)，預設為最新交易日"),
     min_score: float = Query(60.0, description="最小信心度分數 (0~100)"),
@@ -129,7 +133,7 @@ def scan_patterns(
 @router.get("/{stock_id}/detail", summary="單一股票 K 線與型態繪圖細節")
 def get_pattern_detail(
     stock_id: str,
-    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear"),
+    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle"),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)"),
     limit: int = Query(120, description="K 線視窗根數，預設 120 根"),
@@ -184,8 +188,10 @@ def get_pattern_detail(
 
         for l in pattern_dict.get("lines", []):
             try:
-                l["start_time"] = tw_naive_to_epoch(pd.Timestamp(l["start_date"]))
-                l["end_time"] = tw_naive_to_epoch(pd.Timestamp(l["end_date"]))
+                t1 = tw_naive_to_epoch(pd.Timestamp(l["start_date"]))
+                t2 = tw_naive_to_epoch(pd.Timestamp(l["end_date"]))
+                l["start_time"] = t1
+                l["end_time"] = t2
             except Exception:
                 l["start_time"] = None
                 l["end_time"] = None

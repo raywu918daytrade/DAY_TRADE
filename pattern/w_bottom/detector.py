@@ -200,7 +200,7 @@ class WBottomDetector(BasePatternDetector):
             # 【硬性條件 2】：四段振幅對稱性
             amps = [a1, a2, a3, a4]
             a_min, a_max = min(amps), max(amps)
-            if a_max / a_min > 4.0:
+            if a_min <= 0 or a_max / a_min > 4.0:
                 continue
 
             # 【硬性條件 3】：現價/結束點必須高於兩底最低點
@@ -246,75 +246,38 @@ class WBottomDetector(BasePatternDetector):
             return None
 
         p_p0, p_l1, p_h, p_l2, d_idx, d_price, b_diff, depth, times, amps, t_cv, a_cv = best_match
+        pl1, ph, pl2 = p_l1.price, p_h.price, p_l2.price
         t1, t2, t3, t4 = times
         a1, a2, a3, a4 = amps
 
-        # 構建 W 型幾何 4 條連線 (P0->L1, L1->H, H->L2, L2->D)
-        line_start = TrendLine(
-            start_index=int(p_p0.index),
-            end_index=int(p_l1.index),
-            start_date=str(p_p0.date),
-            end_date=str(p_l1.date),
-            start_price=float(p_p0.price),
-            end_price=float(p_l1.price),
-            slope=float((p_l1.price - p_p0.price) / max(1, p_l1.index - p_p0.index)),
-            intercept=0.0,
-            r_squared=0.95,
-            line_type="resistance", # 下降段
-        )
+        # 構建 W 型幾何 4 條連線 (P0->L1, L1->H, H->L2, L2->D) 與頸線
+        def create_line(p_start, p_end, price_start, price_end, l_type):
+            dx = max(1, p_end.index - p_start.index)
+            dy = price_end - price_start
+            s = float(dy / dx)
+            icpt = float(price_start - s * p_start.index)
+            return TrendLine(
+                start_index=int(p_start.index),
+                end_index=int(p_end.index),
+                start_date=str(p_start.date),
+                end_date=str(p_end.date),
+                start_price=float(price_start),
+                end_price=float(price_end),
+                slope=s,
+                intercept=icpt,
+                r_squared=0.95,
+                line_type=l_type,
+            )
 
-        line_left_leg = TrendLine(
-            start_index=int(p_l1.index),
-            end_index=int(p_h.index),
-            start_date=str(p_l1.date),
-            end_date=str(p_h.date),
-            start_price=float(p_l1.price),
-            end_price=float(p_h.price),
-            slope=float((p_h.price - p_l1.price) / max(1, p_h.index - p_l1.index)),
-            intercept=0.0,
-            r_squared=0.95,
-            line_type="support",
-        )
-
-        line_right_leg = TrendLine(
-            start_index=int(p_h.index),
-            end_index=int(p_l2.index),
-            start_date=str(p_h.date),
-            end_date=str(p_l2.date),
-            start_price=float(p_h.price),
-            end_price=float(p_l2.price),
-            slope=float((p_l2.price - p_h.price) / max(1, p_l2.index - p_h.index)),
-            intercept=0.0,
-            r_squared=0.95,
-            line_type="resistance",
-        )
-
-        line_attack = TrendLine(
-            start_index=int(p_l2.index),
-            end_index=int(d_idx),
-            start_date=str(p_l2.date),
-            end_date=str(sub_df["date"].iloc[d_idx]),
-            start_price=float(p_l2.price),
-            end_price=float(d_price),
-            slope=float((d_price - p_l2.price) / max(1, d_idx - p_l2.index)),
-            intercept=0.0,
-            r_squared=0.95,
-            line_type="support",
-        )
-
+        line_start = create_line(p_p0, p_l1, p_p0.price, pl1, "resistance")
+        line_left_leg = create_line(p_l1, p_h, pl1, ph, "support")
+        line_right_leg = create_line(p_h, p_l2, ph, pl2, "resistance")
+        
+        d_date = str(sub_df["date"].iloc[d_idx])
+        line_attack = create_line(p_l2, PivotPoint(d_idx, d_date, d_price, "peak"), pl2, d_price, "support")
+        
         # 頸線水平線
-        line_neckline = TrendLine(
-            start_index=int(p_l1.index),
-            end_index=int(d_idx),
-            start_date=str(p_l1.date),
-            end_date=str(sub_df["date"].iloc[d_idx]),
-            start_price=float(p_h.price),
-            end_price=float(p_h.price),
-            slope=0.0,
-            intercept=float(p_h.price),
-            r_squared=1.0,
-            line_type="resistance",
-        )
+        line_neckline = create_line(p_l1, PivotPoint(d_idx, d_date, ph, "peak"), ph, ph, "resistance")
 
         # 突破狀態判定 (以最新收盤價判定，非 D 點價格)
         if latest_close >= p_h.price * 1.003:
