@@ -35,9 +35,6 @@ signal*.txt
 *.history
 *.db*
 *bak
-*.md
-!knowledge/**/*.md
-!main/README.md
 *.html
 *.txt
 !requirements.txt
