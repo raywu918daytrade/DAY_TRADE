@@ -1,0 +1,252 @@
+"""
+ABCD 下跌型態檢測器 (Bearish ABCD Pattern Detector)
+
+幾何結構與硬性條件：
+1. A 點 (Peak 起跌高點): AB 下降浪開端
+2. B 點 (Trough 第一波低點): PB < PA
+3. C 點 (Peak 修正反彈點): PC < PA 且 PC > PB (硬性條件：反彈高點 C 不能超越起跌高點 A)
+4. D 點 (Trough 第二波目標/現價點): PD < PB 且 PD < PC (硬性條件：第二波下跌必須跌破前低 B)
+5. 時間對稱性 (Time Symmetry): CD 浪 K 線根數與 AB 浪 K 線根數比例要在 0.4 ~ 2.5 之間
+
+黃金比例 (Fibonacci Criteria):
+- BC 反彈比例: (PC - PB) / (PA - PB) 介於 0.35 ~ 0.85 之間 (最佳為 0.618)
+- CD 浪下跌幅程: (PC - PD) / (PA - PB) 介於 0.75 ~ 1.8 之間 (通常 AB ≈ CD)
+"""
+
+from typing import List, Optional
+import numpy as np
+import pandas as pd
+
+from pattern.base import BasePatternDetector, PatternResult, PivotPoint, TrendLine
+
+
+class AbcdBearDetector(BasePatternDetector):
+    """ABCD 下跌型態檢測器"""
+
+    def __init__(
+        self,
+        window: int = 3,            # Pivot 點提取視窗大小
+        min_candles: int = 20,      # 型態最少 K 線根數
+        max_candles: int = 120,     # 型態最多 K 線根數
+    ):
+        super().__init__(name="abcd_bear", display_name="ABCD 下跌")
+        self.window = window
+        self.min_candles = min_candles
+        self.max_candles = max_candles
+
+    def _extract_pivots(self, df: pd.DataFrame) -> List[PivotPoint]:
+        """提取波段點並保持 Peak/Trough 交替"""
+        highs = df["high"].values
+        lows = df["low"].values
+        dates = df["date"].astype(str).values
+        n = len(df)
+        w = self.window
+
+        raw_pivots: List[PivotPoint] = []
+        for i in range(w, n - w):
+            is_peak = (highs[i] == np.max(highs[i - w : i + w + 1])) and (highs[i] > np.min(highs[i - w : i + w + 1]))
+            is_trough = (lows[i] == np.min(lows[i - w : i + w + 1])) and (lows[i] < np.max(lows[i - w : i + w + 1]))
+
+            if is_peak and not is_trough:
+                raw_pivots.append(PivotPoint(index=i, date=dates[i], price=float(highs[i]), type="peak"))
+            elif is_trough and not is_peak:
+                raw_pivots.append(PivotPoint(index=i, date=dates[i], price=float(lows[i]), type="trough"))
+
+        if not raw_pivots:
+            return []
+
+        # 強制 Peak / Trough 嚴格交替
+        pivots: List[PivotPoint] = [raw_pivots[0]]
+        for p in raw_pivots[1:]:
+            last = pivots[-1]
+            if p.type == last.type:
+                if p.type == "peak" and p.price > last.price:
+                    pivots[-1] = p
+                elif p.type == "trough" and p.price < last.price:
+                    pivots[-1] = p
+            else:
+                pivots.append(p)
+
+        return pivots
+
+    def detect(self, df: pd.DataFrame, stock_id: str, timeframe: str) -> Optional[PatternResult]:
+        """對單一股票執行 ABCD 下跌型態檢測"""
+        if df.empty or len(df) < self.min_candles:
+            return None
+
+        sub_df = df.iloc[-self.max_candles :].reset_index(drop=True)
+        n = len(sub_df)
+        if n < self.min_candles:
+            return None
+
+        pivots = self._extract_pivots(sub_df)
+        if len(pivots) < 3:
+            return None
+
+        # 尋找最近一組符合 A(Peak) -> B(Trough) -> C(Peak) 的組合，再加上最新一根 K 線或 Pivot 作為 D (Trough)
+        best_match = None
+        best_score = -1.0
+
+        latest_idx = n - 1
+        latest_close = float(sub_df["close"].iloc[-1])
+        latest_low = float(sub_df["low"].iloc[-1])
+
+        # 逐一檢視四點組合
+        for i in range(len(pivots) - 2):
+            p_a = pivots[i]
+            p_b = pivots[i + 1]
+            p_c = pivots[i + 2]
+
+            # 檢查類型順序：A 必須為 peak, B 為 trough, C 為 peak
+            if not (p_a.type == "peak" and p_b.type == "trough" and p_c.type == "peak"):
+                continue
+
+            pa, pb, pc = p_a.price, p_b.price, p_c.price
+
+            # 【硬性條件 1】：B 低於 A，且 C 介於 A 與 B 之間 (反彈高點 C 絕對不能高於起跌點 A)
+            if not (pb < pa and pc < pa and pc > pb):
+                continue
+
+            ab_height = pa - pb
+            if ab_height <= 0:
+                continue
+
+            bc_retrace_ratio = (pc - pb) / ab_height
+
+            # 【硬性條件 2】：BC 修正反彈比例要在 0.35 ~ 0.85 之間
+            if not (0.35 <= bc_retrace_ratio <= 0.85):
+                continue
+
+            # 尋找 D 點：D 點可以是後續的某個 Trough，或者最新這根 K 線的最低價
+            d_candidates = []
+            if len(pivots) >= i + 4:
+                p_d_pivot = pivots[i + 3]
+                if p_d_pivot.type == "trough":
+                    d_candidates.append(p_d_pivot)
+
+            # 最新 K 線作為潛在的 D 點
+            d_latest = PivotPoint(index=latest_idx, date=str(sub_df["date"].iloc[-1]), price=latest_low, type="trough")
+            d_candidates.append(d_latest)
+
+            for p_d in d_candidates:
+                pd_price = p_d.price
+
+                # 【硬性條件 3】：D 必須低於前低 B，且 D 必須低於 C
+                if not (pd_price < pb and pd_price < pc):
+                    continue
+
+                cd_height = pc - pd_price
+                cd_ratio = cd_height / ab_height
+
+                # 【硬性條件 4】：CD 浪跌幅比例要在 0.75 ~ 1.8 之間
+                if not (0.75 <= cd_ratio <= 1.8):
+                    continue
+
+                # 【硬性條件 5】：時間對稱性 constraint - CD 浪與 AB 浪 K 線根數比例要在 0.4 ~ 2.5 之間
+                time_ab_bars = max(1, int(p_b.index - p_a.index))
+                time_cd_bars = max(1, int(p_d.index - p_c.index))
+                time_ratio = float(time_cd_bars / time_ab_bars)
+
+                if not (0.4 <= time_ratio <= 2.5):
+                    continue
+
+                # ---- 計算評分 (Score 0 ~ 100) ----
+                # 1. BC 黃金比例貼合度 (最高 30 分，越接近 0.618 分數越高)
+                bc_diff = abs(bc_retrace_ratio - 0.618)
+                score_bc = max(0.0, 30.0 * (1.0 - bc_diff / 0.3))
+
+                # 2. CD 展幅 AB=CD 貼合度 (最高 30 分，越接近 1.0 或 1.272 分數越高)
+                cd_diff = min(abs(cd_ratio - 1.0), abs(cd_ratio - 1.272))
+                score_cd = max(0.0, 30.0 * (1.0 - cd_diff / 0.5))
+
+                # 3. 時間對稱性貼合度 (最高 20 分，越接近 1.0 或 0.618 / 1.272 分數越高)
+                time_diff = min(abs(time_ratio - 1.0), abs(time_ratio - 1.272), abs(time_ratio - 0.618))
+                score_time = max(0.0, 20.0 * (1.0 - time_diff / 0.8))
+
+                # 4. 跌破力道 (最高 20 分): 最新收盤價低於 B 點的比例
+                breakdown_margin = (pb - latest_close) / pb
+                if breakdown_margin > 0:
+                    score_breakdown = min(20.0, 10.0 + breakdown_margin * 200.0)
+                else:
+                    score_breakdown = 5.0
+
+                total_score = float(min(100.0, score_bc + score_cd + score_time + score_breakdown))
+
+                if total_score > best_score:
+                    best_score = total_score
+                    best_match = (p_a, p_b, p_c, p_d, bc_retrace_ratio, cd_ratio, time_ab_bars, time_cd_bars, time_ratio)
+
+        if not best_match or best_score < 40.0:
+            return None
+
+        p_a, p_b, p_c, p_d, bc_ratio, cd_ratio, ab_bars, cd_bars, t_ratio = best_match
+
+        # 構建 3 條連線線段 (AB, BC, CD)
+        line_ab = TrendLine(
+            start_index=int(p_a.index),
+            end_index=int(p_b.index),
+            start_date=str(p_a.date),
+            end_date=str(p_b.date),
+            start_price=float(p_a.price),
+            end_price=float(p_b.price),
+            slope=float((p_b.price - p_a.price) / max(1, p_b.index - p_a.index)),
+            intercept=0.0,
+            r_squared=0.95,
+            line_type="resistance",  # 下降段 AB
+        )
+
+        line_bc = TrendLine(
+            start_index=int(p_b.index),
+            end_index=int(p_c.index),
+            start_date=str(p_b.date),
+            end_date=str(p_c.date),
+            start_price=float(p_b.price),
+            end_price=float(p_c.price),
+            slope=float((p_c.price - p_b.price) / max(1, p_c.index - p_b.index)),
+            intercept=0.0,
+            r_squared=0.95,
+            line_type="support",  # 反彈段 BC
+        )
+
+        line_cd = TrendLine(
+            start_index=int(p_c.index),
+            end_index=int(p_d.index),
+            start_date=str(p_c.date),
+            end_date=str(p_d.date),
+            start_price=float(p_c.price),
+            end_price=float(p_d.price),
+            slope=float((p_d.price - p_c.price) / max(1, p_d.index - p_c.index)),
+            intercept=0.0,
+            r_squared=0.95,
+            line_type="resistance",  # 跌勢段 CD
+        )
+
+        # 跌破狀態
+        if latest_close < p_b.price * 0.997:
+            breakout_status = "breakout_down"
+        else:
+            breakout_status = "inside"
+
+        return PatternResult(
+            stock_id=stock_id,
+            pattern_type="abcd_bear",
+            sub_type="bearish_abcd",
+            timeframe=timeframe,
+            score=best_score,
+            date=str(sub_df["date"].iloc[-1]),
+            pivots=[p_a, p_b, p_c, p_d],
+            lines=[line_ab, line_bc, line_cd],
+            details={
+                "breakout_status": breakout_status,
+                "price_A": round(float(p_a.price), 2),
+                "price_B": round(float(p_b.price), 2),
+                "price_C": round(float(p_c.price), 2),
+                "price_D": round(float(p_d.price), 2),
+                "bc_retrace_ratio": round(float(bc_ratio), 3),
+                "cd_expansion_ratio": round(float(cd_ratio), 3),
+                "time_ab_bars": int(ab_bars),
+                "time_cd_bars": int(cd_bars),
+                "time_ratio": round(float(t_ratio), 3),
+                "latest_close": latest_close,
+            },
+        )

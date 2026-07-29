@@ -69,6 +69,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from pattern.pattern_api import router as pattern_router
+
+app.include_router(pattern_router)
+
 _SKIP_LOG_PATHS = {"/stream", "/health"}
 
 @app.middleware("http")
