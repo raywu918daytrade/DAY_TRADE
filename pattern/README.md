@@ -214,15 +214,18 @@ pattern/
   ```
 
 ### 2. `GET /api/pattern/scan`
-- **用途**：全市場型態選股過濾。
+- **用途**：全市場型態選股過濾（支援多型態與全型態一次掃描）。
 - **查詢參數**：
-  - `pattern_type` (str): 型態種類，可選 `triangle`, `abcd_bull`, `abcd_bear`, `w_bottom`, `m_top`, `head_shoulders_bottom`, `head_shoulders_top`, `cup_handle`。
+  - `pattern_type` (str): 型態種類，支援 3 種傳參方式：
+    1. **單一型態**：`triangle`
+    2. **多個型態 (逗號分隔)**：`triangle,w_bottom,m_top`
+    3. **全型態掃描**：`all`（一次掃描所有 8 種已註冊型態）
   - `timeframe` (str): 時間週期，可選 `1m`, `3m`, `5m`, `day`（預設 `day`）。
   - `date` (str, 選填): 基準日期 `YYYY-MM-DD`（預設最新交易日）。
   - `min_score` (float): 最低信心分數門檻，預設 `60.0`。
   - `min_vol_lots` (float, 選填): **日 K 10日均量過濾門檻 (張)**，預設 `1000.0` 張（設為 0 不限制）。
   - `limit` (int): K 線視窗根數，預設 `120` 根。
-- **回傳內容**：符合條件的股票代號清單，包含 `pattern_type` (英文 ID)、`pattern_name` (中文名稱)、信心分數、10日均量張數 (`avg_vol_10d_lots`)、突破狀態 (`inside` / `breakout_up` / `breakout_down`)。
+- **回傳內容**：符合條件的股票代號清單，包含 `pattern_types` (已選型態陣列) 與 `results` 平舖陣列。若同一股票符合多個型態，會保留各自獨立的型態匹配項目，並按信心分數全域遞減排序。
 
 ### 3. `GET /api/pattern/{stock_id}/detail`
 - **用途**：取得單一股票的 K 線歷史數據與型態繪圖座標。

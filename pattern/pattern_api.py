@@ -70,30 +70,56 @@ def get_pattern_types() -> Dict[str, Any]:
 
 @router.get("/scan", summary="過濾篩選符合特定型態與時區的股票清單")
 def scan_patterns(
-    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle"),
+    pattern_type: str = Query("triangle", description="型態種類: 可帶單一型態(triangle)、逗號分隔多型態(triangle,w_bottom)、或全型態(all)。可用型態: triangle, abcd_bull, abcd_bear, w_bottom, m_top, head_shoulders_bottom, head_shoulders_top, cup_handle, all"),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)，預設為最新交易日"),
     min_score: float = Query(60.0, description="最小信心度分數 (0~100)"),
     min_vol_lots: Optional[float] = Query(1000.0, description="日 K 10 日均量過濾門檻 (張)，預設 1000 張；設為 None 或 0 表示不限制"),
     limit: int = Query(120, description="K 線視窗根數，預設 120 根"),
 ) -> Dict[str, Any]:
-    """掃描市場上所有股票，找出符合該型態與時區條件的股票清單（支援極速記憶體快取與 10 日均量過濾）。"""
-    if pattern_type not in DETECTORS:
+    """掃描市場上所有股票，找出符合特定/多個/全型態與時區條件的股票清單（支援極速記憶體快取與 10 日均量過濾）。"""
+    # 1. 解析型態參數 (支援逗號分隔與 "all")
+    raw_types = [t.strip() for t in pattern_type.split(",") if t.strip()]
+    
+    if "all" in raw_types:
+        selected_types = list(DETECTORS.keys())
+    else:
+        selected_types = []
+        invalid_types = []
+        for p in raw_types:
+            if p in DETECTORS:
+                if p not in selected_types:
+                    selected_types.append(p)
+            else:
+                invalid_types.append(p)
+        
+        if invalid_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"尚未支援或無效的型態: {invalid_types}。可用型態: {list(DETECTORS.keys())} 或 all",
+            )
+
+    if not selected_types:
         raise HTTPException(
             status_code=400,
-            detail=f"尚未支援或無效的型態: {pattern_type}。可用型態: {list(DETECTORS.keys())}",
+            detail=f"未指定有效的型態。可用型態: {list(DETECTORS.keys())} 或 all",
         )
 
-    # 取得最新 K 線時間戳以構造智慧快取 Key
+    # 正規化型態鍵值以穩定命中快取
+    normalized_pattern_key = ",".join(sorted(selected_types))
+
+    # 2. 取得最新 K 線時間戳以構造智慧快取 Key
     latest_ts = get_latest_candle_timestamp(timeframe=timeframe, date=date)
-    cache_key = (pattern_type, timeframe, date or "latest", min_score, min_vol_lots, limit, latest_ts)
+    cache_key = (normalized_pattern_key, timeframe, date or "latest", min_score, min_vol_lots, limit, latest_ts)
 
     if cache_key in _SCAN_CACHE:
         return _SCAN_CACHE[cache_key]
 
-    detector = DETECTORS[pattern_type]
+    # 3. 僅讀取一次全市場 K 線 (最佳化 I/O 效能)
     all_candles = get_all_stocks_candles(timeframe=timeframe, date=date, limit=limit)
     avg_vol_map = get_stocks_10d_avg_vol_lots(date=date)
+
+    active_detectors = [(pt, DETECTORS[pt]) for pt in selected_types]
 
     matches = []
     for stock_id, df_candles in all_candles.items():
@@ -105,22 +131,24 @@ def scan_patterns(
         if min_vol_lots and min_vol_lots > 0 and avg_vol_lots < min_vol_lots:
             continue
 
-        try:
-            res = detector.detect(df_candles, stock_id=stock_id, timeframe=timeframe)
-            if res and res.score >= min_score:
-                res_dict = res.to_dict()
-                res_dict["pattern_name"] = detector.display_name
-                res_dict["details"]["avg_vol_10d_lots"] = avg_vol_lots
-                matches.append(res_dict)
-        except Exception:
-            continue
+        # 一支股票可同時匹配多個 Detector
+        for pt_key, detector in active_detectors:
+            try:
+                res = detector.detect(df_candles, stock_id=stock_id, timeframe=timeframe)
+                if res and res.score >= min_score:
+                    res_dict = res.to_dict()
+                    res_dict["pattern_name"] = detector.display_name
+                    res_dict["details"]["avg_vol_10d_lots"] = avg_vol_lots
+                    matches.append(res_dict)
+            except Exception:
+                continue
 
     # 按信心分數遞減排序
     matches.sort(key=lambda x: x["score"], reverse=True)
 
     result = {
         "pattern_type": pattern_type,
-        "pattern_name": detector.display_name,
+        "pattern_types": selected_types,
         "timeframe": timeframe,
         "date": date or (matches[0]["date"] if matches else None),
         "min_vol_lots": min_vol_lots,
