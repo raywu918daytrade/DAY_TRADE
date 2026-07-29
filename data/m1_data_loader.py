@@ -167,6 +167,16 @@ def _get_done_stocks(date_str: str) -> set:
     return set(df[df["date"] == date_str]["stock_id"].tolist())
 
 
+def _has_today_data(df: pd.DataFrame, date_str: str) -> bool:
+    """判斷下載回來的近30日資料是否真的包含「今天」這一天。如果在開盤前
+    或盤中很早執行，近30日回傳可能還沒有今天的K線（df 非空，但最新一筆
+    只到昨天），此時不能標記 flag，否則收盤後重跑會被誤判成「今天已處理
+    過」而跳過，導致當天真正的分鐘K永遠抓不到（2026-07-29 發現：早上跑過
+    一次後，下午重跑 2000 多支股票被跳過，db/m1 裡當天資料只剩早上抓到的
+    那一小批）。"""
+    return bool(df["date"].str.startswith(date_str).any())
+
+
 def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str = "Fugle"):
     """Fugle 那一份：historical/candles 一次就含今天（見 _download_m1() 的
     2026-07-13 實測結果），1.05秒/支（1次API），維持在 60 req/min 以內留緩衝。
@@ -185,7 +195,10 @@ def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str 
             if not df.empty:
                 _save_m1(df)
                 print(f"[{label}] {stock_id} 下載完成 {len(df)} 筆")
-                _update_flag(stock_id, date_str)
+                if _has_today_data(df, date_str):
+                    _update_flag(stock_id, date_str)
+                else:
+                    print(f"[{label}] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓）")
             else:
                 print(f"[{label}] {stock_id} 無資料")
         except requests.exceptions.HTTPError as e:
@@ -209,7 +222,10 @@ def _update_m1_fubon(stocks: list, date_str: str, sdk):
             if not df.empty:
                 _save_m1(df)
                 print(f"[富邦] {stock_id} 下載完成 {len(df)} 筆")
-                _update_flag(stock_id, date_str)
+                if _has_today_data(df, date_str):
+                    _update_flag(stock_id, date_str)
+                else:
+                    print(f"[富邦] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓）")
             else:
                 print(f"[富邦] {stock_id} 無資料")
         except Exception as e:
