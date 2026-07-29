@@ -217,26 +217,39 @@ class WBottomDetector(BasePatternDetector):
             time_cv = calc_cv(times)
             amp_cv = calc_cv(amps)
 
-            # 1. 時間全對稱得分 (最高 20 分)
-            score_time_sym = max(0.0, 20.0 * (1.0 - time_cv / 0.8))
+            # 1. 時間全對稱得分 (最高 15 分)
+            score_time_sym = max(0.0, 15.0 * (1.0 - time_cv / 0.8))
 
-            # 2. 振幅全對稱得分 (最高 20 分)
-            score_amp_sym = max(0.0, 20.0 * (1.0 - amp_cv / 0.8))
+            # 2. 振幅全對稱得分 (最高 15 分)
+            score_amp_sym = max(0.0, 15.0 * (1.0 - amp_cv / 0.8))
 
-            # 3. 雙底平對齊得分 (最高 25 分)
-            score_alignment = max(0.0, 25.0 * (1.0 - bottom_diff_pct / self.max_bottom_diff_pct))
+            # 3. 雙底平對齊得分 (最高 20 分)
+            score_alignment = max(0.0, 20.0 * (1.0 - bottom_diff_pct / self.max_bottom_diff_pct))
 
-            # 4. 頸線深度得分 (最高 15 分)
+            # 4. 頸線深度得分 (最高 10 分)
             depth_diff = abs(depth_pct - 0.12)
-            score_depth = max(0.0, 15.0 * (1.0 - depth_diff / 0.15))
+            score_depth = max(0.0, 10.0 * (1.0 - depth_diff / 0.15))
 
-            # 5. 突破力道得分 (最高 20 分)
+            # 5. 突破力道得分 (最高 15 分)
             if latest_close >= ph * 0.99:
-                score_breakout = min(20.0, 10.0 + (latest_close - ph) / ph * 200.0)
+                score_breakout = min(15.0, 7.5 + (latest_close - ph) / ph * 150.0)
             else:
-                score_breakout = max(0.0, 10.0 * (latest_close - min_bottom) / (ph - min_bottom))
+                score_breakout = max(0.0, 7.5 * (latest_close - min_bottom) / (ph - min_bottom))
 
-            total_score = float(min(100.0, score_time_sym + score_amp_sym + score_alignment + score_depth + score_breakout))
+            # 6. 近現性得分 (最高 25 分，第二底 L2 距離當前 K 線越近分數越高)
+            bars_from_present = (n - 1) - p_l2.index
+            if bars_from_present <= 10:
+                score_recency = 25.0
+            elif bars_from_present <= 20:
+                score_recency = 20.0
+            elif bars_from_present <= 35:
+                score_recency = 15.0
+            elif bars_from_present <= 60:
+                score_recency = 10.0
+            else:
+                score_recency = 2.0
+
+            total_score = float(min(100.0, score_time_sym + score_amp_sym + score_alignment + score_depth + score_breakout + score_recency))
 
             if total_score > best_score:
                 best_score = total_score

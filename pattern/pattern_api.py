@@ -17,6 +17,7 @@ from pattern.abcd_bull.detector import AbcdBullDetector
 from pattern.cup_handle.detector import CupHandleDetector
 from pattern.data_loader import get_all_stocks_candles, get_latest_candle_timestamp, get_stock_candles, get_stocks_10d_avg_vol_lots
 from pattern.head_shoulders_bottom.detector import HeadShouldersBottomDetector
+from pattern.head_shoulders_top.detector import HeadShouldersTopDetector
 from pattern.m_top.detector import MTopDetector
 from pattern.triangle.detector import TriangleDetector
 from pattern.w_bottom.detector import WBottomDetector
@@ -31,6 +32,7 @@ DETECTORS = {
     "w_bottom": WBottomDetector(),
     "m_top": MTopDetector(),
     "head_shoulders_bottom": HeadShouldersBottomDetector(),
+    "head_shoulders_top": HeadShouldersTopDetector(),
     "cup_handle": CupHandleDetector(),
 }
 

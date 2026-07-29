@@ -151,26 +151,39 @@ class AbcdBullDetector(BasePatternDetector):
                     continue
 
                 # ---- 計算評分 (Score 0 ~ 100) ----
-                # 1. BC 黃金比例貼合度 (最高 30 分，越接近 0.618 分數越高)
+                # 1. BC 黃金比例貼合度 (最高 25 分，越接近 0.618 分數越高)
                 bc_diff = abs(bc_retrace_ratio - 0.618)
-                score_bc = max(0.0, 30.0 * (1.0 - bc_diff / 0.3))
+                score_bc = max(0.0, 25.0 * (1.0 - bc_diff / 0.3))
 
-                # 2. CD 展幅 AB=CD 貼合度 (最高 30 分，越接近 1.0 或 1.272 分數越高)
+                # 2. CD 展幅 AB=CD 貼合度 (最高 25 分，越接近 1.0 或 1.272 分數越高)
                 cd_diff = min(abs(cd_ratio - 1.0), abs(cd_ratio - 1.272))
-                score_cd = max(0.0, 30.0 * (1.0 - cd_diff / 0.5))
+                score_cd = max(0.0, 25.0 * (1.0 - cd_diff / 0.5))
 
-                # 3. 時間對稱性貼合度 (最高 20 分，越接近 1.0 或 0.618 / 1.272 分數越高)
+                # 3. 時間對稱性貼合度 (最高 15 分，越接近 1.0 或 0.618 / 1.272 分數越高)
                 time_diff = min(abs(time_ratio - 1.0), abs(time_ratio - 1.272), abs(time_ratio - 0.618))
-                score_time = max(0.0, 20.0 * (1.0 - time_diff / 0.8))
+                score_time = max(0.0, 15.0 * (1.0 - time_diff / 0.8))
 
-                # 4. 突破力道 (最高 20 分): 最新收盤價超過 B 點的比例
+                # 4. 突破力道 (最高 10 分): 最新收盤價超過 B 點的比例
                 breakout_margin = (latest_close - pb) / pb
                 if breakout_margin > 0:
-                    score_breakout = min(20.0, 10.0 + breakout_margin * 200.0)
+                    score_breakout = min(10.0, 5.0 + breakout_margin * 100.0)
                 else:
-                    score_breakout = 5.0
+                    score_breakout = 2.5
 
-                total_score = float(min(100.0, score_bc + score_cd + score_time + score_breakout))
+                # 5. 近現性得分 (最高 25 分，D 點越接近當前 K 線分數越高)
+                bars_from_present = (n - 1) - p_d.index
+                if bars_from_present <= 10:
+                    score_recency = 25.0
+                elif bars_from_present <= 20:
+                    score_recency = 20.0
+                elif bars_from_present <= 35:
+                    score_recency = 15.0
+                elif bars_from_present <= 60:
+                    score_recency = 10.0
+                else:
+                    score_recency = 2.0
+
+                total_score = float(min(100.0, score_bc + score_cd + score_time + score_breakout + score_recency))
 
                 if total_score > best_score:
                     best_score = total_score

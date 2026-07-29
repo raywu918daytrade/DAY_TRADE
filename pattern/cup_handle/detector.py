@@ -151,23 +151,36 @@ class CupHandleDetector(BasePatternDetector):
             d_price = float(sub_df["close"].iloc[d_index])
 
             # ---- 計算評分 (Score 0 ~ 100) ----
-            # 1. U型底圓潤得分 (最高 30 分)
-            score_u = min(30.0, u_fullness * 100.0)
+            # 1. U型底圓潤得分 (最高 25 分)
+            score_u = min(25.0, u_fullness * 83.3)
             
-            # 2. 柄部回測優質得分 (最高 25 分): 最佳回測為杯身深度的 1/3
+            # 2. 柄部回測優質得分 (最高 20 分): 最佳回測為杯身深度的 1/3
             handle_diff = abs(handle_retracement - 0.33)
-            score_handle = max(0.0, 25.0 * (1.0 - handle_diff / 0.4))
+            score_handle = max(0.0, 20.0 * (1.0 - handle_diff / 0.4))
             
-            # 3. 杯緣對稱得分 (最高 15 分)
-            score_rim = max(0.0, 15.0 * (1.0 - rim_diff / self.max_rim_diff_pct))
+            # 3. 杯緣對稱得分 (最高 10 分)
+            score_rim = max(0.0, 10.0 * (1.0 - rim_diff / self.max_rim_diff_pct))
             
-            # 4. 突破力道得分 (最高 30 分)
+            # 4. 突破力道得分 (最高 20 分)
             if latest_close >= pp2 * 0.99:
-                score_breakout = min(30.0, 15.0 + (latest_close - pp2) / pp2 * 300.0)
+                score_breakout = min(20.0, 10.0 + (latest_close - pp2) / pp2 * 200.0)
             else:
-                score_breakout = max(0.0, 15.0 * (latest_close - pth) / (pp2 - pth))
+                score_breakout = max(0.0, 10.0 * (latest_close - pth) / (pp2 - pth))
 
-            total_score = float(min(100.0, score_u + score_handle + score_rim + score_breakout))
+            # 5. 近現性得分 (最高 25 分，柄部低點 T_handle 距離當前 K 線越近分數越高)
+            bars_from_present = (n - 1) - p_th.index
+            if bars_from_present <= 10:
+                score_recency = 25.0
+            elif bars_from_present <= 20:
+                score_recency = 20.0
+            elif bars_from_present <= 35:
+                score_recency = 15.0
+            elif bars_from_present <= 60:
+                score_recency = 10.0
+            else:
+                score_recency = 2.0
+
+            total_score = float(min(100.0, score_u + score_handle + score_rim + score_breakout + score_recency))
 
             if total_score > best_score:
                 best_score = total_score

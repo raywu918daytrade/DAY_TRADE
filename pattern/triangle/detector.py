@@ -80,7 +80,7 @@ class TriangleDetector(BasePatternDetector):
         return alternating
 
     def detect(self, df: pd.DataFrame, stock_id: str, timeframe: str) -> Optional[PatternResult]:
-        """對單一股票執行精準三角收斂識別"""
+        """對單一股票執行精準三角收斂識別 (優先選取近現性高之最新型態)"""
         if df.empty or len(df) < self.min_candles:
             return None
 
@@ -96,142 +96,171 @@ class TriangleDetector(BasePatternDetector):
         if len(pivots) < self.min_pivots:
             return None
 
-        peaks = [p for p in pivots if p.type == "peak"]
-        troughs = [p for p in pivots if p.type == "trough"]
+        m_pivots = len(pivots)
+        best_match = None
+        best_score = -1.0
 
-        if len(peaks) < 2 or len(troughs) < 2:
+        # 2. 遍歷 Pivot 子序列組合，搜尋最佳（近現性高 + 結構標準）之三角型態
+        for i in range(0, m_pivots - self.min_pivots + 1):
+            for j in range(i + self.min_pivots, m_pivots + 1):
+                sub_pivots = pivots[i:j]
+                peaks = [p for p in sub_pivots if p.type == "peak"]
+                troughs = [p for p in sub_pivots if p.type == "trough"]
+
+                if len(peaks) < 2 or len(troughs) < 2:
+                    continue
+
+                if len(peaks) >= 3 and peaks[0].price < peaks[1].price * 0.9:
+                    peaks = peaks[1:]
+                if len(troughs) >= 3 and troughs[0].price > troughs[1].price * 1.1:
+                    troughs = troughs[1:]
+
+                if len(peaks) < 2 or len(troughs) < 2:
+                    continue
+
+                # 3. 上下軌包絡線擬合 (Envelope Trendlines)
+                p1, p_last = peaks[0], peaks[-1]
+                dx_u = p_last.index - p1.index
+                if dx_u <= 0:
+                    continue
+                slope_u = (p_last.price - p1.price) / float(dx_u)
+                intercept_u = p1.price - slope_u * p1.index
+
+                peak_indices = np.array([p.index for p in peaks])
+                peak_prices = np.array([p.price for p in peaks])
+                diffs_u = peak_prices - (slope_u * peak_indices + intercept_u)
+                max_diff_u = np.max(diffs_u)
+                if max_diff_u > 0:
+                    intercept_u += max_diff_u
+
+                t1, t_last = troughs[0], troughs[-1]
+                dx_l = t_last.index - t1.index
+                if dx_l <= 0:
+                    continue
+                slope_l = (t_last.price - t1.price) / float(dx_l)
+                intercept_l = t1.price - slope_l * t1.index
+
+                trough_indices = np.array([t.index for t in troughs])
+                trough_prices = np.array([t.price for t in troughs])
+                diffs_l = (slope_l * trough_indices + intercept_l) - trough_prices
+                max_diff_l = np.max(diffs_l)
+                if max_diff_l > 0:
+                    intercept_l -= max_diff_l
+
+                # 4. 幾何收斂性判斷
+                start_pattern_idx = min(p1.index, t1.index)
+                end_pattern_idx = max(p_last.index, t_last.index)
+
+                ref_price = float(sub_df["close"].iloc[start_pattern_idx])
+                if ref_price <= 0:
+                    continue
+
+                slope_u_pct = (slope_u / ref_price) * 100
+                slope_l_pct = (slope_l / ref_price) * 100
+
+                slope_thresh = 0.01  # 每根 K 線 0.01%
+
+                is_sym = (slope_u_pct < -slope_thresh) and (slope_l_pct > slope_thresh)
+                is_asc = (abs(slope_u_pct) <= slope_thresh) and (slope_l_pct > slope_thresh)
+                is_desc = (slope_u_pct < -slope_thresh) and (abs(slope_l_pct) <= slope_thresh)
+
+                if not (is_sym or is_asc or is_desc):
+                    continue
+
+                if slope_u >= slope_l:
+                    continue
+
+                slope_diff = slope_u - slope_l
+                if abs(slope_diff) < 1e-8:
+                    continue
+                apex_index = (intercept_l - intercept_u) / slope_diff
+
+                latest_idx = n - 1
+
+                if apex_index <= start_pattern_idx or apex_index > n + 1.2 * n:
+                    continue
+
+                # 5. 波動度收窄與長度驗證 (Volatility Squeeze)
+                pattern_len = end_pattern_idx - start_pattern_idx + 1
+                if pattern_len < self.min_candles:
+                    continue
+
+                seg_len = max(5, pattern_len // 3)
+                df_pattern = sub_df.iloc[start_pattern_idx : end_pattern_idx + 1]
+
+                ranges = df_pattern["high"] - df_pattern["low"]
+                avg_range_head = ranges.iloc[:seg_len].mean()
+                avg_range_tail = ranges.iloc[-seg_len:].mean()
+
+                squeeze_ratio = (avg_range_tail / avg_range_head) if avg_range_head > 0 else 1.0
+                if squeeze_ratio >= 0.85:
+                    continue
+
+                # 6. K 線穿透邊界檢測 (Penetration Check)
+                highs = sub_df["high"].iloc[start_pattern_idx : end_pattern_idx + 1].values
+                lows = sub_df["low"].iloc[start_pattern_idx : end_pattern_idx + 1].values
+                idxs = np.arange(start_pattern_idx, end_pattern_idx + 1)
+
+                upper_bounds = slope_u * idxs + intercept_u
+                lower_bounds = slope_l * idxs + intercept_l
+
+                pen_upper = np.maximum(0, highs - upper_bounds) / ref_price
+                pen_lower = np.maximum(0, lower_bounds - lows) / ref_price
+
+                viol_upper = np.sum(pen_upper > self.max_penetration_pct)
+                viol_lower = np.sum(pen_lower > self.max_penetration_pct)
+
+                if viol_upper > 2 or viol_lower > 2:
+                    continue
+
+                # 7. 計算綜合評分 (品質得分 + 近現性得分)
+                sub_type = "symmetrical" if is_sym else ("ascending" if is_asc else "descending")
+
+                score_pivots = min(25.0, len(sub_pivots) * 5.0)
+                score_squeeze = min(25.0, max(0.0, (0.85 - squeeze_ratio) / 0.5 * 25.0))
+
+                total_span = apex_index - start_pattern_idx
+                progress = (latest_idx - start_pattern_idx) / total_span if total_span > 0 else 0
+                if 0.55 <= progress <= 0.90:
+                    score_progress = 25.0
+                elif 0.35 <= progress < 0.55:
+                    score_progress = 20.0
+                else:
+                    score_progress = 15.0
+
+                # 近現性得分 (Recency Score，型態終點越接近最新 K 線分數越高，最高 25 分)
+                bars_from_end = (n - 1) - end_pattern_idx
+                if bars_from_end <= 5:
+                    score_recency = 25.0
+                elif bars_from_end <= 15:
+                    score_recency = 20.0
+                elif bars_from_end <= 30:
+                    score_recency = 15.0
+                elif bars_from_end <= 60:
+                    score_recency = 10.0
+                else:
+                    score_recency = 5.0
+
+                total_score = float(min(100.0, float(score_pivots) + float(score_squeeze) + float(score_progress) + float(score_recency)))
+
+                if total_score > best_score:
+                    best_score = total_score
+                    best_match = (
+                        sub_pivots, p1, p_last, t1, t_last, slope_u, intercept_u, slope_l, intercept_l,
+                        sub_type, apex_index, slope_u_pct, slope_l_pct, squeeze_ratio, progress,
+                        start_pattern_idx, end_pattern_idx
+                    )
+
+        if not best_match or best_score < 40.0:
             return None
 
-        # 如果第一個 Peak 價格顯著低於第二個 Peak (例如前置噪訊點)，則跳過第一個 Peak 尋找主三角結構起點
-        if len(peaks) >= 3 and peaks[0].price < peaks[1].price * 0.9:
-            peaks = peaks[1:]
-        if len(troughs) >= 3 and troughs[0].price > troughs[1].price * 1.1:
-            troughs = troughs[1:]
+        (
+            sub_pivots, p1, p_last, t1, t_last, slope_u, intercept_u, slope_l, intercept_l,
+            sub_type, apex_index, slope_u_pct, slope_l_pct, squeeze_ratio, progress,
+            start_pattern_idx, end_pattern_idx
+        ) = best_match
 
-        # 2. 上下軌包絡線擬合 (Envelope Trendlines)
-        # 上軌：由第一個 Peak 與最後一個 Peak 連線（或穿過 Peak 群的上包覆線）
-        p1, p_last = peaks[0], peaks[-1]
-        dx_u = p_last.index - p1.index
-        if dx_u <= 0:
-            return None
-        slope_u = (p_last.price - p1.price) / float(dx_u)
-        intercept_u = p1.price - slope_u * p1.index
-
-        # 調整上軌截距，使其成為真正的 upper envelope（包覆所有 Peaks）
-        peak_indices = np.array([p.index for p in peaks])
-        peak_prices = np.array([p.price for p in peaks])
-        diffs_u = peak_prices - (slope_u * peak_indices + intercept_u)
-        max_diff_u = np.max(diffs_u)
-        if max_diff_u > 0:
-            intercept_u += max_diff_u
-
-        # 下軌：由第一個 Trough 與最後一個 Trough 連線（或穿過 Trough 群的下包覆線）
-        t1, t_last = troughs[0], troughs[-1]
-        dx_l = t_last.index - t1.index
-        if dx_l <= 0:
-            return None
-        slope_l = (t_last.price - t1.price) / float(dx_l)
-        intercept_l = t1.price - slope_l * t1.index
-
-        # 調整下軌截距，使其成為真正的 lower envelope（包覆所有 Troughs）
-        trough_indices = np.array([t.index for t in troughs])
-        trough_prices = np.array([t.price for t in troughs])
-        diffs_l = (slope_l * trough_indices + intercept_l) - trough_prices
-        max_diff_l = np.max(diffs_l)
-        if max_diff_l > 0:
-            intercept_l -= max_diff_l
-
-        # 3. 幾何收斂性判斷
-        # 價格基準 (採用型態起點 Pivot 處的收盤價作為百分比歸一化基準)
-        start_pattern_idx = min(p1.index, t1.index)
-        ref_price = float(sub_df["close"].iloc[start_pattern_idx])
-        if ref_price <= 0:
-            return None
-
-        slope_u_pct = (slope_u / ref_price) * 100
-        slope_l_pct = (slope_l / ref_price) * 100
-
-        slope_thresh = 0.01  # 每根 K 線 0.01%
-
-        is_sym = (slope_u_pct < -slope_thresh) and (slope_l_pct > slope_thresh)
-        is_asc = (abs(slope_u_pct) <= slope_thresh) and (slope_l_pct > slope_thresh)
-        is_desc = (slope_u_pct < -slope_thresh) and (abs(slope_l_pct) <= slope_thresh)
-
-        if not (is_sym or is_asc or is_desc):
-            return None
-
-        # 收斂條件: 上軌斜率 < 下軌斜率
-        if slope_u >= slope_l:
-            return None
-
-        # 計算 Apex 交點 x_apex
-        slope_diff = slope_u - slope_l
-        apex_index = (intercept_l - intercept_u) / slope_diff
-
-        start_pattern_idx = min(p1.index, t1.index)
         latest_idx = n - 1
-
-        # 交點要在第一個 Pivot 之後，且不超過當前位置往後太多 (apex <= n + 1.2 * n)
-        if apex_index <= start_pattern_idx or apex_index > n + 1.2 * n:
-            return None
-
-        # 4. 波動度收窄驗證 (Volatility Squeeze)
-        pattern_len = latest_idx - start_pattern_idx + 1
-        if pattern_len < self.min_candles:
-            return None
-
-        seg_len = max(5, pattern_len // 3)
-        df_pattern = sub_df.iloc[start_pattern_idx : latest_idx + 1]
-
-        ranges = df_pattern["high"] - df_pattern["low"]
-        avg_range_head = ranges.iloc[:seg_len].mean()
-        avg_range_tail = ranges.iloc[-seg_len:].mean()
-
-        # 後段震盪幅度和前段相比，必須顯著收窄
-        squeeze_ratio = (avg_range_tail / avg_range_head) if avg_range_head > 0 else 1.0
-        if squeeze_ratio >= 0.85:
-            return None  # 未顯著收窄
-
-        # 5. K 線穿透邊界檢測 (Penetration Check)
-        highs = sub_df["high"].iloc[start_pattern_idx : latest_idx + 1].values
-        lows = sub_df["low"].iloc[start_pattern_idx : latest_idx + 1].values
-        idxs = np.arange(start_pattern_idx, latest_idx + 1)
-
-        upper_bounds = slope_u * idxs + intercept_u
-        lower_bounds = slope_l * idxs + intercept_l
-
-        # 計算超出趨勢線的穿透率
-        pen_upper = np.maximum(0, highs - upper_bounds) / ref_price
-        pen_lower = np.maximum(0, lower_bounds - lows) / ref_price
-
-        viol_upper = np.sum(pen_upper > self.max_penetration_pct)
-        viol_lower = np.sum(pen_lower > self.max_penetration_pct)
-
-        if viol_upper > 2 or viol_lower > 2:
-            return None  # 穿透太多次，線條不具撐壓效力
-
-        # 6. 計算信心分數 (0 ~ 100)
-        sub_type = "symmetrical" if is_sym else ("ascending" if is_asc else "descending")
-
-        # (a) Pivot 交替數量分數 (最高 30 分)
-        score_pivots = min(30.0, len(pivots) * 6.0)
-
-        # (b) 波幅收窄強度分數 (最高 35 分): squeeze_ratio 越小分數越高
-        score_squeeze = min(35.0, max(0.0, (0.85 - squeeze_ratio) / 0.5 * 35.0))
-
-        # (c) 收斂進度分數 (最高 35 分): 最佳進入點為收斂進度 60% ~ 90%
-        total_span = apex_index - start_pattern_idx
-        progress = (latest_idx - start_pattern_idx) / total_span if total_span > 0 else 0
-        if 0.55 <= progress <= 0.90:
-            score_progress = 35.0
-        elif 0.35 <= progress < 0.55:
-            score_progress = 25.0
-        else:
-            score_progress = 15.0
-
-        total_score = float(min(100.0, float(score_pivots) + float(score_squeeze) + float(score_progress)))
-
-        # 7. 判斷最新價格突破狀態
         latest_close = float(sub_df["close"].iloc[-1])
         upper_now = slope_u * latest_idx + intercept_u
         lower_now = slope_l * latest_idx + intercept_l
@@ -255,7 +284,7 @@ class TriangleDetector(BasePatternDetector):
             end_price=float(slope_u * end_peak_idx + intercept_u),
             slope=float(slope_u),
             intercept=float(intercept_u),
-            r_squared=0.85,  # 外軌包絡線高品質
+            r_squared=0.85,
             line_type="resistance",
         )
 
@@ -277,9 +306,9 @@ class TriangleDetector(BasePatternDetector):
             pattern_type="triangle",
             sub_type=sub_type,
             timeframe=timeframe,
-            score=total_score,
+            score=best_score,
             date=str(sub_df["date"].iloc[-1]),
-            pivots=pivots,
+            pivots=sub_pivots,
             lines=[line_upper, line_lower],
             details={
                 "breakout_status": breakout_status,
@@ -291,6 +320,6 @@ class TriangleDetector(BasePatternDetector):
                 "latest_close": float(latest_close),
                 "upper_boundary_price": round(float(upper_now), 2),
                 "lower_boundary_price": round(float(lower_now), 2),
-                "pivot_count": int(len(pivots)),
+                "pivot_count": int(len(sub_pivots)),
             },
         )
