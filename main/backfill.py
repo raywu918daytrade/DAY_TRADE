@@ -30,7 +30,21 @@ def run_startup_backfill(state) -> None:
             f"  → {len(m1_now):,} 筆，{m1_now['stock_id'].nunique():,} 支，最新分鐘：{last_min}",
             flush=True,
         )
+        last_dt = datetime.strptime(last_min, "%Y-%m-%d %H:%M:%S")
+        h, m = last_dt.hour, last_dt.minute
         for s in state.strategies.values():
+            # 2026-07-29發現的bug：這裡原本沒有比對 session_start/session_end，
+            # 不管重啟發生在幾點，都會硬對每個策略跑一次 predict_live()——如果
+            # 重啟發生在該策略的進場窗口之外（例如收盤後13:30重啟，cnn_up只在
+            # 9:00~10:00有效），會餵給模型它從沒訓練過的時段資料，算出來的
+            # 監控數字沒有意義，還會卡在 _monitoring 裡（push_monitoring() 的
+            # 過期清理只在被呼叫時才觸發，這個策略當天不會再被呼叫，會一直
+            # 卡著直到隔天重置）。跟 main/live_trader.py::on_minute() 用同一套
+            # session時段判斷，超出範圍就跳過，不产生這筆監控資料。
+            if (h, m) < s.session_start or (h, m) > s.session_end:
+                print(f"  [{s.name}] 補載當下（{last_min[11:16]}）不在進場窗口內，跳過", flush=True)
+                continue
+
             # 每個策略各自的門檻：先查前端 settings 的全域覆蓋值，沒設定才
             # fallback 該策略自己的預設值（見 main/state.py::StrategyState 的
             # 說明），跟 main/live_trader.py 的 on_minute() 用同一套邏輯。

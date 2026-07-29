@@ -1126,9 +1126,25 @@ def chart_candles_history(
 
 @app.get("/monitoring", tags=["監控"], summary="監控中股票的最新推論結果（依信心度排序）")
 def get_monitoring():
-    print(f"[GET /monitoring] 回傳 {len(_monitoring)} 支監控股票", flush=True)
+    """2026-07-29發現的bug：main/backfill.py::run_startup_backfill()重啟補載時
+    原本沒檢查策略自己的session時段，可能把過期很久（例如收盤後才重啟）的
+    監控結果寫進_monitoring；該策略當天之後不會再被呼叫，push_monitoring()
+    內建的過期清理（見該函式，180秒門檻）也就沒有機會再觸發，舊資料會一直
+    卡著、被這支端點原封不動吐給前端，讓人誤以為是即時訊號、可能因此手動
+    進場。backfill.py的根因已經修了，這裡額外加一層防護：回傳前只保留
+    minute距離現在不超過180秒（跟push_monitoring()同一個門檻）的項目，就算
+    未來還有其他沒想到的原因造成資料卡住，前端也不會被誤導成看到「還在跑」
+    的假象。"""
+    now = datetime.now(_TW).replace(tzinfo=None)
+    today_str = now.strftime("%Y-%m-%d")
     with _lock:
-        return sorted(_monitoring.values(), key=lambda x: -x["proba"])
+        fresh = [
+            v
+            for v in _monitoring.values()
+            if (now - datetime.strptime(f"{today_str} {v['minute']}", "%Y-%m-%d %H:%M")).total_seconds() <= 180
+        ]
+        print(f"[GET /monitoring] 回傳 {len(fresh)}/{len(_monitoring)} 支監控股票（濾掉過期）", flush=True)
+        return sorted(fresh, key=lambda x: -x["proba"])
 
 
 @app.get("/completed_trades", tags=["成交"], summary="今日已完成回合（進出配對，含損益）")
