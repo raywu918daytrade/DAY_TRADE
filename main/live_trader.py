@@ -74,6 +74,7 @@ from api import (
     append_system_log as _log_sys,
     get_uvicorn_config,
     push_candles,
+    push_conflict_signals,
     push_consensus_signals,
     push_inference_log,
     push_monitoring,
@@ -88,6 +89,7 @@ from main import collector as _collector
 from main import premarket as _premarket
 from main.backfill import run_startup_backfill
 from main.config import (
+    CONFLICT_THRESHOLD,
     CONSENSUS_TOP_N,
     FORCE_CLOSE_HOUR as _FORCE_CLOSE_HOUR,
     FORCE_CLOSE_MIN as _FORCE_CLOSE_MIN,
@@ -133,6 +135,7 @@ set_strategies(
     ],
     consensus_top_n=CONSENSUS_TOP_N,
 )
+
 
 def _startup():
     """開機序列（模型載入／當沖標的清單／日K／盤前快取／交易引擎），搬進背景
@@ -180,7 +183,9 @@ def _startup():
                 f"✓ [D1] {len(state.day):,} 筆，{state.day['stock_id'].nunique():,} 支，最新日期：{_d1_last}",
                 flush=True,
             )
-            _log_sys(f"D1 載入完成：{state.day['stock_id'].nunique() if not state.day.empty else 0} 支，最新 {_d1_last}")
+            _log_sys(
+                f"D1 載入完成：{state.day['stock_id'].nunique() if not state.day.empty else 0} 支，最新 {_d1_last}"
+            )
         except Exception as e:
             print(f"✗ [D1] 載入失敗: {e}", flush=True)
             _log_sys(f"D1 載入失敗: {e}", "error")
@@ -192,7 +197,9 @@ def _startup():
     print("盤前預算快取...", flush=True)
     try:
         _premarket.refresh_prewarm(state)
-        print(f"✓ 盤前快取完成：{ {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()} }", flush=True)
+        print(
+            f"✓ 盤前快取完成：{ {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()} }", flush=True
+        )
     except Exception as e:
         print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
 
@@ -370,6 +377,11 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     # 混在一起排名——「A策略看漲、B策略看跌」不是共識，是分歧，一定要同方向
     # 才算「多個模型都看好同一件事」。
     top_by_direction: dict[str, dict[str, list[dict]]] = {"up": {}, "down": {}}
+    # 多空衝突（反轉）訊號用：每支股票分別記錄「目前看過的所有策略」裡最高
+    # 的多方信心度、最高的空方信心度（不限前N名，全部推論結果都算——見
+    # main/config.py::CONFLICT_THRESHOLD 的說明）。等所有策略跑完，兩邊都
+    # 超過門檻的股票，代表模型之間對這支股票方向嚴重分歧。
+    stock_best_by_direction: dict[str, dict[str, dict]] = {}
     # 同一分鐘內，如果兩個策略共用同一個 predict_live 函式「且」同一個 model
     # 物件（例如 mkt_up/mkt_down，見 strategy/mkt/up、strategy/mkt/down/live.py
     # ——同一顆3分類模型，只是各自濾不同方向），代表算出來的東西完全一樣，
@@ -440,6 +452,11 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             dir_results = [r for r in all_results if r["direction"] == direction]
             if dir_results:
                 top_by_direction[direction][s.name] = sorted(dir_results, key=lambda x: -x["proba"])[:CONSENSUS_TOP_N]
+        for r in all_results:
+            slot = stock_best_by_direction.setdefault(r["stock_id"], {})
+            best = slot.get(r["direction"])
+            if best is None or r["proba"] > best["proba"]:
+                slot[r["direction"]] = r
         top_str = " ".join(f"{r['stock_id']}={r['proba']:.2f}" for r in top)
         print(
             f"  [{s.name}] 推論:{len(all_results)} 支  訊號:{len(signals)} 支（門檻={threshold:.2f}）  top5:[{top_str}]",
@@ -481,8 +498,37 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         if consensus:
             consensus.sort(key=lambda c: -sum(c["probas"].values()) / len(c["probas"]))
             push_consensus_signals(minute_str, consensus)
-            print(f"  [共識-{direction}] {len(consensus)} 支同時進入 {CONSENSUS_TOP_N} 名內: "
-                  + " ".join(f"{c['stock_id']}({'+'.join(c['strategies'])})" for c in consensus), flush=True)
+            print(
+                f"  [共識-{direction}] {len(consensus)} 支同時進入 {CONSENSUS_TOP_N} 名內: "
+                + " ".join(f"{c['stock_id']}({'+'.join(c['strategies'])})" for c in consensus),
+                flush=True,
+            )
+
+    # 多空衝突（反轉）訊號：同一支股票，多方最高信心度、空方最高信心度都
+    # 超過門檻（見 main/config.py::CONFLICT_THRESHOLD），代表模型之間對這支
+    # 股票方向嚴重分歧，跟上面「共識」（同方向）邏輯相反，分開推送，不取代。
+    conflicts = []
+    for sid, best in stock_best_by_direction.items():
+        up_r, down_r = best.get("up"), best.get("down")
+        if up_r and down_r and up_r["proba"] >= CONFLICT_THRESHOLD and down_r["proba"] >= CONFLICT_THRESHOLD:
+            conflicts.append(
+                {
+                    "stock_id": sid,
+                    "name": up_r["name"],
+                    "up_proba": up_r["proba"],
+                    "up_strategy": up_r["strategy"],
+                    "down_proba": down_r["proba"],
+                    "down_strategy": down_r["strategy"],
+                }
+            )
+    if conflicts:
+        conflicts.sort(key=lambda c: -(c["up_proba"] + c["down_proba"]))
+        push_conflict_signals(minute_str, conflicts)
+        print(
+            f"  [多空衝突] {len(conflicts)} 支同時滿足多空門檻（≥{CONFLICT_THRESHOLD:.0%}）: "
+            + " ".join(f"{c['stock_id']}(多{c['up_proba']:.2f}/空{c['down_proba']:.2f})" for c in conflicts),
+            flush=True,
+        )
 
     if price_map:
         update_positions_price(price_map)

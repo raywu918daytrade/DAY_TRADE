@@ -29,6 +29,13 @@ STRATEGY_MODULES = [
 # 共識訊號，額外推送給前端參考（見 main/live_trader.py 的 on_minute()）。
 CONSENSUS_TOP_N = int(os.environ.get("CONSENSUS_TOP_N", "10"))
 
+# 多空衝突（反轉）訊號：同一支股票同一分鐘，如果「某策略」看多信心度 ≥ 這個
+# 門檻、「某策略」（可以是同一個或不同策略）看空信心度也 ≥ 這個門檻，代表
+# 模型之間對這支股票的方向嚴重分歧，標記成「衝突/反轉」給前端參考（見
+# main/live_trader.py 的 on_minute()）。跟 CONSENSUS_TOP_N 的共識邏輯相反：
+# 共識要求同方向、衝突要求異方向。
+CONFLICT_THRESHOLD = float(os.environ.get("CONFLICT_THRESHOLD", "0.6"))
+
 # 頁首固定追蹤股票（不經過策略候選篩選，例如 ETF 0050）：on_minute() 每分鐘
 # 收到這些股票的 m1 就查前一交易日收盤價、算漲跌幅，push_quote() 推給前端。
 WATCHLIST_QUOTES = [

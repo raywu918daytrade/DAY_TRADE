@@ -9,6 +9,7 @@ ReDoc      : http://localhost:8000/redoc
     GET  /dashboard/summary          上方資訊列統計
     GET  /signals/today              左邊訊號列表
     GET  /consensus/today            今日「多個策略前N名重疊」訊號列表
+    GET  /conflict/today             今日「多空衝突（反轉）」訊號列表
     GET  /strategies                 目前啟用的策略清單（幾個模型、各自session範圍）
     GET  /signals/{stock_id}/detail  右邊訊號詳情
     GET  /chart/{stock_id}/candles   中間 K 圖
@@ -307,6 +308,7 @@ _quotes: dict = {}  # {stock_id: {stock_id, price, prev_close, change_pct, minut
 _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
 _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 _consensus_signals: list = []  # 今日「多個策略的前N名重疊」記錄，見 push_consensus_signals()
+_conflict_signals: list = []  # 今日「多空衝突（反轉）」記錄，見 push_conflict_signals()
 _strategies_registry: dict = {"strategies": [], "consensus_top_n": 0}  # 見 set_strategies()
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
@@ -402,7 +404,7 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -417,6 +419,7 @@ def _reset_if_new_day():
         _trade_logs.clear()
         _monitoring.clear()
         _consensus_signals.clear()
+        _conflict_signals.clear()
         _summary = dict(_SUMMARY_DEFAULT)
 
 
@@ -637,6 +640,23 @@ def push_consensus_signals(minute_str: str, consensus: list):
         for c in consensus:
             _consensus_signals.append({**c, "time": minute_str[11:16]})
         _broadcast({"type": "consensus_signals", "minute": minute_str[11:16], "data": consensus})
+
+
+def push_conflict_signals(minute_str: str, conflicts: list):
+    """推入「多空衝突（反轉）」訊號（由 main/live_trader.py 的 on_minute() 在
+    所有策略都跑完那分鐘的推論後呼叫，見 main/config.py::CONFLICT_THRESHOLD）。
+
+    conflicts 每筆結構：{"stock_id", "name", "up_proba", "up_strategy",
+    "down_proba", "down_strategy"}——同一支股票，多方最高信心度、空方最高
+    信心度都超過門檻，代表模型之間對這支股票方向嚴重分歧，跟 push_consensus_signals()
+    （要求同方向）邏輯相反，分開推送，不取代。
+    """
+    print(f"[push_conflict_signals] {minute_str} 產生 {len(conflicts)} 筆多空衝突訊號", flush=True)
+    with _lock:
+        _reset_if_new_day()
+        for c in conflicts:
+            _conflict_signals.append({**c, "time": minute_str[11:16]})
+        _broadcast({"type": "conflict_signals", "minute": minute_str[11:16], "data": conflicts})
 
 
 def push_candles(stock_id: str, candles: list):
@@ -968,6 +988,17 @@ def consensus_today():
     print(f"[GET /consensus/today] 回傳 {len(_consensus_signals)} 筆重疊訊號", flush=True)
     with _lock:
         return list(reversed(_consensus_signals))  # 最新在上
+
+
+@app.get(
+    "/conflict/today",
+    tags=["訊號"],
+    summary="今日「多空衝突（反轉）」訊號列表",
+)
+def conflict_today():
+    print(f"[GET /conflict/today] 回傳 {len(_conflict_signals)} 筆多空衝突訊號", flush=True)
+    with _lock:
+        return list(reversed(_conflict_signals))  # 最新在上
 
 
 @app.get(
