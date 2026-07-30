@@ -15,6 +15,8 @@
     load_tick_by_stock(stock_id) → db/tick/      單一股票的逐筆成交明細（見下方
                                     load_tick_by_stock() 說明，tick資料量太大
                                     不提供整個資料集一次讀進記憶體的版本）
+    load_volume_profile()        → db/volume_profile/ 價位成交量分布 (Volume Profile)
+    load_poc()                   → db/poc_day/        每日 POC 關鍵價位 (Point of Control)
 """
 
 from pathlib import Path
@@ -202,3 +204,134 @@ def load_m1_live(date: str = None) -> pd.DataFrame:
     df = pd.read_parquet(path)
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def load_volume_profile(
+    stock_id: str | None = None,
+    date: str | None = None,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    """載入 db/volume_profile/ 價位成交量分布 (Volume Profile)。
+
+    stock_id: 選填，指定股票代號（走 pyarrow filter pushdown）
+    date: 選填，格式 "YYYY-MM-DD"，指定交易日（走 pyarrow filter pushdown）
+    start_date: 選填，格式 "YYYY-MM-DD"，依月份載入 start_date 之後的檔案
+
+    回傳欄位：stock_id, date, price, volume, buy_volume, sell_volume, neutral_volume
+    """
+    path = _ROOT / "db/volume_profile"
+    if not path.exists():
+        return pd.DataFrame(
+            columns=["stock_id", "date", "price", "volume", "buy_volume", "sell_volume", "neutral_volume"]
+        )
+
+    # 依 start_date 決定要讀哪些月份分檔
+    # 若指定了 date，以 date 所在月份縮小讀取範圍
+    eff_start = start_date
+    if date is not None and (eff_start is None or date < eff_start):
+        eff_start = date
+
+    paths = _dataset_paths(path, eff_start)
+    if not paths:
+        return pd.DataFrame(
+            columns=["stock_id", "date", "price", "volume", "buy_volume", "sell_volume", "neutral_volume"]
+        )
+
+    dataset = ds.dataset(paths, format="parquet")
+    filt = None
+    if stock_id is not None:
+        filt = ds.field("stock_id") == stock_id
+    if date is not None:
+        filt = (filt & (ds.field("date") == date)) if filt is not None else (ds.field("date") == date)
+
+    table = dataset.to_table(filter=filt)
+    if table.num_rows == 0:
+        return pd.DataFrame(
+            columns=["stock_id", "date", "price", "volume", "buy_volume", "sell_volume", "neutral_volume"]
+        )
+
+    df = table.to_pandas()
+    df.drop_duplicates(subset=["stock_id", "date", "price"], keep="last", inplace=True)
+    return df.sort_values(["stock_id", "date", "price"]).reset_index(drop=True)
+
+
+def load_poc(
+    stock_id: str | None = None,
+    date: str | None = None,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    """載入 db/poc_day/ 每日 POC 關鍵價位 (Point of Control 與 Value Area)。
+
+    stock_id: 選填，指定股票代號（走 pyarrow filter pushdown）
+    date: 選填，格式 "YYYY-MM-DD"，指定交易日（走 pyarrow filter pushdown）
+    start_date: 選填，格式 "YYYY-MM-DD"，依月份載入 start_date 之後的檔案
+
+    回傳欄位：stock_id, date, poc, poc_volume, pocs, poc_count, profile_type, vah, val, total_volume
+    """
+    path = _ROOT / "db/poc_day"
+    if not path.exists():
+        return pd.DataFrame(
+            columns=[
+                "stock_id",
+                "date",
+                "poc",
+                "poc_volume",
+                "pocs",
+                "poc_count",
+                "profile_type",
+                "vah",
+                "val",
+                "total_volume",
+            ]
+        )
+
+    eff_start = start_date
+    if date is not None and (eff_start is None or date < eff_start):
+        eff_start = date
+
+    paths = _dataset_paths(path, eff_start)
+    if not paths:
+        return pd.DataFrame(
+            columns=[
+                "stock_id",
+                "date",
+                "poc",
+                "poc_volume",
+                "pocs",
+                "poc_count",
+                "profile_type",
+                "vah",
+                "val",
+                "total_volume",
+            ]
+        )
+
+    dataset = ds.dataset(paths, format="parquet")
+    filt = None
+    if stock_id is not None:
+        filt = ds.field("stock_id") == stock_id
+    if date is not None:
+        filt = (filt & (ds.field("date") == date)) if filt is not None else (ds.field("date") == date)
+
+    table = dataset.to_table(filter=filt)
+    if table.num_rows == 0:
+        return pd.DataFrame(
+            columns=[
+                "stock_id",
+                "date",
+                "poc",
+                "poc_volume",
+                "pocs",
+                "poc_count",
+                "profile_type",
+                "vah",
+                "val",
+                "total_volume",
+            ]
+        )
+
+    df = table.to_pandas()
+    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
