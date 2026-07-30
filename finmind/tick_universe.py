@@ -4,9 +4,18 @@
 排名變動就換掉補的股票。
 
 清單定義：db/fugle_day/2026_01.parquet ~ 2026_06.parquet 這6個月，4碼數字股票
-（regex ^\\d{4}$，排除ETF/權證等非4碼代號）依平均日成交量排序，取前800名，
-再強制併入 0050（即使 0050 沒過4碼regex——ETF代號規則是「00+3碼」共5碼，
-0050 剛好是4碼的例外，見 fubon/subscribe_list.py 的既有註解）。
+依平均日成交量排序，取前399名，再強制併入 0050，共400檔。
+
+2026-07-30 發現：光是「4碼數字」（regex ^\\d{4}$）不夠，早期上市的ETF代號
+（0050/0052/0056等）剛好也是4碼、會混進純股票的排名池——查過
+db/tickers/tickers.parquet，凡是 stock_id 開頭"00"的，industry欄位都是"00"
+（沒有任何一般個股用這個開頭），所以額外排除所有"00"開頭的代號，只留
+0050 這一個明確要的例外（強制併入，不受排名池排除影響）。
+
+2026-07-30：從800調降到400——800檔涵蓋2026-01~06累積成交量的100%，但87%的
+量前300名就拿到了、92%前400名就拿到了，超過400名之後邊際貢獻明顯遞減（每多
+50名只增加不到5個百分點），但回補時間是跟股票數線性成長，縮到400檔可以把
+全部12個月的回補時間從約35小時砍到約17.5小時，CP值划算很多。
 
 用法：
     python -m finmind.tick_universe   # 算一次、存到 db/tickers/tick_universe.parquet
@@ -23,10 +32,11 @@ import pandas as pd
 
 from finmind.finmind_api import _atomic_to_parquet, _ROOT
 
-_TOP_N = 800
+_TOP_N = 400  # 輸出總檔數（含force_include），不是「純排名檔數 + force_include」
 _FORCE_INCLUDE = ["0050"]
 _DEFAULT_YEAR_MONTHS = [(2026, m) for m in range(1, 7)]
 _FOUR_DIGIT = re.compile(r"^\d{4}$")
+_ETF_PREFIX = "00"  # db/tickers/tickers.parquet 驗證過：00開頭的代號industry都是"00"（ETF），沒有一般個股用這個開頭
 
 
 def _universe_file_path() -> Path:
@@ -40,16 +50,18 @@ def build_tick_universe(
 ) -> pd.DataFrame:
     """讀 year_months 每個月的 db/fugle_day/{year}_{month}.parquet（只取
     stock_id/date/volume 三欄，比照 finmind_api._month_universe() 的做法），
-    篩 4碼數字股票，算跨月平均日成交量排序。force_include 的股票（例如
-    0050）先從排名池排除，取「純排名」前 top_n 名，再把 force_include 額外
-    併入——確保輸出永遠是 top_n + len(force_include) 檔（預設800+1=801），
-    不會因為 force_include 剛好本來就排得進前top_n名而被「吃掉一個名額」。
+    篩 4碼數字股票、排除"00"開頭的ETF代號（見上面模組docstring的說明，
+    0050/0052/0056這種早期ETF代號剛好也是4碼，不能只靠regex ^\\d{4}$濾掉），
+    算跨月平均日成交量排序，取前 (top_n - len(force_include)) 名，
+    再把 force_include（例如0050）併入——確保輸出**總數固定是 top_n**
+    （預設400，399純排名+1個強制併入），不是 top_n 之外再加碼。
 
-    輸出欄位：stock_id, avg_volume, rank, forced_include。前 top_n 列
-    rank=1~top_n、forced_include=False；force_include 的列 rank=NaN、
-    forced_include=True，avg_volume 仍然照實填（純粹沒被排進top_n名額，
-    不代表沒有成交量資料）——保留這些欄位是為了之後回頭稽核「這份清單是
-    怎麼算出來的」，不是直接存一份沒有脈絡的股票代號清單。
+    輸出欄位：stock_id, avg_volume, rank, forced_include。純排名列
+    rank=1~(top_n-len(force_include))、forced_include=False；
+    force_include 的列 rank=NaN、forced_include=True，avg_volume 仍然
+    照實填（純粹沒被排進排名名額，不代表沒有成交量資料）——保留這些欄位
+    是為了之後回頭稽核「這份清單是怎麼算出來的」，不是直接存一份沒有
+    脈絡的股票代號清單。
     """
     frames = []
     for year, month in year_months:
@@ -59,14 +71,17 @@ def build_tick_universe(
         frames.append(pd.read_parquet(path, columns=["stock_id", "date", "volume"]))
     df = pd.concat(frames, ignore_index=True)
     df = df[df["stock_id"].str.match(_FOUR_DIGIT)]
-
-    avg_vol = df.groupby("stock_id")["volume"].mean().sort_values(ascending=False)
-    # force_include 的股票（例如0050）先從排名池排除再取前top_n名，這樣
-    # 「前800名 + 強制併入」永遠是 top_n + len(force_include) 檔，不會因為
-    # force_include剛好本來就排得進前top_n名而變成「800檔裡面含0050」，
-    # 使用者要的是800純排名 + 0050額外併入，共801檔。
-    ranked_pool = avg_vol.drop(index=force_include, errors="ignore")
-    ranked = ranked_pool.head(top_n)
+    # avg_vol_all 包含ETF（給 force_include 查詢實際成交量用，例如0050要
+    # 顯示真實avg_volume，不能因為它被排名池排除就查不到），avg_vol 是排除
+    # 掉"00"開頭ETF代號之後、真正拿來排名選股的池子。
+    avg_vol_all = df.groupby("stock_id")["volume"].mean()
+    avg_vol = (
+        df[~df["stock_id"].str.startswith(_ETF_PREFIX)]
+        .groupby("stock_id")["volume"]
+        .mean()
+        .sort_values(ascending=False)
+    )
+    ranked = avg_vol.head(top_n - len(force_include))
     result = pd.DataFrame(
         {
             "stock_id": ranked.index,
@@ -79,7 +94,7 @@ def build_tick_universe(
     extra_df = pd.DataFrame(
         {
             "stock_id": force_include,
-            "avg_volume": avg_vol.reindex(force_include).values,
+            "avg_volume": avg_vol_all.reindex(force_include).values,
             "rank": pd.NA,
             "forced_include": True,
         }

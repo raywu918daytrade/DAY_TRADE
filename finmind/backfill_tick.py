@@ -1,6 +1,6 @@
 """FinMind Tick 補齊 — TaiwanStockPriceTick，固定股票清單（見
-finmind/tick_universe.py，800檔4碼股票依成交量排序+0050，共801檔）、固定範圍
-2025-08 ~ 2026-07（含當月至今）。
+finmind/tick_universe.py，399檔4碼股票依成交量排序+0050，共400檔，排除ETF代號）、
+固定範圍 2025-08 ~ 2026-07（含當月至今）。
 
 薄wrapper，核心邏輯在 finmind/backfill_tick_history.py，這支只固定範圍/名單。
 用 finmind_api.run_forever()（跟分K共用同一套額度恢復輪詢邏輯，見
@@ -31,8 +31,8 @@ backfill_all.py/backfill_top1000.py 的既有警告，長時間連續執行的�
 
 import asyncio
 
+from finmind.backfill_history import run_forever
 from finmind.backfill_tick_history import backfill_tick_history
-from finmind.finmind_api import run_forever
 from finmind.tick_universe import load_tick_universe
 
 _DEFAULT_START = "2025-08"

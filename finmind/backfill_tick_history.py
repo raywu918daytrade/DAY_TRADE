@@ -1,15 +1,15 @@
 """FinMind Tick（TaiwanStockPriceTick）歷史回補 — 補進 db/tick/，跟
 finmind/backfill_history.py（分K）同構的月份迴圈驅動，差別是股票清單用固定的
-801檔名單（見 finmind/tick_universe.py），不像分K的 top_n_by_volume 是每月
+401檔名單（見 finmind/tick_universe.py），不像分K的 top_n_by_volume 是每月
 動態重算。
 
 跟 finmind/finmind_api.py 的核心 fetch/rate-limit/錯誤處理邏輯完全共用（見
 fetch_tick_day()/_fetch_finmind_day()），這支只負責「跑哪些月份、依序跑、
 股票清單哪裡來」。
 
-⚠️ 規模警告：801支 x 12個月的交易日，request數量級是 股票數 x 交易日數，
+⚠️ 規模警告：401支 x 12個月的交易日，request數量級是 股票數 x 交易日數，
 跟分K同一套規則，但實際 request 數比全部2325支股票的分K回補省很多（約
-801/2325 ≈ 三分之一）。不過 tick 資料量遠比分K大（單日單股可能上萬筆，
+401/2325 ≈ 六分之一）。不過 tick 資料量遠比分K大（單日單股可能上萬筆，
 2330實測單日9424筆），寫檔案的I/O跟磁碟空間會比分K重，仍然不是能在一次
 對話 session 裡「背景跑一下」的任務，要用 nohup/caffeinate 背景跑（見
 finmind/backfill_tick.py 的啟動說明）。
@@ -185,7 +185,7 @@ async def backfill_tick_history(
     backfill_tick_month()。FileNotFoundError 跳過該月繼續，FatalAPIError
     整批停止並往上拋（run_forever() 會處理暫停/恢復），其他 Exception
     跳過該月繼續。stocks=None 時從 tick_universe.load_tick_universe() 讀
-    固定的801檔清單。"""
+    固定的401檔清單。"""
     if stocks is None:
         stocks = load_tick_universe()
     months = _month_range(start_ym, end_ym)
