@@ -11,7 +11,10 @@
     load_m1_live() → db/m1_live/   今日即時分K（交易用，500支，收盤後丟棄）
 
 單支股票查詢（用 pyarrow filter pushdown，不用像 load_day() 整個資料集讀進記憶體）：
-    load_day_by_stock(stock_id) → db/fugle_day/ 單一股票的全部日K
+    load_day_by_stock(stock_id)  → db/fugle_day/ 單一股票的全部日K
+    load_tick_by_stock(stock_id) → db/tick/      單一股票的逐筆成交明細（見下方
+                                    load_tick_by_stock() 說明，tick資料量太大
+                                    不提供整個資料集一次讀進記憶體的版本）
 """
 
 from pathlib import Path
@@ -90,6 +93,36 @@ def load_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
         return pd.DataFrame(columns=["stock_id", "date", "open", "high", "low", "close", "volume"])
     df = table.to_pandas()
     # 同 load_day()：按月分檔可能混雜不同型別的 date 欄位，用 format="mixed" 容忍
+    df["date"] = pd.to_datetime(df["date"], format="mixed")
+    df.drop_duplicates(subset=["date"], keep="last", inplace=True)
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def load_tick_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
+    """載入單一股票在 db/tick/ 的逐筆成交明細（FinMind TaiwanStockPriceTick，
+    見 finmind/tick_api.py），只讀該股票的 row group，不提供整個資料集一次
+    讀進記憶體的版本——tick資料量級跟分K差太多（一個月400檔股票就有2000多萬
+    列），像 load_m1() 那樣整個資料夾讀進記憶體會是幾十GB，不現實。
+
+    date: 選填，格式 "YYYY-MM-DD"，只回傳該日的tick；不填則回傳該股票在
+    db/tick/ 裡全部月份的tick（小心：熱門股全部12個月的tick可能是數十萬列，
+    沒有 date 就近一步限制的話記憶體用量會偏高）。查無資料回傳空 DataFrame
+    （欄位跟 db/tick 一致：stock_id, date, deal_price, volume, tick_type）。
+
+    date 欄位是完整時間字串（"YYYY-MM-DD HH:MM:SS.ffffff"，見
+    finmind/tick_api.py::save_tick() 的說明），不是純日期，不能像
+    load_day_by_stock() 那樣用 == 比對，改用當天 00:00:00~23:59:59.999999
+    的字串範圍（欄位是固定寬度的ISO格式字串，字典序比較等同時間先後順序，
+    pyarrow 一樣能靠 row group 的 min/max 統計做 filter pushdown）。
+    """
+    dataset = ds.dataset(str(_ROOT / "db/tick"), format="parquet")
+    filt = ds.field("stock_id") == stock_id
+    if date is not None:
+        filt = filt & (ds.field("date") >= f"{date} 00:00:00") & (ds.field("date") <= f"{date} 23:59:59.999999")
+    table = dataset.to_table(filter=filt)
+    if table.num_rows == 0:
+        return pd.DataFrame(columns=["stock_id", "date", "deal_price", "volume", "tick_type"])
+    df = table.to_pandas()
     df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["date"], keep="last", inplace=True)
     return df.sort_values("date").reset_index(drop=True)
