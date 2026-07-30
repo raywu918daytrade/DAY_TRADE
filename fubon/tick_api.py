@@ -29,12 +29,15 @@ fubon/subscribe_list.py:158 同樣的節流方式（0.25秒/次，留緩衝抓~2
     python -m fubon.tick_api   # 更新今天固定清單（tick_universe，400檔+0050）的tick到db/tick
 """
 
-from datetime import datetime, timedelta, timezone
 import time
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 
+# finmind.tick_api 匯入時會連帶 import finmind.finmind_api，那支檔案本身已經
+# monkey-patch 過全域 print（加時間戳記+強制flush，見該檔說明），這裡不用
+# 重複做一次——重複patch會把時間戳記包兩層，變成 "[HH:MM:SS] [HH:MM:SS] ..."。
 from finmind.tick_api import save_tick
 from finmind.tick_universe import load_tick_universe
 
