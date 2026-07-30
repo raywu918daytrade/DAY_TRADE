@@ -255,14 +255,15 @@ async def sync_rate_limiter() -> dict:
     }
 
 
-async def fetch_kbar_day(
-    session: aiohttp.ClientSession, stock_id: str, date_str: str, _retry: int = 0
-) -> pd.DataFrame:
-    """單一股票、單一交易日的分K。date_str 格式 YYYY-MM-DD。
-
-    回傳欄位跟 db/m1 一致：stock_id, date("YYYY-MM-DD HH:MM:SS"), open, high,
-    low, close, volume。當天沒有資料（停牌/尚未上市等）回傳空 DataFrame，
-    不當例外處理——例外只保留給真正的請求失敗（網路、限流、權限問題）。
+async def _fetch_finmind_day(
+    session: aiohttp.ClientSession, dataset: str, stock_id: str, date_str: str, _retry: int = 0
+) -> list[dict]:
+    """單一 (dataset, 股票, 交易日) 的原始請求，date_str 格式 YYYY-MM-DD。回傳
+    payload['data'] 的原始 list[dict]（未整形，欄位怎麼組成最終 DataFrame由呼叫
+    端決定），因為這裡的request/timeout/retry/錯誤分類邏輯完全跟dataset無關
+    （2026-07-29 從原本寫死 TaiwanStockKBar 的 fetch_kbar_day() 抽出來，讓
+    fetch_tick_day()（TaiwanStockPriceTick）共用同一套，不要複製這段
+    60行的錯誤處理邏輯——之後FinMind訊息格式一變，只要改一個地方）。
 
     2026-07-14 實測：帳號真實上限就是 6000/小時（跟 _RATE_LIMIT_PER_HOUR 一致，
     衝高流量測過會撞到 402 "Requests reach the upper limit"）。_RateLimiter
@@ -277,20 +278,24 @@ async def fetch_kbar_day(
     if not _TOKEN:
         raise RuntimeError("缺少 FINMIND_TOKEN，請在 .env 設定")
     headers = {"Authorization": f"Bearer {_TOKEN}"}
-    params = {"dataset": _DATASET, "data_id": stock_id, "start_date": date_str}
+    params = {"dataset": dataset, "data_id": stock_id, "start_date": date_str}
     await _rate_limiter.acquire()
     # 2026-07-14：外層再包一次 asyncio.wait_for()，雙重保險——aiohttp自己的
     # ClientTimeout理論上該夠了，但實測遇過整支程式長時間沒有任何進度、
     # 又查不到CPU活動或開啟中的網路連線，不確定是不是某種邊界情況讓內建
-    # timeout沒生效，這裡強制25秒後一定會拋TimeoutError，不會無限卡住。
+    # timeout沒生效，這裡強制40秒後一定會拋TimeoutError，不會無限卡住。
+    # 2026-07-29：從20/25秒調高到30/40秒——TaiwanStockPriceTick單日單股
+    # 可能回傳上萬筆（2330實測單日9424筆），比分K單日約270筆重很多，原本
+    # 給分K用的timeout對tick的大檔案股票可能太緊，誤觸發NetworkError讓
+    # 整批任務停止；分K的response本來就小很多，調高timeout對它沒有壞處。
     async def _do_request():
         async with session.get(
-            _BASE_URL, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=20)
+            _BASE_URL, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=30)
         ) as r:
             return r.status, await r.json()
 
     try:
-        status, payload = await asyncio.wait_for(_do_request(), timeout=25)
+        status, payload = await asyncio.wait_for(_do_request(), timeout=40)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         # 2026-07-26：斷線/DNS失敗/連線逾時，跟 FinMind 有沒有回應無關，重試
         # 單一請求沒有意義（下一筆一樣會失敗）——當成 FatalAPIError 讓整批
@@ -309,7 +314,7 @@ async def fetch_kbar_day(
         if "upper limit" in msg.lower():
             if _retry < 3:
                 await asyncio.sleep(60 * (_retry + 1))
-                return await fetch_kbar_day(session, stock_id, date_str, _retry=_retry + 1)
+                return await _fetch_finmind_day(session, dataset, stock_id, date_str, _retry=_retry + 1)
             raise QuotaError(
                 f"{stock_id} {date_str} 重試3次還是402（{msg}），可能是額度真的用完了"
                 "（FinMind官方說法：「請升級會員或等待下個計費週期」，不一定是1小時內會恢復），"
@@ -320,7 +325,20 @@ async def fetch_kbar_day(
             # OtherFatalError 的說明），不要當成單筆失敗繼續跑下一筆。
             raise OtherFatalError(f"{stock_id} {date_str} 4xx錯誤（status={status}, msg={msg}），整批任務停止")
         raise RuntimeError(f"{stock_id} {date_str} 失敗: {msg}")
-    rows = payload.get("data", [])
+    return payload.get("data", [])
+
+
+async def fetch_kbar_day(
+    session: aiohttp.ClientSession, stock_id: str, date_str: str, _retry: int = 0
+) -> pd.DataFrame:
+    """單一股票、單一交易日的分K。date_str 格式 YYYY-MM-DD。
+
+    回傳欄位跟 db/m1 一致：stock_id, date("YYYY-MM-DD HH:MM:SS"), open, high,
+    low, close, volume。當天沒有資料（停牌/尚未上市等）回傳空 DataFrame，
+    不當例外處理——例外只保留給真正的請求失敗（網路、限流、權限問題）。
+    request/timeout/retry/錯誤分類邏輯見 _fetch_finmind_day()。
+    """
+    rows = await _fetch_finmind_day(session, _DATASET, stock_id, date_str, _retry=_retry)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)

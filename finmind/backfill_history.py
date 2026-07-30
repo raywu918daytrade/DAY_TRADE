@@ -82,14 +82,22 @@ async def backfill_history(
 
 
 async def run_forever(
-    start_ym: str = _DEFAULT_START,
-    end_ym: str = _DEFAULT_END,
-    top_n_by_volume: int | None = None,
+    history_fn=backfill_history,
+    history_kwargs: dict | None = None,
     check_interval: int = 60,
 ):
     """backfill_history() 的外層自動重試包裝，給長時間背景執行用（18天的
     全歷史補齊、或15.7小時的前1000支，都不希望撞到任何4xx就整個停掉、需要
     人工重新執行）。
+
+    history_fn/history_kwargs：2026-07-29 從固定呼叫 backfill_history() 改成
+    接受任意 callable + kwargs——額度/token恢復輪詢這段等待迴圈是這整套系統
+    教訓最多、最容易出錯的部分（下面的說明都是踩過的坑），值得只維護一份；
+    finmind/backfill_tick_history.py::backfill_tick_history() 也是同構的
+    「逐月回補、FatalAPIError整批停止」，直接重用這個迴圈，不用複製一份。
+    預設值 history_fn=backfill_history（不帶kwargs）保留舊行為，但舊呼叫端
+    如果是用位置參數帶 start_ym/end_ym/top_n_by_volume 的寫法就要改成
+    history_kwargs={...}（見 backfill_all.py/backfill_top1000.py 的呼叫點）。
 
     撞到 FatalAPIError（TokenError/QuotaError/IPBannedError/OtherFatalError，
     見 finmind/finmind_api.py 的說明）時不會讓程式結束，而是每 check_interval 秒
@@ -114,10 +122,11 @@ async def run_forever(
     完全不知道，會誤以為滿額可用，等真的送出去才會撞到402，等於「檢查的
     時機太晚」。第一次啟動、跟每次額度恢復要重新開始前，都會先同步一次。
     """
+    kwargs = history_kwargs or {}
     while True:
         await sync_rate_limiter()
         try:
-            await backfill_history(start_ym, end_ym, top_n_by_volume=top_n_by_volume)
+            await history_fn(**kwargs)
             return
         except FatalAPIError as e:
             print(f"\n⏸ 暫停：{e}")
@@ -153,4 +162,4 @@ if __name__ == "__main__":
     else:
         _start, _end = _DEFAULT_START, _DEFAULT_END
     _top_n = int(sys.argv[3]) if len(sys.argv) >= 4 else None
-    asyncio.run(run_forever(_start, _end, top_n_by_volume=_top_n))
+    asyncio.run(run_forever(history_kwargs={"start_ym": _start, "end_ym": _end, "top_n_by_volume": _top_n}))

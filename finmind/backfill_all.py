@@ -51,4 +51,4 @@ if __name__ == "__main__":
         _start, _end = sys.argv[1], sys.argv[2]
     else:
         _start, _end = _DEFAULT_START, _DEFAULT_END
-    asyncio.run(run_forever(_start, _end, top_n_by_volume=None))
+    asyncio.run(run_forever(history_kwargs={"start_ym": _start, "end_ym": _end, "top_n_by_volume": None}))
