@@ -33,8 +33,9 @@ finmind/backfill_tick_history.py 檔頭的風險說明，一定要精算過剩�
 
 確認還在跑：
     ps aux | grep backfill_tick
-執行：
-    caffeinate -i python3 -m finmind.backfill_tick 2025-08 2026-07
+
+指定範圍（不指定就用預設的 2025-08 ~ 2026-07，股票清單一律固定400檔）：
+    caffeinate -i python3 -m finmind.backfill_tick 2024-01 2025-12
 """
 
 import asyncio
@@ -50,10 +51,16 @@ _DEFAULT_END = "2026-07"
 if __name__ == "__main__":
     import sys
 
-    # 範圍固定，argv 只用來接 --max-requests=N（電腦快關機、想把剩下的額度
-    # 用完不浪費：送滿N筆就安全停止、正常結束，下次重跑不帶這個參數會自動
-    # 接續，見 finmind/finmind_api.py::RequestBudgetExhausted）。
-    _, _max_requests, _burst = parse_max_requests(sys.argv[1:])
+    # 2026-07-31 修：原本這裡完全沒讀位置參數，不管使用者傳什麼日期範圍都
+    # 悄悄忽略、直接用寫死的_DEFAULT_START/_DEFAULT_END，跟backfill_all.py/
+    # backfill_top1000.py/backfill_tick_history.py的行為不一致，容易誤會
+    # 「有帶參數就會生效」。股票清單還是固定400檔（這支腳本存在的意義），
+    # 但日期範圍现在比照其他腳本可以覆蓋。
+    _argv, _max_requests, _burst = parse_max_requests(sys.argv[1:])
+    if len(_argv) >= 2:
+        _start, _end = _argv[0], _argv[1]
+    else:
+        _start, _end = _DEFAULT_START, _DEFAULT_END
     if _max_requests:
         set_request_budget(_max_requests)
     if _burst:
@@ -63,7 +70,7 @@ if __name__ == "__main__":
         asyncio.run(
             run_forever(
                 history_fn=backfill_tick_history,
-                history_kwargs={"start_ym": _DEFAULT_START, "end_ym": _DEFAULT_END, "stocks": _stocks},
+                history_kwargs={"start_ym": _start, "end_ym": _end, "stocks": _stocks},
             )
         )
     except RequestBudgetExhausted as e:

@@ -14,6 +14,7 @@ import pandas as pd
 
 from pattern.abcd_bear.detector import AbcdBearDetector
 from pattern.abcd_bull.detector import AbcdBullDetector
+from pattern.breakdown_retest.detector import BreakdownRetestDetector
 from pattern.breakout_retest.detector import BreakoutRetestDetector
 from pattern.cup_handle.detector import CupHandleDetector
 from pattern.data_loader import get_all_stocks_candles, get_latest_candle_timestamp, get_stock_candles, get_stocks_10d_avg_vol_lots
@@ -36,6 +37,7 @@ DETECTORS = {
     "head_shoulders_top": HeadShouldersTopDetector(),
     "cup_handle": CupHandleDetector(),
     "breakout_retest": BreakoutRetestDetector(),
+    "breakdown_retest": BreakdownRetestDetector(),
 }
 
 # 記憶體快取 (In-Memory Cache)
@@ -72,7 +74,7 @@ def get_pattern_types() -> Dict[str, Any]:
 
 @router.get("/scan", summary="過濾篩選符合特定型態與時區的股票清單")
 def scan_patterns(
-    pattern_type: str = Query("triangle", description="型態種類: 可帶單一型態(triangle)、逗號分隔多型態(triangle,w_bottom)、或全型態(all)。可用型態: triangle, abcd_bull, abcd_bear, w_bottom, m_top, head_shoulders_bottom, head_shoulders_top, cup_handle, breakout_retest, all"),
+    pattern_type: str = Query("triangle", description="型態種類: 可帶單一型態(triangle)、逗號分隔多型態(triangle,w_bottom)、或全型態(all)。可用型態: triangle, abcd_bull, abcd_bear, w_bottom, m_top, head_shoulders_bottom, head_shoulders_top, cup_handle, breakout_retest, breakdown_retest, all"),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)，預設為最新交易日"),
     min_score: float = Query(60.0, description="最小信心度分數 (0~100)"),
