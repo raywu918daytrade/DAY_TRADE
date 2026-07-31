@@ -20,6 +20,10 @@ backfill_all.py/backfill_top1000.py 的既有警告，長時間連續執行的�
     cd /Users/wumingrui/Library/CloudStorage/Dropbox/just1stock_day_trade
     nohup caffeinate -i python3 -m finmind.backfill_tick > finmind_tick.log 2>&1 &
 
+電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N，送滿N筆request
+就安全停止、正常結束（不是錯誤），下次重跑（不帶這個參數）會自動接續：
+    python3 -m finmind.backfill_tick --max-requests=3000
+
 看即時進度：
     tail -f /Users/wumingrui/Library/CloudStorage/Dropbox/just1stock_day_trade/finmind_tick.log
 
@@ -33,16 +37,30 @@ import asyncio
 
 from finmind.backfill_history import run_forever
 from finmind.backfill_tick_history import backfill_tick_history
+from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_request_budget
 from finmind.tick_universe import load_tick_universe
 
 _DEFAULT_START = "2025-08"
 _DEFAULT_END = "2026-07"
 
 if __name__ == "__main__":
+    import sys
+
+    # 範圍固定，argv 只用來接 --max-requests=N（電腦快關機、想把剩下的額度
+    # 用完不浪費：送滿N筆就安全停止、正常結束，下次重跑不帶這個參數會自動
+    # 接續，見 finmind/finmind_api.py::RequestBudgetExhausted）。
+    _, _max_requests = parse_max_requests(sys.argv[1:])
+    if _max_requests:
+        set_request_budget(_max_requests)
     _stocks = load_tick_universe()
-    asyncio.run(
-        run_forever(
-            history_fn=backfill_tick_history,
-            history_kwargs={"start_ym": _DEFAULT_START, "end_ym": _DEFAULT_END, "stocks": _stocks},
+    try:
+        asyncio.run(
+            run_forever(
+                history_fn=backfill_tick_history,
+                history_kwargs={"start_ym": _DEFAULT_START, "end_ym": _DEFAULT_END, "stocks": _stocks},
+            )
         )
-    )
+    except RequestBudgetExhausted as e:
+        print(f"\n⏸ {e}")
+        print("已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了）。"
+              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續。")
