@@ -28,6 +28,12 @@ db/fugle_day 的「股」（db/fugle_day 同一天同一支股票的volume會是
 用法：
     python -m finmind.backfill_tick_history                      # 2025-08 補到 2026-07（預設）
     python -m finmind.backfill_tick_history 2025-08 2026-07      # 指定範圍
+    python -m finmind.backfill_tick_history --max-requests=3000  # 送滿3000筆就安全停止（見下方說明）
+
+電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N（可以跟其他參數
+併用，順序不拘），送滿N筆request就存檔收工、正常結束（不是錯誤），不用等
+FatalAPIError；下次重跑（不用帶這個參數）會用既有的中斷續傳機制自動接著補，
+不會重複下載已經有的部分（見 finmind/finmind_api.py::RequestBudgetExhausted）。
 """
 
 import asyncio
@@ -36,7 +42,13 @@ import pandas as pd
 
 import aiohttp
 
-from finmind.finmind_api import FatalAPIError, _ROOT
+from finmind.finmind_api import (
+    FatalAPIError,
+    RequestBudgetExhausted,
+    _ROOT,
+    parse_max_requests,
+    set_request_budget,
+)
 from finmind.tick_api import existing_tick_pairs, fetch_tick_day, save_empty_tick_pairs, save_tick
 from finmind.tick_universe import load_tick_universe
 
@@ -114,6 +126,7 @@ async def backfill_tick_month(
     empty_buffer: list[tuple[str, str]] = []
     stop_event = asyncio.Event()
     fatal_error_holder: list[FatalAPIError] = []
+    budget_holder: list[RequestBudgetExhausted] = []
 
     async def _one(session: aiohttp.ClientSession, sid: str, day: str):
         nonlocal done, got_data, confirmed_empty
@@ -124,6 +137,10 @@ async def backfill_tick_month(
                 return
             try:
                 df = await fetch_tick_day(session, sid, day)
+            except RequestBudgetExhausted as e:
+                stop_event.set()
+                budget_holder.append(e)
+                return
             except FatalAPIError as e:
                 stop_event.set()
                 fatal_error_holder.append(e)
@@ -157,6 +174,13 @@ async def backfill_tick_month(
                 empty_buffer.clear()
             if stop_event.is_set():
                 break
+
+    if budget_holder:
+        e = budget_holder[0]
+        print(f"  ⏸ {e}")
+        print("  已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了），"
+              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續")
+        raise e
 
     if fatal_error_holder:
         e = fatal_error_holder[0]
@@ -198,6 +222,10 @@ async def backfill_tick_history(
             await backfill_tick_month(year, month, stocks)
         except FileNotFoundError as e:
             print(f"  跳過：{e}")
+        except RequestBudgetExhausted:
+            # 使用者主動設的用量上限，不是「這個月失敗」——直接往上拋，
+            # 不要落到下面的 except Exception 被當成單月失敗、繼續跑下個月。
+            raise
         except FatalAPIError as e:
             print(f"\n⚠️ {e}")
             print(f"在 {year}-{month:02d} 停止，處理好問題後重跑這支腳本會自動接著補")
@@ -212,8 +240,16 @@ async def backfill_tick_history(
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) >= 3:
-        _start, _end = sys.argv[1], sys.argv[2]
+    _argv, _max_requests = parse_max_requests(sys.argv[1:])
+    if len(_argv) >= 2:
+        _start, _end = _argv[0], _argv[1]
     else:
         _start, _end = _DEFAULT_START, _DEFAULT_END
-    asyncio.run(backfill_tick_history(_start, _end))
+    if _max_requests:
+        set_request_budget(_max_requests)
+    try:
+        asyncio.run(backfill_tick_history(_start, _end))
+    except RequestBudgetExhausted as e:
+        print(f"\n⏸ {e}")
+        print("已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了）。"
+              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續。")

@@ -24,13 +24,28 @@ FinMind 分K 一次性歷史補齊 — 從 2019-01-01（FinMind TaiwanStockKBar 
     python -m finmind.backfill_history 2019-01 2026-05           # 指定範圍
     python -m finmind.backfill_history 2026-01 2026-05 1000      # 指定範圍 + 每月只補前1000支（依成交量）
     nohup python -m finmind.backfill_history > finmind_backfill.log 2>&1 &   # 背景持續執行
+    python -m finmind.backfill_history --max-requests=3000       # 送滿3000筆就安全停止（見下方說明）
+
+電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N（可以跟其他參數
+併用，順序不拘），送滿N筆request就存檔收工、正常結束（不是錯誤），不用等
+FatalAPIError；下次重跑（不用帶這個參數）會用既有的中斷續傳機制自動接著補，
+不會重複下載已經有的部分（見 finmind/finmind_api.py::RequestBudgetExhausted）。
 """
 
 import asyncio
 
 import pandas as pd
 
-from finmind.finmind_api import FatalAPIError, backfill_month, check_quota, reload_token, sync_rate_limiter
+from finmind.finmind_api import (
+    FatalAPIError,
+    RequestBudgetExhausted,
+    backfill_month,
+    check_quota,
+    parse_max_requests,
+    reload_token,
+    set_request_budget,
+    sync_rate_limiter,
+)
 
 _DEFAULT_START = "2019-01"
 _DEFAULT_END = "2026-05"
@@ -67,6 +82,10 @@ async def backfill_history(
             # db/fugle_day 沒有那個月的資料，沒辦法確定交易日/股票清單，
             # 跳過但不中斷整個歷史補齊（例如 db/fugle_day 本身也有缺口）。
             print(f"  跳過：{e}")
+        except RequestBudgetExhausted:
+            # 使用者主動設的用量上限，不是「這個月失敗」——直接往上拋，
+            # 不要落到下面的 except Exception 被當成單月失敗、繼續跑下個月。
+            raise
         except FatalAPIError as e:
             # 任何4xx（token壞掉/額度用完/IP被封/其他），繼續跑後面88個月
             # 只會全部用同一個原因失敗，浪費時間——整支腳本直接停止，處理好
@@ -157,9 +176,17 @@ async def run_forever(
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) >= 3:
-        _start, _end = sys.argv[1], sys.argv[2]
+    _argv, _max_requests = parse_max_requests(sys.argv[1:])
+    if len(_argv) >= 2:
+        _start, _end = _argv[0], _argv[1]
     else:
         _start, _end = _DEFAULT_START, _DEFAULT_END
-    _top_n = int(sys.argv[3]) if len(sys.argv) >= 4 else None
-    asyncio.run(run_forever(history_kwargs={"start_ym": _start, "end_ym": _end, "top_n_by_volume": _top_n}))
+    _top_n = int(_argv[2]) if len(_argv) >= 3 else None
+    if _max_requests:
+        set_request_budget(_max_requests)
+    try:
+        asyncio.run(run_forever(history_kwargs={"start_ym": _start, "end_ym": _end, "top_n_by_volume": _top_n}))
+    except RequestBudgetExhausted as e:
+        print(f"\n⏸ {e}")
+        print("已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了）。"
+              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續。")

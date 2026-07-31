@@ -42,15 +42,18 @@ load_dotenv(_ROOT / ".env", override=True)
 _TW = timezone(timedelta(hours=8))
 _TICKERS_PATH = _ROOT / "db/tickers/tickers.parquet"
 
-# 手動黑名單：確認不要的個別代號，直接加代號字串即可
-_BLACKLIST: set[str] = {
-    "66451",
-    "67711",
-    "68541",
-    "76101",
-    "811211",
-    "370201",
-}
+# 手動黑名單：確認不要交易的個別代號，見 fubon/blacklist.txt（一行一個代號）
+_BLACKLIST_PATH = _ROOT / "fubon/blacklist.txt"
+
+
+def _load_blacklist() -> set[str]:
+    if not _BLACKLIST_PATH.exists():
+        return set()
+    lines = _BLACKLIST_PATH.read_text(encoding="utf-8").splitlines()
+    return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
+
+
+_BLACKLIST = _load_blacklist()
 
 # 台股 ETF 代號後綴慣例：00XXXB＝債券型ETF，00XXXD＝主動式債券/固定收益基金
 # （實測這批代號的名稱都帶「非投」「債」「入息」）。只要股票跟一般/槓桿/反向/

@@ -25,6 +25,10 @@ debugger session 上，關掉 VS Code/停止偵錯/電腦睡眠都會讓它中�
     cd /Users/wumingrui/Library/CloudStorage/Dropbox/just1stock_day_trade
     nohup caffeinate -i python3 -m finmind.backfill_top1000 > finmind_top1000.log 2>&1 &
 
+電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N，送滿N筆request
+就安全停止、正常結束（不是錯誤），下次重跑（不帶這個參數）會自動接續：
+    python3 -m finmind.backfill_top1000 --max-requests=3000
+
 看即時進度：
     tail -f /Users/wumingrui/Library/CloudStorage/Dropbox/just1stock_day_trade/finmind_top1000.log
 
@@ -35,6 +39,7 @@ debugger session 上，關掉 VS Code/停止偵錯/電腦睡眠都會讓它中�
 import asyncio
 
 from finmind.backfill_history import run_forever
+from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_request_budget
 
 _DEFAULT_START = "2026-01"
 _DEFAULT_END = "2026-05"
@@ -43,8 +48,19 @@ _TOP_N = 1000
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) >= 3:
-        _start, _end = sys.argv[1], sys.argv[2]
+    _argv, _max_requests = parse_max_requests(sys.argv[1:])
+    if len(_argv) >= 2:
+        _start, _end = _argv[0], _argv[1]
     else:
         _start, _end = _DEFAULT_START, _DEFAULT_END
-    asyncio.run(run_forever(history_kwargs={"start_ym": _start, "end_ym": _end, "top_n_by_volume": _TOP_N}))
+    if _max_requests:
+        # 電腦快關機、想把剩下的額度用完不浪費：--max-requests=N，送滿N筆就
+        # 安全停止、正常結束，下次重跑（不帶這個參數）自動接續（見
+        # finmind/finmind_api.py::RequestBudgetExhausted）。
+        set_request_budget(_max_requests)
+    try:
+        asyncio.run(run_forever(history_kwargs={"start_ym": _start, "end_ym": _end, "top_n_by_volume": _TOP_N}))
+    except RequestBudgetExhausted as e:
+        print(f"\n⏸ {e}")
+        print("已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了）。"
+              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續。")

@@ -134,6 +134,16 @@ class OtherFatalError(FatalAPIError):
     不會突然成功，除非外部狀況（額度/token/封鎖）改變了。"""
 
 
+class RequestBudgetExhausted(RuntimeError):
+    """達到 set_request_budget() 設定的上限，主動停止發送新請求。故意不繼承
+    FatalAPIError：這不是錯誤，是使用者自己設下的用量煞車（典型情境：電腦
+    快關機了，想把剩下的額度用完、不要浪費），已經抓到的資料都正常存檔，
+    直接結束程式即可——不需要、也不應該被 run_forever() 的「定期查額度、
+    自動恢復重試」邏輯接住（那套是給 402/token失效這種之後會自己恢復的
+    狀況用的，budget 用完不會因為等待而恢復，只會在下次不帶
+    --max-requests 重新執行時，用既有的中斷續傳機制接著補）。"""
+
+
 class NetworkError(FatalAPIError):
     """連線層級失敗（斷線/DNS/timeout），不是 FinMind 回應的 4xx。2026-07-26
     發現：這種錯誤本來會被 backfill_month()::_one() 的 `except Exception` 當成
@@ -219,6 +229,12 @@ class _RateLimiter:
 
     async def acquire(self):
         async with self._lock:
+            if _request_budget is not None and self._dispatch_count >= _request_budget:
+                # 在真的發送這筆請求之前就擋下來，count跟budget才會精準對得上
+                # （不會有「已經送出去了才發現超額」的情況）。
+                raise RequestBudgetExhausted(
+                    f"已送出 {self._dispatch_count} 筆 request，達到本次執行設定的上限 {_request_budget}"
+                )
             loop = asyncio.get_event_loop()
             while True:
                 now = loop.time()
@@ -240,6 +256,33 @@ class _RateLimiter:
 
 
 _rate_limiter = _RateLimiter(_SAFE_LIMIT_PER_HOUR)
+
+_request_budget: int | None = None
+
+
+def set_request_budget(n: int | None) -> None:
+    """設定這次執行最多送出幾筆 request，送滿就乾淨停止（見
+    RequestBudgetExhausted 說明）。給「電腦快關機、想把剩下的額度用完不要
+    浪費」這種一次性場景用：跑一次帶 --max-requests=N，送滿N筆就存檔收工，
+    下次重跑（不帶這個參數）會自動從中斷處接續。n=None 取消上限（預設
+    行為，跑到全部補完為止）。"""
+    global _request_budget
+    _request_budget = n
+
+
+def parse_max_requests(argv: list[str]) -> tuple[list[str], int | None]:
+    """從命令列參數裡挑出 --max-requests=N，回傳（剩下的位置參數, N或None）。
+    抽成共用函式是因為 backfill_history.py/backfill_tick_history.py/
+    backfill_all.py/backfill_top1000.py/backfill_tick.py 的 __main__ 都要
+    支援同一個旗標，不要複製貼上5份一樣的parsing邏輯。"""
+    rest = []
+    max_requests = None
+    for a in argv:
+        if a.startswith("--max-requests="):
+            max_requests = int(a.split("=", 1)[1])
+        else:
+            rest.append(a)
+    return rest, max_requests
 
 
 async def sync_rate_limiter() -> dict:
@@ -510,6 +553,7 @@ async def backfill_month(
     empty_buffer: list[tuple[str, str]] = []
     stop_event = asyncio.Event()
     fatal_error_holder: list[FatalAPIError] = []
+    budget_holder: list[RequestBudgetExhausted] = []
 
     async def _one(session: aiohttp.ClientSession, sid: str, day: str):
         nonlocal done, got_data, confirmed_empty
@@ -520,6 +564,10 @@ async def backfill_month(
                 return  # 排隊等併發額度時，可能中途已經被別的任務觸發停止
             try:
                 df = await fetch_kbar_day(session, sid, day)
+            except RequestBudgetExhausted as e:
+                stop_event.set()
+                budget_holder.append(e)
+                return
             except FatalAPIError as e:
                 stop_event.set()
                 fatal_error_holder.append(e)
@@ -557,6 +605,13 @@ async def backfill_month(
             if stop_event.is_set():
                 break
 
+    if budget_holder:
+        e = budget_holder[0]
+        print(f"  ⏸ {e}")
+        print("  已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了），"
+              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續")
+        raise e
+
     if fatal_error_holder:
         e = fatal_error_holder[0]
         print(f"  ⚠️ {e}")
@@ -578,8 +633,15 @@ async def backfill_month(
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) >= 3:
-        _year, _month = int(sys.argv[1]), int(sys.argv[2])
+    _argv, _max_requests = parse_max_requests(sys.argv[1:])
+    if len(_argv) >= 2:
+        _year, _month = int(_argv[0]), int(_argv[1])
     else:
         _year, _month = 2026, 5
-    asyncio.run(backfill_month(_year, _month))
+    if _max_requests:
+        set_request_budget(_max_requests)
+    try:
+        asyncio.run(backfill_month(_year, _month))
+    except RequestBudgetExhausted as e:
+        print(f"\n⏸ {e}")
+        print("已達到本次設定的 request 上限，安全停止，之後重跑這支腳本會自動接續")
