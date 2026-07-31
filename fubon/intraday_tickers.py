@@ -29,6 +29,7 @@
 """
 
 import os
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -37,6 +38,12 @@ import re
 from dotenv import load_dotenv
 
 _ROOT = Path(__file__).parent.parent
+if str(_ROOT) not in sys.path:
+    # 讓這支檔案不管是用 `python fubon/intraday_tickers.py` 直接執行、
+    # VSCode 的 Run/Debug 按鈕、還是 `python -m fubon.intraday_tickers`
+    # 執行都能 import 到專案根目錄下的 fubon package，不用依賴外部
+    # PYTHONPATH／cwd 設定。
+    sys.path.insert(0, str(_ROOT))
 load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
