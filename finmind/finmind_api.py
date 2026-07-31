@@ -420,14 +420,26 @@ async def _fetch_finmind_day(
     try:
         status, payload = await asyncio.wait_for(_do_request(), timeout=40)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        # 2026-07-26：斷線/DNS失敗/連線逾時，跟 FinMind 有沒有回應無關，重試
-        # 單一請求沒有意義（下一筆一樣會失敗）——當成 FatalAPIError 讓整批
-        # 任務停止，run_forever() 會定期呼叫 check_quota() 確認狀況，網路真的
-        # 恢復後 check_quota() 自然會成功，接著自動繼續（見 NetworkError 說明）。
-        # 注意：這裡只會抓到「連不上/沒收到完整回應」（ClientConnectorError、
-        # ServerDisconnectedError、逾時等）——「有收到回應，但是5xx/非JSON」
-        # 已經在上面 _do_request() 內部處理掉，不會跑到這裡。
-        raise NetworkError(f"{stock_id} {date_str} 網路錯誤（{e}），整批任務停止，等網路恢復後自動接著補") from e
+        # 2026-07-26：斷線/DNS失敗/連線逾時，跟 FinMind 有沒有回應無關，當成
+        # FatalAPIError 讓整批任務停止，run_forever() 會定期呼叫 check_quota()
+        # 確認狀況，網路真的恢復後 check_quota() 自然會成功，接著自動繼續
+        # （見 NetworkError 說明）。注意：這裡只會抓到「連不上/沒收到完整回應」
+        # （ClientConnectorError、ServerDisconnectedError、逾時等）——「有收到
+        # 回應，但是5xx/非JSON」已經在上面 _do_request() 內部處理掉，不會跑到
+        # 這裡。
+        #
+        # 2026-07-31：burst模式高併發下，實測遇過上千筆同時飛行、只有孤立
+        # 一兩筆逾時的狀況（其他都成功）——這種單一request偶發逾時本來就該
+        # 預期，直接判死刑讓整批（甚至剩下幾千筆）任務停止太重。跟上面402
+        # "upper limit" 同一個retry機制，先重試2次（間隔2/4秒）看看是不是
+        # 真的斷線；重試完還是失敗，才代表可能是真的網路有問題，繼續往上
+        # 拋NetworkError整批停止。
+        if _retry < 2:
+            await asyncio.sleep(2 * (_retry + 1))
+            return await _fetch_finmind_day(session, dataset, stock_id, date_str, _retry=_retry + 1)
+        raise NetworkError(
+            f"{stock_id} {date_str} 網路錯誤（{e}），重試2次仍失敗，整批任務停止，等網路恢復後自動接著補"
+        ) from e
     if payload.get("msg") != "success":
         msg = payload.get("msg") or ""
         if status == 403 or "ip banned" in msg.lower():
