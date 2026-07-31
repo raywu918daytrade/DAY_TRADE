@@ -24,6 +24,10 @@ backfill_all.py/backfill_top1000.py 的既有警告，長時間連續執行的�
 就安全停止、正常結束（不是錯誤），下次重跑（不帶這個參數）會自動接續：
     python3 -m finmind.backfill_tick --max-requests=3000
 
+再加 --burst 可以跳過節流、接近同時把N筆全部發出去（見
+finmind/backfill_tick_history.py 檔頭的風險說明，一定要精算過剩餘額度才用）：
+    python3 -m finmind.backfill_tick --max-requests=3000 --burst
+
 看即時進度：
     tail -f /Users/wumingrui/Library/CloudStorage/Dropbox/just1stock_day_trade/finmind_tick.log
 
@@ -37,7 +41,7 @@ import asyncio
 
 from finmind.backfill_history import run_forever
 from finmind.backfill_tick_history import backfill_tick_history
-from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_request_budget
+from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_burst_mode, set_request_budget
 from finmind.tick_universe import load_tick_universe
 
 _DEFAULT_START = "2025-08"
@@ -49,9 +53,11 @@ if __name__ == "__main__":
     # 範圍固定，argv 只用來接 --max-requests=N（電腦快關機、想把剩下的額度
     # 用完不浪費：送滿N筆就安全停止、正常結束，下次重跑不帶這個參數會自動
     # 接續，見 finmind/finmind_api.py::RequestBudgetExhausted）。
-    _, _max_requests = parse_max_requests(sys.argv[1:])
+    _, _max_requests, _burst = parse_max_requests(sys.argv[1:])
     if _max_requests:
         set_request_budget(_max_requests)
+    if _burst:
+        set_burst_mode(True)
     _stocks = load_tick_universe()
     try:
         asyncio.run(

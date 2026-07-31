@@ -235,6 +235,11 @@ class _RateLimiter:
                 raise RequestBudgetExhausted(
                     f"已送出 {self._dispatch_count} 筆 request，達到本次執行設定的上限 {_request_budget}"
                 )
+            if _burst_mode:
+                # 使用者主動要求不節流（見 set_burst_mode()），跳過安全上限
+                # 輪詢跟0.655秒間隔，只留上面的 request_budget 當唯一煞車。
+                self._dispatch_count += 1
+                return
             loop = asyncio.get_event_loop()
             while True:
                 now = loop.time()
@@ -270,19 +275,84 @@ def set_request_budget(n: int | None) -> None:
     _request_budget = n
 
 
-def parse_max_requests(argv: list[str]) -> tuple[list[str], int | None]:
-    """從命令列參數裡挑出 --max-requests=N，回傳（剩下的位置參數, N或None）。
-    抽成共用函式是因為 backfill_history.py/backfill_tick_history.py/
-    backfill_all.py/backfill_top1000.py/backfill_tick.py 的 __main__ 都要
-    支援同一個旗標，不要複製貼上5份一樣的parsing邏輯。"""
+_burst_mode: bool = False
+
+
+def set_burst_mode(b: bool) -> None:
+    """打開後，_RateLimiter.acquire() 完全不節流（不等0.655秒間隔、不理會
+    _SAFE_LIMIT_PER_HOUR的安全上限輪詢），backfill_month()/backfill_tick_month()
+    也會把併發數／每批flush的量放大成待補組數跟剩餘request budget取小
+    （見 effective_batch_size()），讓請求幾乎同時送出去，不再照
+    flush_every/_CONCURRENCY 這種節流用的小數字分批。
+
+    只給「使用者已經自己精算過剩餘額度、只跑這一次」的場景用（例如電腦快
+    關機前，2026-07-31 加），一定要搭配 set_request_budget() 一起用，不然
+    完全沒有煞車。2026-07-14 IP被封鎖那次同時踩到「超過6000/小時」跟
+    「瞬間爆量」兩件事，FinMind官方判斷邏輯沒有公開，沒辦法保證這個模式
+    一定安全（見 IPBannedError 的說明），是使用者自己承擔的風險，不是
+    預設行為。"""
+    global _burst_mode
+    _burst_mode = b
+
+
+def effective_batch_size(default: int, pending: int) -> int:
+    """一般模式（_burst_mode=False）原封不動回傳 default（既有的併發數/
+    flush批次大小）。burst模式下放大成 min(pending, 剩餘的request budget)，
+    給 backfill_month()/backfill_tick_month() 決定每批flush塞多少組用，讓
+    整批（或budget上限內）幾乎一次性用同一個 asyncio.gather 送出去。"""
+    if not _burst_mode:
+        return default
+    remaining = pending
+    if _request_budget is not None:
+        remaining = min(remaining, max(_request_budget - _rate_limiter._dispatch_count, 0))
+    sized = min(pending, remaining)
+    return sized if sized > 0 else default
+
+
+_BURST_MAX_CONCURRENCY = 50
+# 2026-07-31 實測：3000筆budget、burst模式下併發直接放到2825（幾乎全部
+# 同時發出去），FinMind回了502（Bad Gateway，回應不是JSON），研判是伺服器
+# 端/前面的proxy撐不住這麼多同時連線，不是IP封鎖（不是403 ip banned訊息）。
+# 拿真正的「同時飛行中」請求數（asyncio.Semaphore大小）另外蓋這個上限，
+# 跟 flush批次大小（effective_batch_size()）脫鉤——flush批次可以維持很大
+# （決定多久寫一次檔），但實際併發送出去的數量收斂到這個上限，靠 semaphore
+# 排隊消化，一樣完全跳過0.655秒的逐筆節流，吞吐量瓶頸變成「50個in-flight
+# 多快輪轉完」而不是固定間隔，比原本4併發快很多，但不會像2825那樣直接把
+# 對方伺服器打502。
+
+
+def effective_concurrency(default: int, pending: int) -> int:
+    """跟 effective_batch_size() 一樣的burst放大邏輯，但額外蓋
+    _BURST_MAX_CONCURRENCY 上限，給 asyncio.Semaphore 大小用（見上面的
+    2026-07-31實測說明，跟決定flush批次大小的 effective_batch_size() 是
+    分開的兩個用途，不要混用）。"""
+    size = effective_batch_size(default, pending)
+    return min(size, _BURST_MAX_CONCURRENCY) if _burst_mode else size
+
+
+def parse_max_requests(argv: list[str]) -> tuple[list[str], int | None, bool]:
+    """從命令列參數裡挑出 --max-requests=N 跟 --burst，回傳（剩下的位置參數,
+    N或None, 要不要burst）。抽成共用函式是因為 backfill_history.py/
+    backfill_tick_history.py/backfill_all.py/backfill_top1000.py/
+    backfill_tick.py 的 __main__ 都要支援同一組旗標，不要複製貼上5份一樣的
+    parsing邏輯。
+
+    --burst 一定要搭配 --max-requests 一起用——沒有上限的全速噴發完全沒有
+    煞車，太危險，直接拒絕執行（見 set_burst_mode() 的風險說明）。單獨給
+    --max-requests、不給 --burst，維持原本保守的節流行為不變。"""
     rest = []
     max_requests = None
+    burst = False
     for a in argv:
         if a.startswith("--max-requests="):
             max_requests = int(a.split("=", 1)[1])
+        elif a == "--burst":
+            burst = True
         else:
             rest.append(a)
-    return rest, max_requests
+    if burst and max_requests is None:
+        raise SystemExit("--burst 一定要搭配 --max-requests=N 一起用（沒有上限的全速噴發太危險，不會執行）")
+    return rest, max_requests, burst
 
 
 async def sync_rate_limiter() -> dict:
@@ -335,6 +405,16 @@ async def _fetch_finmind_day(
         async with session.get(
             _BASE_URL, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=30)
         ) as r:
+            if r.content_type != "application/json":
+                # 2026-07-31 實測：burst模式高併發下遇過502 Bad Gateway，body是
+                # text/plain不是JSON——這是FinMind伺服器端自己的錯誤（HTTP 5xx，
+                # 衡量對方可用率的分子），不是我們這邊斷線/DNS失敗，也不代表
+                # 接下來的請求會一樣失敗，不該當成NetworkError讓整批任務停止。
+                # 直接讀文字內容包成跟「msg!=success」一樣的formats，交給下面
+                # 既有的狀態碼判斷邏輯處理：4xx還是視情況當Fatal，5xx落到最後
+                # 的RuntimeError，只當這一筆失敗、其他還在飛行中的請求不受影響。
+                text = await r.text()
+                return r.status, {"msg": f"non-JSON回應（status={r.status}）: {text[:200]}"}
             return r.status, await r.json()
 
     try:
@@ -344,6 +424,9 @@ async def _fetch_finmind_day(
         # 單一請求沒有意義（下一筆一樣會失敗）——當成 FatalAPIError 讓整批
         # 任務停止，run_forever() 會定期呼叫 check_quota() 確認狀況，網路真的
         # 恢復後 check_quota() 自然會成功，接著自動繼續（見 NetworkError 說明）。
+        # 注意：這裡只會抓到「連不上/沒收到完整回應」（ClientConnectorError、
+        # ServerDisconnectedError、逾時等）——「有收到回應，但是5xx/非JSON」
+        # 已經在上面 _do_request() 內部處理掉，不會跑到這裡。
         raise NetworkError(f"{stock_id} {date_str} 網路錯誤（{e}），整批任務停止，等網路恢復後自動接著補") from e
     if payload.get("msg") != "success":
         msg = payload.get("msg") or ""
@@ -544,7 +627,12 @@ async def backfill_month(
     est_hours = len(pairs) / _RATE_LIMIT_PER_HOUR
     print(f"預估耗時：約 {est_hours:.1f} 小時（rate limit {_RATE_LIMIT_PER_HOUR}/小時）")
 
-    sem = asyncio.Semaphore(_CONCURRENCY)
+    concurrency = effective_concurrency(_CONCURRENCY, len(pairs))
+    batch_size = effective_batch_size(flush_every, len(pairs))
+    if _burst_mode:
+        print(f"  ⚡ burst模式：併發數={concurrency}，每批flush={batch_size}（不節流，見 set_burst_mode()）")
+
+    sem = asyncio.Semaphore(concurrency)
     done = 0
     got_data = 0
     confirmed_empty = 0
@@ -589,10 +677,10 @@ async def backfill_month(
                 empty_buffer.append((sid, day))
 
     async with aiohttp.ClientSession() as session:
-        for i in range(0, len(pairs), flush_every):
+        for i in range(0, len(pairs), batch_size):
             if stop_event.is_set():
                 break
-            batch = pairs[i : i + flush_every]
+            batch = pairs[i : i + batch_size]
             await asyncio.gather(*(_one(session, sid, day) for sid, day in batch))
             if buffer:
                 _save_m1(pd.concat(buffer, ignore_index=True), year, month)
@@ -633,13 +721,15 @@ async def backfill_month(
 if __name__ == "__main__":
     import sys
 
-    _argv, _max_requests = parse_max_requests(sys.argv[1:])
+    _argv, _max_requests, _burst = parse_max_requests(sys.argv[1:])
     if len(_argv) >= 2:
         _year, _month = int(_argv[0]), int(_argv[1])
     else:
         _year, _month = 2026, 5
     if _max_requests:
         set_request_budget(_max_requests)
+    if _burst:
+        set_burst_mode(True)
     try:
         asyncio.run(backfill_month(_year, _month))
     except RequestBudgetExhausted as e:

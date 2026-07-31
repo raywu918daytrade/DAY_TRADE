@@ -34,6 +34,10 @@ VS Code/停止偵錯/電腦睡眠都會讓它中斷，輸出也只會進 VS Code
 就安全停止、正常結束（不是錯誤），下次重跑（不帶這個參數）會自動接續：
     python3 -m finmind.backfill_all --max-requests=3000
 
+再加 --burst 可以跳過節流、接近同時把N筆全部發出去（見
+finmind/backfill_history.py 檔頭的風險說明，一定要精算過剩餘額度才用）：
+    python3 -m finmind.backfill_all --max-requests=3000 --burst
+
 看即時進度：
     tail -f /Users/wumingrui/Library/CloudStorage/Dropbox/just1stock_day_trade/finmind_all.log
 
@@ -44,7 +48,7 @@ VS Code/停止偵錯/電腦睡眠都會讓它中斷，輸出也只會進 VS Code
 import asyncio
 
 from finmind.backfill_history import run_forever
-from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_request_budget
+from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_burst_mode, set_request_budget
 
 _DEFAULT_START = "2019-01"
 _DEFAULT_END = "2026-05"
@@ -52,7 +56,7 @@ _DEFAULT_END = "2026-05"
 if __name__ == "__main__":
     import sys
 
-    _argv, _max_requests = parse_max_requests(sys.argv[1:])
+    _argv, _max_requests, _burst = parse_max_requests(sys.argv[1:])
     if len(_argv) >= 2:
         _start, _end = _argv[0], _argv[1]
     else:
@@ -62,6 +66,8 @@ if __name__ == "__main__":
         # 安全停止、正常結束，下次重跑（不帶這個參數）自動接續（見
         # finmind/finmind_api.py::RequestBudgetExhausted）。
         set_request_budget(_max_requests)
+    if _burst:
+        set_burst_mode(True)
     try:
         asyncio.run(run_forever(history_kwargs={"start_ym": _start, "end_ym": _end, "top_n_by_volume": None}))
     except RequestBudgetExhausted as e:

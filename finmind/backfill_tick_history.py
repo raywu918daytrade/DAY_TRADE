@@ -29,11 +29,19 @@ db/fugle_day 的「股」（db/fugle_day 同一天同一支股票的volume會是
     python -m finmind.backfill_tick_history                      # 2025-08 補到 2026-07（預設）
     python -m finmind.backfill_tick_history 2025-08 2026-07      # 指定範圍
     python -m finmind.backfill_tick_history --max-requests=3000  # 送滿3000筆就安全停止（見下方說明）
+    python -m finmind.backfill_tick_history --max-requests=3000 --burst  # 上面那個+不節流，接近同時發出去
 
 電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N（可以跟其他參數
 併用，順序不拘），送滿N筆request就存檔收工、正常結束（不是錯誤），不用等
 FatalAPIError；下次重跑（不用帶這個參數）會用既有的中斷續傳機制自動接著補，
 不會重複下載已經有的部分（見 finmind/finmind_api.py::RequestBudgetExhausted）。
+
+再加 --burst：跳過原本每筆間隔約0.655秒的節流，併發數/flush批次放大成
+min(待補組數, 剩餘budget)，接近同時把N筆全部送出去，不會乖乖排隊等。
+⚠️ 只給「已經自己精算過FinMind帳號剩餘額度、只跑這一次」的場景用——
+2026-07-14 曾經因為瞬間爆量被封鎖IP 30分鐘（見 finmind/finmind_api.py::
+IPBannedError 的說明），這個模式沒辦法保證不會再發生，一定要搭配
+--max-requests 一起用，不然直接拒絕執行。
 """
 
 import asyncio
@@ -46,7 +54,10 @@ from finmind.finmind_api import (
     FatalAPIError,
     RequestBudgetExhausted,
     _ROOT,
+    effective_batch_size,
+    effective_concurrency,
     parse_max_requests,
+    set_burst_mode,
     set_request_budget,
 )
 from finmind.tick_api import existing_tick_pairs, fetch_tick_day, save_empty_tick_pairs, save_tick
@@ -117,7 +128,12 @@ async def backfill_tick_month(
         print("已經補齊，不用下載")
         return
 
-    sem = asyncio.Semaphore(_CONCURRENCY)
+    concurrency = effective_concurrency(_CONCURRENCY, len(pairs))
+    batch_size = effective_batch_size(flush_every, len(pairs))
+    if concurrency != _CONCURRENCY:
+        print(f"  ⚡ burst模式：併發數={concurrency}，每批flush={batch_size}（不節流，見 set_burst_mode()）")
+
+    sem = asyncio.Semaphore(concurrency)
     done = 0
     got_data = 0
     confirmed_empty = 0
@@ -159,10 +175,10 @@ async def backfill_tick_month(
                 empty_buffer.append((sid, day))
 
     async with aiohttp.ClientSession() as session:
-        for i in range(0, len(pairs), flush_every):
+        for i in range(0, len(pairs), batch_size):
             if stop_event.is_set():
                 break
-            batch = pairs[i : i + flush_every]
+            batch = pairs[i : i + batch_size]
             await asyncio.gather(*(_one(session, sid, day) for sid, day in batch))
             if buffer:
                 save_tick(pd.concat(buffer, ignore_index=True), year, month)
@@ -240,13 +256,15 @@ async def backfill_tick_history(
 if __name__ == "__main__":
     import sys
 
-    _argv, _max_requests = parse_max_requests(sys.argv[1:])
+    _argv, _max_requests, _burst = parse_max_requests(sys.argv[1:])
     if len(_argv) >= 2:
         _start, _end = _argv[0], _argv[1]
     else:
         _start, _end = _DEFAULT_START, _DEFAULT_END
     if _max_requests:
         set_request_budget(_max_requests)
+    if _burst:
+        set_burst_mode(True)
     try:
         asyncio.run(backfill_tick_history(_start, _end))
     except RequestBudgetExhausted as e:

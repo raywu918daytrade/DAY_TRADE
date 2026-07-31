@@ -25,11 +25,19 @@ FinMind 分K 一次性歷史補齊 — 從 2019-01-01（FinMind TaiwanStockKBar 
     python -m finmind.backfill_history 2026-01 2026-05 1000      # 指定範圍 + 每月只補前1000支（依成交量）
     nohup python -m finmind.backfill_history > finmind_backfill.log 2>&1 &   # 背景持續執行
     python -m finmind.backfill_history --max-requests=3000       # 送滿3000筆就安全停止（見下方說明）
+    python -m finmind.backfill_history --max-requests=3000 --burst  # 上面那個+不節流，接近同時發出去
 
 電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N（可以跟其他參數
 併用，順序不拘），送滿N筆request就存檔收工、正常結束（不是錯誤），不用等
 FatalAPIError；下次重跑（不用帶這個參數）會用既有的中斷續傳機制自動接著補，
 不會重複下載已經有的部分（見 finmind/finmind_api.py::RequestBudgetExhausted）。
+
+再加 --burst：跳過原本每筆間隔約0.655秒的節流，併發數/flush批次放大成
+min(待補組數, 剩餘budget)，接近同時把N筆全部送出去，不會乖乖排隊等。
+⚠️ 只給「已經自己精算過FinMind帳號剩餘額度、只跑這一次」的場景用——
+2026-07-14 曾經因為瞬間爆量被封鎖IP 30分鐘（見 finmind/finmind_api.py::
+IPBannedError 的說明），這個模式沒辦法保證不會再發生，一定要搭配
+--max-requests 一起用，不然直接拒絕執行。
 """
 
 import asyncio
