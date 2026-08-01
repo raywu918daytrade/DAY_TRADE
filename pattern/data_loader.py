@@ -36,6 +36,11 @@ def get_stock_candles(
         包含 columns: ["stock_id", "date", "open", "high", "low", "close", "volume"]
         按 date 遞增排序。
     """
+    if limit is not None and not isinstance(limit, int):
+        try:
+            limit = int(limit)
+        except Exception:
+            limit = 120
     if timeframe == "day":
         dir_path = _ROOT / "db/fugle_day"
         if not dir_path.exists():
@@ -130,6 +135,11 @@ def get_all_stocks_candles(
     Returns:
         Dict[stock_id, pd.DataFrame]
     """
+    if limit is not None and not isinstance(limit, int):
+        try:
+            limit = int(limit)
+        except Exception:
+            limit = 120
     if timeframe == "day":
         dir_path = _ROOT / "db/fugle_day"
         if not dir_path.exists():

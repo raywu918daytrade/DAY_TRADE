@@ -272,19 +272,24 @@ pattern/
   - `date` (str, 選填): 基準日期 `YYYY-MM-DD`（預設最新交易日）。
   - `min_score` (float): 最低信心分數門檻，預設 `60.0`。
   - `min_vol_lots` (float, 選填): **日 K 10日均量過濾門檻 (張)**，預設 `1000.0` 張（設為 0 不限制）。
+  - `only_tick_universe` (bool, 選填): **是否只過濾具備 Tick / Volume Profile / POC 資料的 400 檔股票**，預設 `false`。
   - `limit` (int): K 線視窗根數，預設 `120` 根。
-- **回傳內容**：符合條件的股票代號清單，包含 `pattern_types` (已選型態陣列) 與 `results` 平舖陣列。若同一股票符合多個型態，會保留各自獨立的型態匹配項目，並按信心分數全域遞減排序。
+- **回傳內容**：符合條件的股票代號清單，包含 `pattern_types` (已選型態陣列)、`only_tick_universe` 與 `results` 平舖陣列。每筆匹配結果包含 `in_tick_universe` 布林標籤 (標示是否屬 400 檔逐筆成交個股)。若同一股票符合多個型態，會保留各自獨立的型態匹配項目，並按信心分數全域遞減排序。
 
 ### 3. `GET /api/pattern/{stock_id}/detail`
-- **用途**：取得單一股票的 K 線歷史數據與型態繪圖座標。
+- **用途**：取得單一股票的 K 線歷史數據、型態繪圖座標、當日 Volume Profile 成交量分布與 POC / VAH / VAL 數據。
 - **查詢參數**：`pattern_type`, `timeframe`, `date`, `limit`
 - **回傳內容**：
+  - `stock_id`: 股票代號（例如 `"2330"`）。
+  - `in_tick_universe`: 布林值（例如 `true` / `false`），標示該股票是否屬於 400 檔 Tick Universe 逐筆成交個股。
   - `pattern_type` & `pattern_name`: 型態英文 ID 與中文名稱（例如 `"head_shoulders_top"` 與 `"頭肩頂"`）。
   - `candles`: K 線陣列，`time` 欄位已依 `CLAUDE.md` 規範轉換為台北本地時間 UTC Timestamp 秒數。
   - `pattern`:
     - `pattern_name`: 型態中文名稱。
     - `pivots`: 波段高低點轉折陣列 `[{ time, price, type: "peak"/"trough" }]`
     - `lines`: 上下軌趨勢線線段座標 `[{ start_time, start_price, end_time, end_price, slope, line_type: "resistance"/"support" }]`
+  - `volume_profile`: 當日價位成交量分布陣列 `[{ "price": 2200.0, "volume": 5615, "buy_volume": 4717, "sell_volume": 898, "neutral_volume": 0 }, ...]` (非 tick universe 股票回傳 `[]`)
+  - `poc_data`: 當日 POC 籌碼數據 `{ "poc": 2205.0, "pocs": "2205.00,2230.00", "poc_volume": 10619, "poc_count": 2, "profile_type": "multi", "vah": 2235.0, "val": 2205.0, "total_volume": 44144 }` (非 tick universe 股票回傳 `null`)
 
 ### 4. `POST /api/pattern/cache/clear`
 - **用途**：手動清空記憶體中的 Pattern 掃描與詳情快取。
@@ -296,7 +301,7 @@ pattern/
 為了避免全市場 2,700+ 支股票重複掃描運算，採用**雙軌智慧記憶體快取**：
 
 - **快取 Key 結構**：
-  `(pattern_type, timeframe, date, min_score, min_vol_lots, limit, latest_ts)`
+  `(pattern_type, timeframe, date, min_score, min_vol_lots, only_tick_universe, limit, latest_ts)`
 - **自動失效與更新**：
   - 快取 Key 自動綁定 `get_latest_candle_timestamp()`（最新 K 線時間戳）。
   - **盤中時間**：每分鐘寫入新 1 分 K 線時，時間戳更新，快取自動失效並重算最新型態。

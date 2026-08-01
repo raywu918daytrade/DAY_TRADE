@@ -23,6 +23,8 @@ from pattern.head_shoulders_top.detector import HeadShouldersTopDetector
 from pattern.m_top.detector import MTopDetector
 from pattern.triangle.detector import TriangleDetector
 from pattern.w_bottom.detector import WBottomDetector
+from data.query import load_poc, load_volume_profile
+from finmind.tick_universe import load_tick_universe
 
 router = APIRouter(prefix="/api/pattern", tags=["技術型態"])
 
@@ -39,6 +41,12 @@ DETECTORS = {
     "breakout_retest": BreakoutRetestDetector(),
     "breakdown_retest": BreakdownRetestDetector(),
 }
+
+# 全域載入 Tick Universe 股票集合 (用於在 API 中標註是否具備 Tick / Volume Profile / POC 資料)
+try:
+    TICK_UNIVERSE_SET = set(load_tick_universe())
+except Exception:
+    TICK_UNIVERSE_SET = set()
 
 # 記憶體快取 (In-Memory Cache)
 _SCAN_CACHE: Dict[tuple, Dict[str, Any]] = {}
@@ -79,9 +87,24 @@ def scan_patterns(
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)，預設為最新交易日"),
     min_score: float = Query(60.0, description="最小信心度分數 (0~100)"),
     min_vol_lots: Optional[float] = Query(1000.0, description="日 K 10 日均量過濾門檻 (張)，預設 1000 張；設為 None 或 0 表示不限制"),
+    only_tick_universe: bool = Query(False, description="是否只過濾具備 Tick / Volume Profile / POC 資料的 400 檔股票"),
     limit: int = Query(120, description="K 線視窗根數，預設 120 根"),
 ) -> Dict[str, Any]:
-    """掃描市場上所有股票，找出符合特定/多個/全型態與時區條件的股票清單（支援極速記憶體快取與 10 日均量過濾）。"""
+    """掃描市場上所有股票，找出符合特定/多個/全型態與時區條件的股票清單（支援極速記憶體快取、10 日均量與 Tick Universe 過濾）。"""
+    # 處理直接在 Python 內部調用函式時可能傳入 Query 物件的情況
+    if hasattr(pattern_type, "default"):
+        pattern_type = pattern_type.default
+    if hasattr(timeframe, "default"):
+        timeframe = timeframe.default
+    if hasattr(min_score, "default"):
+        min_score = min_score.default
+    if hasattr(min_vol_lots, "default"):
+        min_vol_lots = min_vol_lots.default
+    if hasattr(only_tick_universe, "default"):
+        only_tick_universe = only_tick_universe.default
+    if hasattr(limit, "default"):
+        limit = limit.default
+
     # 1. 解析型態參數 (支援逗號分隔與 "all")
     raw_types = [t.strip() for t in pattern_type.split(",") if t.strip()]
     
@@ -114,7 +137,7 @@ def scan_patterns(
 
     # 2. 取得最新 K 線時間戳以構造智慧快取 Key
     latest_ts = get_latest_candle_timestamp(timeframe=timeframe, date=date)
-    cache_key = (normalized_pattern_key, timeframe, date or "latest", min_score, min_vol_lots, limit, latest_ts)
+    cache_key = (normalized_pattern_key, timeframe, date or "latest", min_score, min_vol_lots, only_tick_universe, limit, latest_ts)
 
     if cache_key in _SCAN_CACHE:
         return _SCAN_CACHE[cache_key]
@@ -130,8 +153,15 @@ def scan_patterns(
         if df_candles.empty or len(df_candles) < 20:
             continue
 
+        str_stock_id = str(stock_id)
+        in_universe = str_stock_id in TICK_UNIVERSE_SET
+
+        # 是否只過濾 tick universe 股票
+        if only_tick_universe and not in_universe:
+            continue
+
         # 10 日均量 (張) 過濾
-        avg_vol_lots = avg_vol_map.get(str(stock_id), 0.0)
+        avg_vol_lots = avg_vol_map.get(str_stock_id, 0.0)
         if min_vol_lots and min_vol_lots > 0 and avg_vol_lots < min_vol_lots:
             continue
 
@@ -142,6 +172,7 @@ def scan_patterns(
                 if res and res.score >= min_score:
                     res_dict = res.to_dict()
                     res_dict["pattern_name"] = detector.display_name
+                    res_dict["in_tick_universe"] = in_universe
                     res_dict["details"]["avg_vol_10d_lots"] = avg_vol_lots
                     matches.append(res_dict)
             except Exception:
@@ -156,6 +187,7 @@ def scan_patterns(
         "timeframe": timeframe,
         "date": date or (matches[0]["date"] if matches else None),
         "min_vol_lots": min_vol_lots,
+        "only_tick_universe": only_tick_universe,
         "total_matches": len(matches),
         "results": matches,
     }
@@ -232,13 +264,50 @@ def get_pattern_detail(
 
         pattern_output = pattern_dict
 
+    # 載入當日/當前的 Volume Profile & POC 籌碼數據
+    volume_profile_output = []
+    poc_data_output = None
+
+    try:
+        query_date = date or (df_candles["date"].iloc[-1].strftime("%Y-%m-%d") if not df_candles.empty else None)
+        if query_date:
+            vp_df = load_volume_profile(stock_id=stock_id, date=query_date)
+            if not vp_df.empty:
+                for _, r in vp_df.iterrows():
+                    volume_profile_output.append({
+                        "price": float(r["price"]),
+                        "volume": int(r["volume"]),
+                        "buy_volume": int(r["buy_volume"]),
+                        "sell_volume": int(r["sell_volume"]),
+                        "neutral_volume": int(r["neutral_volume"]),
+                    })
+
+            poc_df = load_poc(stock_id=stock_id, date=query_date)
+            if not poc_df.empty:
+                r_poc = poc_df.iloc[0]
+                poc_data_output = {
+                    "poc": float(r_poc["poc"]),
+                    "pocs": str(r_poc["pocs"]),
+                    "poc_volume": int(r_poc["poc_volume"]),
+                    "poc_count": int(r_poc["poc_count"]),
+                    "profile_type": str(r_poc["profile_type"]),
+                    "vah": float(r_poc["vah"]),
+                    "val": float(r_poc["val"]),
+                    "total_volume": int(r_poc["total_volume"]),
+                }
+    except Exception:
+        pass
+
     result = {
         "stock_id": stock_id,
+        "in_tick_universe": str(stock_id) in TICK_UNIVERSE_SET,
         "timeframe": timeframe,
         "pattern_type": pattern_type,
         "pattern_name": detector.display_name,
         "candles": candles_output,
         "pattern": pattern_output,
+        "volume_profile": volume_profile_output,
+        "poc_data": poc_data_output,
     }
 
     _DETAIL_CACHE[cache_key] = result
