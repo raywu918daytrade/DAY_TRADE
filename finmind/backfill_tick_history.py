@@ -1,9 +1,9 @@
 """FinMind Tick（TaiwanStockPriceTick）歷史回補 — 補進 db/tick/，跟
-finmind/backfill_history.py（分K）同構的月份迴圈驅動，差別是股票清單用固定的
+finmind/backfill_m1_history.py（分K）同構的月份迴圈驅動，差別是股票清單用固定的
 401檔名單（見 finmind/tick_universe.py），不像分K的 top_n_by_volume 是每月
 動態重算。
 
-跟 finmind/finmind_api.py 的核心 fetch/rate-limit/錯誤處理邏輯完全共用（見
+跟 finmind/m1_api.py 的核心 fetch/rate-limit/錯誤處理邏輯完全共用（見
 fetch_tick_day()/_fetch_finmind_day()），這支只負責「跑哪些月份、依序跑、
 股票清單哪裡來」。
 
@@ -36,12 +36,12 @@ db/fugle_day 的「股」（db/fugle_day 同一天同一支股票的volume會是
 電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N（可以跟其他參數
 併用，順序不拘），送滿N筆request就存檔收工、正常結束（不是錯誤），不用等
 FatalAPIError；下次重跑（不用帶這個參數）會用既有的中斷續傳機制自動接著補，
-不會重複下載已經有的部分（見 finmind/finmind_api.py::RequestBudgetExhausted）。
+不會重複下載已經有的部分（見 finmind/m1_api.py::RequestBudgetExhausted）。
 
 再加 --burst：跳過原本每筆間隔約0.655秒的節流，併發數/flush批次放大成
 min(待補組數, 剩餘budget)，接近同時把N筆全部送出去，不會乖乖排隊等。
 ⚠️ 只給「已經自己精算過FinMind帳號剩餘額度、只跑這一次」的場景用——
-2026-07-14 曾經因為瞬間爆量被封鎖IP 30分鐘（見 finmind/finmind_api.py::
+2026-07-14 曾經因為瞬間爆量被封鎖IP 30分鐘（見 finmind/m1_api.py::
 IPBannedError 的說明），這個模式沒辦法保證不會再發生，一定要搭配
 --max-requests 一起用，不然直接拒絕執行。
 """
@@ -52,7 +52,7 @@ import pandas as pd
 
 import aiohttp
 
-from finmind.finmind_api import (
+from finmind.m1_api import (
     FatalAPIError,
     RequestBudgetExhausted,
     _ROOT,
@@ -82,7 +82,7 @@ _FLUSH_EVERY = 25  # 比分K的100小很多：tick單筆request資料量比分K�
 
 
 def _month_range(start_ym: str, end_ym: str) -> list[tuple[int, int]]:
-    """跟 backfill_history.py::_month_range() 一致：由新到舊，近期資料先補。"""
+    """跟 backfill_m1_history.py::_month_range() 一致：由新到舊，近期資料先補。"""
     periods = pd.period_range(start=start_ym, end=end_ym, freq="M")
     return [(p.year, p.month) for p in periods][::-1]
 
@@ -90,7 +90,7 @@ def _month_range(start_ym: str, end_ym: str) -> list[tuple[int, int]]:
 def _tick_month_days(year: int, month: int) -> list[str]:
     """只借 db/fugle_day 確認哪幾天有開盤（不取股票清單——tick backfill 的
     股票清單是外部傳入的固定名單，不是這裡動態算的，見
-    finmind_api.py::_month_universe() 的股票清單版本，這裡只要交易日）。"""
+    m1_api.py::_month_universe() 的股票清單版本，這裡只要交易日）。"""
     path = _ROOT / f"db/fugle_day/{year}_{month:02d}.parquet"
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在，無法確定 {year}-{month:02d} 的交易日")
@@ -108,7 +108,7 @@ async def backfill_tick_month(
     flush_every: int = _FLUSH_EVERY,
 ):
     """補齊 db/tick/{year}_{month}.parquet 缺的 (股票, 交易日) 組合。結構跟
-    finmind_api.backfill_month() 幾乎一樣（stop_event/Semaphore/每flush_every筆
+    m1_api.backfill_month() 幾乎一樣（stop_event/Semaphore/每flush_every筆
     存檔一次/fatal error立刻停止新請求），差別只在股票清單用傳入的固定名單、
     交易日用 _tick_month_days()、讀寫呼叫 tick 專用的函式。
 

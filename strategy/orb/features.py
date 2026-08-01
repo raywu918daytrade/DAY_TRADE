@@ -64,7 +64,7 @@ _M1_LOOKBACK_CALENDAR_DAYS = 20
 # ── Cache 管理（按月分區，跟 db/m1/db/m3/db/m5/db/fugle_day 同樣的按月分檔慣例）──
 #
 # 2026-07-22 從單一大檔案改成按月分區，理由跟 strategy/rally/features.py
-# 2026-07-21 做的同一個修改一樣：db/m1 因為 finmind.backfill_history 正在
+# 2026-07-21 做的同一個修改一樣：db/m1 因為 finmind.backfill_m1_history 正在
 # 補 2019 年起的歷史，越補越大，舊版一次讀 load_m1() 全部歷史算完存一份
 # cache，實測記憶體峰值飆到 82GB，把訓練直接搞到跑不動。現在一次只處理
 # 一個月，且 db/m1 平常只有「當月」那個檔案會變動，其他月份的 cache 分區

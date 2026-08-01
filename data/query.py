@@ -17,6 +17,16 @@
                                     不提供整個資料集一次讀進記憶體的版本）
     load_volume_profile()        → db/volume_profile/ 價位成交量分布 (Volume Profile)
     load_poc()                   → db/poc_day/        每日 POC 關鍵價位 (Point of Control)
+
+還原權息版本（2026-08-01加）：db/m1／db/tick／db/volume_profile／db/poc_day
+存的都是原始（未還原權息）價格，只有 db/fugle_day（日K，下載時帶
+adjusted="true"）是還原後的，當作反推係數的基準來源。
+load_m1_adjusted()／load_volume_profile_adjusted()／load_poc_adjusted() 在讀取
+時 join db/tick_adjust_factor（見 data/build_tick_adjust_factor.py／
+finmind/backfill_tick_adjust_factor.py）換算成跟 db/fugle_day 一致的調整後
+價格再回傳，不動底層 parquet。要跟日K價格一起比較/使用、或訓練特徵需要
+連續價格序列時，應該用這三支，不要直接用 load_m1()/load_volume_profile()/
+load_poc()。
 """
 
 from pathlib import Path
@@ -62,6 +72,39 @@ def load_m1(start_date: str | None = None) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def load_m1_adjusted(start_date: str | None = None) -> pd.DataFrame:
+    """load_m1() 的「還原權息後」版本。
+
+    db/m1 存的是原始價格（2026-08-01 改，見 data/m1_data_loader.py 頂部說明：
+    故意不帶 adjusted，統一交給查詢層處理，不用管這筆資料當初是 Fugle／
+    富邦／finmind 哪個來源抓的）。這支函式在讀取當下 join
+    db/tick_adjust_factor 反推出的每日調整係數，把 open/high/low/close 換算
+    成跟 db/fugle_day 一致的還原後基準再回傳，不動 db/m1 本身。缺 factor 的
+    (stock_id, date)（該股票沒有tick資料/還沒建 factor）維持原始價格
+    （factor=1.0），不會整筆丟掉。volume 不受影響。
+
+    跟 load_volume_profile_adjusted() 不同：這裡不需要 round 後重新聚合——
+    m1 每一列本來就用完整時間戳（精確到分鐘）識別，不是像 volume_profile
+    那樣要用 price 當 groupby key，係數的微小日間差異不會造成假重複。
+
+    參數/回傳欄位同 load_m1()。"""
+    m1_df = load_m1(start_date=start_date)
+    if m1_df.empty:
+        return m1_df
+
+    m1_df["day"] = m1_df["date"].dt.strftime("%Y-%m-%d")
+    factor_df = _load_adjust_factor(None, None, start_date)
+    m1_df = m1_df.merge(
+        factor_df[["stock_id", "date", "factor"]].rename(columns={"date": "day"}),
+        on=["stock_id", "day"],
+        how="left",
+    )
+    m1_df["factor"] = m1_df["factor"].fillna(1.0)
+    for col in ["open", "high", "low", "close"]:
+        m1_df[col] = (m1_df[col] * m1_df["factor"]).round(2).astype("float32")
+    return m1_df.drop(columns=["day", "factor"]).sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
 def load_day(start_date: str | None = None) -> pd.DataFrame:
@@ -333,5 +376,96 @@ def load_poc(
     df = table.to_pandas()
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def _load_adjust_factor(stock_id: str | None, date: str | None, start_date: str | None) -> pd.DataFrame:
+    """載入 db/tick_adjust_factor/（見 data/build_tick_adjust_factor.py），內部
+    helper，給 load_volume_profile_adjusted()/load_poc_adjusted() 共用。"""
+    path = _ROOT / "db/tick_adjust_factor"
+    if not path.exists():
+        return pd.DataFrame(columns=["stock_id", "date", "factor"])
+
+    eff_start = start_date
+    if date is not None and (eff_start is None or date < eff_start):
+        eff_start = date
+
+    paths = _dataset_paths(path, eff_start)
+    if not paths:
+        return pd.DataFrame(columns=["stock_id", "date", "factor"])
+
+    dataset = ds.dataset(paths, format="parquet")
+    filt = None
+    if stock_id is not None:
+        filt = ds.field("stock_id") == stock_id
+    if date is not None:
+        filt = (filt & (ds.field("date") == date)) if filt is not None else (ds.field("date") == date)
+
+    table = dataset.to_table(filter=filt)
+    if table.num_rows == 0:
+        return pd.DataFrame(columns=["stock_id", "date", "factor"])
+    return table.to_pandas()
+
+
+def load_volume_profile_adjusted(
+    stock_id: str | None = None,
+    date: str | None = None,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    """load_volume_profile() 的「還原權息後」版本。
+
+    db/volume_profile 本身是從 db/tick 原始成交價算出來的（見 CLAUDE.md 之外的另一個
+    基準問題：db/m1／db/fugle_day 下載時都帶 adjusted="true"，db/tick 沒有，兩邊價格
+    基準對不上，2026-08-01 除錯 pattern 圖表時發現）。這支函式在讀取當下 join
+    db/tick_adjust_factor 反推出的每日調整係數，把 price 換算成跟 K 線一致的調整後
+    基準再回傳，不動 db/volume_profile 本身。缺 factor 的 (stock_id, date)（例如
+    db/tick_adjust_factor 還沒建或還沒增量到那天）維持原始價格（factor=1.0），不會
+    整筆丟掉。
+
+    參數/回傳欄位同 load_volume_profile()。
+    """
+    vp_df = load_volume_profile(stock_id=stock_id, date=date, start_date=start_date)
+    if vp_df.empty:
+        return vp_df
+
+    factor_df = _load_adjust_factor(stock_id, date, start_date)
+    vp_df = vp_df.merge(factor_df[["stock_id", "date", "factor"]], on=["stock_id", "date"], how="left")
+    vp_df["factor"] = vp_df["factor"].fillna(1.0)
+    # round(2)：factor 是逐日反推出來的，除息日之前每天的 factor 都有微小差異（同一個
+    # 原始tick檔位，不同天乘出來的 adjusted price 會差在小數點後幾位），不 round 直接
+    # 用浮點數當 groupby key，同一個名目價位會被拆成一堆幾乎重複的假價位，2026-08-01
+    # 實測 1101 半年份資料因此從約195個乾淨價位灌水成760+個——round 完再依
+    # (stock_id, date, price) 重新加總，把這些假重複收斂回同一檔
+    vp_df["price"] = (vp_df["price"] * vp_df["factor"]).round(2).astype("float32")
+    vp_df = vp_df.groupby(["stock_id", "date", "price"], as_index=False)[
+        ["volume", "buy_volume", "sell_volume", "neutral_volume"]
+    ].sum()
+    return vp_df.sort_values(["stock_id", "date", "price"]).reset_index(drop=True)
+
+
+def load_poc_adjusted(
+    stock_id: str | None = None,
+    date: str | None = None,
+    start_date: str | None = None,
+) -> pd.DataFrame:
+    """load_poc() 的「還原權息後」版本，說明同 load_volume_profile_adjusted()。
+
+    poc/vah/val/pocs 都是價位，乘上當天調整係數換算成調整後基準；poc_volume/
+    total_volume/poc_count/profile_type 是量或分類欄位，不受價格調整影響，原樣回傳。
+    """
+    poc_df = load_poc(stock_id=stock_id, date=date, start_date=start_date)
+    if poc_df.empty:
+        return poc_df
+
+    factor_df = _load_adjust_factor(stock_id, date, start_date)
+    poc_df = poc_df.merge(factor_df[["stock_id", "date", "factor"]], on=["stock_id", "date"], how="left")
+    poc_df["factor"] = poc_df["factor"].fillna(1.0)
+    poc_df["poc"] = (poc_df["poc"] * poc_df["factor"]).round(2).astype("float32")
+    poc_df["vah"] = (poc_df["vah"] * poc_df["factor"]).round(2).astype("float32")
+    poc_df["val"] = (poc_df["val"] * poc_df["factor"]).round(2).astype("float32")
+    poc_df["pocs"] = poc_df.apply(
+        lambda r: ",".join(f"{float(p) * r['factor']:.2f}" for p in str(r["pocs"]).split(",") if p),
+        axis=1,
+    )
+    return poc_df.drop(columns=["factor"]).sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 

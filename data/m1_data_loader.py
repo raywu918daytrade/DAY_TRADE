@@ -5,6 +5,12 @@
     從 Fugle + 富邦 REST API 下載 1 分鐘 K 線，存入 db/m1/（訓練資料庫）。
     flag 機制避免同一支股票在同一天重複下載。
 
+價格基準（2026-08-01改）：db/m1 存的是原始（未還原權息）價格，故意不帶
+adjusted 參數——需要還原後價格的地方改用 data/query.py::load_m1_adjusted()，
+查詢時 join db/tick_adjust_factor 換算，不用管這筆資料當初是哪個來源
+（Fugle/富邦/finmind）抓的。db/fugle_day（日K）不受影響，仍是還原後價格，
+當作反推係數的基準來源。
+
 與 fubon/marketdata_ws.py 的差異：
     m1_data_loader.py       → 下載歷史分K（近30日），存 db/m1/，給訓練用，GHA 每日觸發
     fubon/marketdata_ws.py  → 盤中富邦 WebSocket 即時推送，存 db/m1_live/，給當天交易推論用
@@ -73,9 +79,19 @@ def _download_m1(stock_id: str, token: str = None) -> pd.DataFrame:
 
     token：不帶用預設 FUGLE 帳號，第二條 Fugle 執行緒（_update_m1_fugle2）
     會傳入 fugle_api.TOKEN_DAYTRADE 走另一組獨立 rate limit。
+
+    不帶 adjusted（2026-08-01 改，故意不還原權息）：db/m1 定位改成跟 db/tick
+    一樣是「原始價格」的資料層，還原權息統一交給查詢層的 load_m1_adjusted()
+    （見 data/query.py，join db/tick_adjust_factor 在讀取時換算）在需要的地方
+    處理。這支曾經帶過 adjusted="true"，但 db/m1 併發下載時 Fugle/富邦兩邊
+    各自一半、富邦那半邊一度漏帶這個參數（2026-08-01 發現並修過一次），造成
+    db/m1 內部同一支股票不同天可能一邊還原一邊沒還原——與其繼續維護「兩邊
+    都要記得帶」這件事，不如兩邊都不帶，統一在查詢層做，來源是富邦/Fugle/
+    finmind 都一樣是原始價格，不用再擔心哪個來源有沒有做對。db/fugle_day
+    （日K）不受影響，維持 adjusted="true"，繼續當作反推係數的基準來源。
     """
     r = fugle_api.historical_candles(
-        stock_id, token=token, timeframe="1", fields="open,high,low,close,volume", sort="asc", adjusted="true"
+        stock_id, token=token, timeframe="1", fields="open,high,low,close,volume", sort="asc"
     )
     r.raise_for_status()
     data = r.json()
@@ -132,7 +148,10 @@ def _update_flag(stock_id: str, date_str: str):
 
 def _download_m1_fubon(sdk, stock_id: str) -> pd.DataFrame:
     """近30日+今日分K，富邦 historical/candles 一次就含今天，不用另外呼叫
-    intraday/candles。"""
+    intraday/candles。
+
+    不帶 adjusted（2026-08-01 改，故意不還原權息）：說明同 _download_m1()——
+    db/m1 現在統一存原始價格，還原交給查詢層的 load_m1_adjusted() 處理。"""
     from fubon import fubon_api as trade_api
 
     bars = trade_api.historical_candles(sdk, stock_id, timeframe=1)
@@ -148,16 +167,15 @@ def _download_m1_fubon(sdk, stock_id: str) -> pd.DataFrame:
 
 
 def _all_stocks() -> list:
-    """股票母體：讀 db/tickers/tickers.parquet 現有內容（見
-    fubon/intraday_tickers.py::load_tickers()），不觸發即時富邦API重新查詢——
-    這裡要的是「現在 db/tickers 裡有記錄的全部股票」，不是「這一刻盤中報的
-    最新清單」，兩者通常一致，但即時查詢還要多一次富邦API往返、且非盤中會
-    回傳空資料，沒必要。db/tickers 由 fubon/intraday_tickers.py::update_tickers()
-    每天更新一次（見 main/premarket.py::refresh_tickers()）。母體來源改了不
-    影響下載邏輯本身，Fugle/富邦兩邊還是各自下載一半。"""
-    from fubon.intraday_tickers import load_tickers
+    """股票母體（2026-08-01改）：讀 db/tickers/tick_universe.parquet 固定的
+    399支排名+0050強制併入共400支（見 finmind/tick_universe.py），不再讀
+    db/tickers/tickers.parquet 的全市場~2700支。訓練用的 db/m1 母體跟推論/
+    交易（fubon/subscribe_list.py）統一成同一批，減少訓練雜訊、也大幅減少
+    每天下載的API用量。母體來源改了不影響下載邏輯本身，Fugle/富邦兩邊還是
+    各自下載一半。"""
+    from finmind.tick_universe import load_tick_universe
 
-    return load_tickers()["stock_id"].tolist()
+    return load_tick_universe()
 
 
 def _get_done_stocks(date_str: str) -> set:

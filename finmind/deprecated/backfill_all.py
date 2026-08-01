@@ -1,21 +1,21 @@
 """
 FinMind 分K 補齊 — 全部股票，不限前N支。
 
-薄wrapper，核心邏輯全部在 finmind/backfill_history.py，這支只是固定好預設
+薄wrapper，核心邏輯全部在 finmind/backfill_m1_history.py，這支只是固定好預設
 範圍（2019-01 ~ 2026-05，FinMind TaiwanStockKBar 資料起點到現在），不帶
 top_n_by_volume，補完整股票母體。跟 finmind/backfill_top1000.py 是分開的
-兩支腳本，用同一套續傳邏輯（見 finmind/finmind_api.py::_existing_pairs()），互不
+兩支腳本，用同一套續傳邏輯（見 finmind/m1_api.py::_existing_pairs()），互不
 衝突：backfill_top1000.py 先跑過的 (股票,日期) 組合，這支執行時會自動跳過，
 只補剩下沒補到的股票，不會重複下載。
 
 ⚠️ 規模警告：2019-01 ~ 2026-05 全部股票、全部補完，大約需要18天連續執行
-（見 finmind/backfill_history.py 檔頭說明），要用 nohup/caffeinate 背景跑，
+（見 finmind/backfill_m1_history.py 檔頭說明），要用 nohup/caffeinate 背景跑，
 不能在對話 session 裡背景執行完。
 
 用 run_forever()（不是 backfill_history()）：撞到400（token無效）或402
 （額度用完）不會整個程式結束，會每60秒自動查一次FinMind官方用量API，
 恢復後自動繼續，18天不用人工盯著重啟（見
-finmind/backfill_history.py::run_forever() 的說明）。
+finmind/backfill_m1_history.py::run_forever() 的說明）。
 
 用法：
     python -m finmind.backfill_all                      # 2019-01 補到 2026-05（預設）
@@ -35,7 +35,7 @@ VS Code/停止偵錯/電腦睡眠都會讓它中斷，輸出也只會進 VS Code
     python3 -m finmind.backfill_all --max-requests=3000
 
 再加 --burst 可以跳過節流、接近同時把N筆全部發出去（見
-finmind/backfill_history.py 檔頭的風險說明，一定要精算過剩餘額度才用）：
+finmind/backfill_m1_history.py 檔頭的風險說明，一定要精算過剩餘額度才用）：
     python3 -m finmind.backfill_all --max-requests=3000 --burst
 
 看即時進度：
@@ -47,8 +47,8 @@ finmind/backfill_history.py 檔頭的風險說明，一定要精算過剩餘額�
 
 import asyncio
 
-from finmind.backfill_history import run_forever
-from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_burst_mode, set_request_budget
+from finmind.backfill_m1_history import run_forever
+from finmind.m1_api import RequestBudgetExhausted, parse_max_requests, set_burst_mode, set_request_budget
 
 _DEFAULT_START = "2019-01"
 _DEFAULT_END = "2026-05"
@@ -64,7 +64,7 @@ if __name__ == "__main__":
     if _max_requests:
         # 電腦快關機、想把剩下的額度用完不浪費：--max-requests=N，送滿N筆就
         # 安全停止、正常結束，下次重跑（不帶這個參數）自動接續（見
-        # finmind/finmind_api.py::RequestBudgetExhausted）。
+        # finmind/m1_api.py::RequestBudgetExhausted）。
         set_request_budget(_max_requests)
     if _burst:
         set_burst_mode(True)

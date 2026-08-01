@@ -197,7 +197,7 @@ p97 門檻當起點，**還沒針對 vwap_ml 自己的樣本分布重新驗證�
 `train.py::_prepare_data()` 的 `start_date` 參數會直接限制
 `load_m1()`/`load_m3()`/`load_m5()` 的載入範圍（不是先載全部歷史再事後
 篩選）——`db/m1` 實際存到 2022-12（另外還有一個獨立的
-`finmind.backfill_history` 背景作業在補 2019~2023 的資料），全部載入
+`finmind.backfill_m1_history` 背景作業在補 2019~2023 的資料），全部載入
 會不必要地拖慢速度、佔用大量記憶體，且訓練通常只需要近1~2年資料
 （`start_date="2024-01-01"` 是目前實際使用的值）。不同 `start_date`
 存在各自獨立的 cache 檔案（`cache/vwap_ml_prepared_{start_date}.parquet`，

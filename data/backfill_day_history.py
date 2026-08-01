@@ -43,7 +43,7 @@ from data.day_data_loader import _ROOT, _all_stocks, _download_day, _download_da
 
 _TW = timezone(timedelta(hours=8))
 
-# 加時間戳記 + 強制 flush（比照 finmind/finmind_api.py 同樣的 monkey-patch 做法）。
+# 加時間戳記 + 強制 flush（比照 finmind/m1_api.py 同樣的 monkey-patch 做法）。
 # 這支腳本要跑很久（背景 nohup），Python 對非終端機輸出預設 block-buffered，
 # 不這樣做的話 log 檔案會長時間看起來是空的，即使其實在正常運作。
 _orig_print = _builtins.print

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from finmind.finmind_api import _atomic_to_parquet, _ROOT
+from finmind.m1_api import _atomic_to_parquet, _ROOT
 
 _TOP_N = 400  # 輸出總檔數（含force_include），不是「純排名檔數 + force_include」
 _FORCE_INCLUDE = ["0050"]
@@ -49,7 +49,7 @@ def build_tick_universe(
     force_include: list[str] = _FORCE_INCLUDE,
 ) -> pd.DataFrame:
     """讀 year_months 每個月的 db/fugle_day/{year}_{month}.parquet（只取
-    stock_id/date/volume 三欄，比照 finmind_api._month_universe() 的做法），
+    stock_id/date/volume 三欄，比照 m1_api._month_universe() 的做法），
     篩 4碼數字股票、排除"00"開頭的ETF代號（見上面模組docstring的說明，
     0050/0052/0056這種早期ETF代號剛好也是4碼，不能只靠regex ^\\d{4}$濾掉），
     算跨月平均日成交量排序，取前 (top_n - len(force_include)) 名，
@@ -99,7 +99,24 @@ def build_tick_universe(
             "forced_include": True,
         }
     )
-    return pd.concat([result, extra_df], ignore_index=True)
+    out = pd.concat([result, extra_df], ignore_index=True)
+    return _attach_names(out)
+
+
+def _attach_names(df: pd.DataFrame) -> pd.DataFrame:
+    """加上 name 欄位（2026-08-01加）：查 db/tickers/tickers.parquet 本地既有
+    清單（不觸發即時富邦API），讓 tick_universe.parquet 自己就有股票名稱，
+    fubon/subscribe_list.py 不用再額外讀 db/tickers/tickers.parquet 那份全
+    市場清單來查名稱——tick_universe 現在是唯一的股票母體來源，名稱也一併
+    帶著走。查不到名稱的（tickers.parquet 沒有這支，例如剛好還沒更新到）
+    留空字串，不擋清單本身。"""
+    from fubon.intraday_tickers import load_tickers
+
+    tickers_df = load_tickers()
+    name_map = dict(zip(tickers_df["stock_id"], tickers_df["name"])) if not tickers_df.empty else {}
+    df = df.copy()
+    df["name"] = df["stock_id"].map(name_map).fillna("")
+    return df
 
 
 def load_tick_universe() -> list[str]:

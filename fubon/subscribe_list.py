@@ -1,20 +1,29 @@
 """
-富邦當沖候選股清單，三步驟篩選（見 subscription_batches()）：
-    1. isNormal + industry數字過濾 + 排除債券ETF（fubon/intraday_tickers.py::update_tickers()）
-    2. 20日均量排序，取前 N 支（ranked_candidates()，最多 MAX_SUBSCRIPTIONS 支）
-    3. canDayTrade/canBuyDayTrade 逐支確認（_filter_day_tradable()）
+富邦當沖候選股清單。
+
+2026-08-01改：候選股母體固定成 db/tickers/tick_universe.parquet（399支排名
++0050強制併入共400支，見 finmind/tick_universe.py），不再即時打富邦API抓
+全市場~2700支、也不再用20日均量動態排序截斷（400支遠低於WebSocket上限
+1000支，不需要截斷）。訓練（data/m1_data_loader.py、data/day_data_loader.py）
+跟推論/交易統一用同一批固定母體，減少訓練雜訊，也大幅減少每天開盤前的API
+用量/等待時間。
+
+固定母體流程（見 subscription_batches()）：
+    1. 讀 db/tickers/tick_universe.parquet 固定400支 + db/tickers/tickers.parquet
+       本地既有清單查名稱（_fixed_universe_names()，都不觸發即時富邦API）
+    2. canDayTrade/canBuyDayTrade 逐支確認（_filter_day_tradable()）——這個
+       還是每天做，確認這400支裡有沒有股票今天被停資/注意處置、不能當沖
    最後切成每組 ≤200 支、最多 5 組（對應富邦 WebSocket rate limit：
-200 檔/連線、5 條連線 → 上限 1000 檔）。
+200 檔/連線、5 條連線 → 上限 1000 檔，400支只會用到2組）。
+
+舊的動態選股邏輯（_fubon_normal_tickers()/ranked_candidates()/
+all_normal_stocks()）保留在檔案裡沒有刪除，只是目前的日常流程不再呼叫，
+之後如果要重新擴大母體/改回動態選股可以直接復用。
 
 這份清單是「唯一」的當沖候選股來源：
     - fubon/marketdata_ws.py 用分組後的 batches 決定 WebSocket 訂閱誰
     - main/premarket.py::refresh_tickers() 直接呼叫 build_and_save_subscribe_list()
       當作 state.day_trade_stocks / state.tickers 的來源
-避免這兩處各自獨立算一次候選股（先前 main/premarket.py 走 Fugle、這裡走富邦，
-兩邊資料源不同，理論上該是同一份清單卻沒有保證真的一致）。
-
-均量排序邏輯直接沿用 data/data_manager.py 的 _volume_filter，避免另外
-寫一套排序規則。
 
 使用方式：
     main/premarket.py::refresh_tickers() 開機、每天 06:00 都會自動呼叫
@@ -25,10 +34,6 @@
         from fubon.subscribe_list import load_candidates, load_subscribe_batches
         df = load_candidates()          # 完整 DataFrame（含 name）
         batches = load_subscribe_batches()  # 分組後的 stock_id list，給 WebSocket 用
-
-    訓練資料批次下載器（不受均量排序/WebSocket上限限制，只要完整母體）：
-        from fubon.subscribe_list import all_normal_stocks
-        stocks = all_normal_stocks()    # 每次呼叫都現抓，不經過存檔的候選清單
 """
 import os
 import threading
@@ -97,21 +102,36 @@ def _fubon_normal_tickers() -> dict[str, str]:
 
 
 def all_normal_stocks() -> list[str]:
-    """完整股票母體（isNormal=true、排除債券ETF，不做均量排序/上限），給訓練資料
-    批次下載器用（data/day_data_loader.py、data/m1_data_loader.py）——那兩支不受
-    WebSocket 訂閱數限制，不需要 ranked_candidates() 的排序/截斷，只要「今天有哪些
-    股票可以交易」這個母體即可。"""
+    """完整股票母體（isNormal=true、排除債券ETF，不做均量排序/上限）。
+    2026-08-01改：日常流程（data/m1_data_loader.py、data/day_data_loader.py、
+    fubon/subscribe_list.py 自己）都已經改成固定讀 tick_universe（見
+    _fixed_universe_names()），不再呼叫這支——保留函式本身，之後如果要
+    重新擴大母體/改回動態選股可以直接復用，不用重寫。"""
     return list(_fubon_normal_tickers().keys())
 
 
 def ranked_candidates(names: dict[str, str]) -> list[str]:
     """依 20日均量排序（高→低）的候選股，最多 MAX_SUBSCRIPTIONS 支（.env，
-    目前設為 1000，剛好對應 5 條連線 × 200 檔）。"""
+    目前設為 1000，剛好對應 5 條連線 × 200 檔）。2026-08-01改：日常流程不再
+    呼叫這支，說明同 all_normal_stocks()。"""
     from data.data_manager import _volume_filter
     from data.query import load_day
 
     day = load_day()
     return _volume_filter(set(names.keys()), day[["stock_id", "date", "volume"]])
+
+
+def _fixed_universe_names() -> dict[str, str]:
+    """固定候選股母體＋名稱查詢（2026-08-01加）：db/tickers/tick_universe.parquet
+    （399支排名+0050強制併入共400支，見 finmind/tick_universe.py，name欄位
+    2026-08-01一併加進去，不用再另外讀 db/tickers/tickers.parquet）決定「有
+    哪些股票」跟名稱——讀本機檔案，不觸發即時富邦API。取代原本
+    _fubon_normal_tickers()（全市場~2700支）+ ranked_candidates()（20日均量
+    動態排序）這兩步，訓練/推論/交易統一用同一批固定母體。"""
+    from finmind.tick_universe import _universe_file_path
+
+    df = pd.read_parquet(_universe_file_path(), columns=["stock_id", "name"])
+    return dict(zip(df["stock_id"], df["name"].fillna("")))
 
 
 def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
@@ -175,10 +195,13 @@ def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     """把候選股切成 ≤MAX_PER_CONNECTION 支一組，最多 MAX_CONNECTIONS 組
     （富邦 WebSocket 連線本身的 rate limit，定義在 fubon/config.py）。
 
-    順序：均量排序＋截斷（ranked_candidates） → canDayTrade/canBuyDayTrade
-    逐支確認，_FORCE_INCLUDE 的股票不查、無條件視為可以當沖（_filter_day_tradable）
-    → 分連線。"""
-    candidates = ranked_candidates(names)
+    2026-08-01改：names 現在固定是 _fixed_universe_names() 的400支（不再是
+    ranked_candidates() 動態均量排序後的結果），這裡直接用 dict 的 key 當
+    候選清單。順序：固定母體 → canDayTrade/canBuyDayTrade 逐支確認，
+    _FORCE_INCLUDE 的股票不查、無條件視為可以當沖（_filter_day_tradable）
+    → 分連線。400支遠低於 MAX_CONNECTIONS×MAX_PER_CONNECTION 上限，實務上
+    只會用到2組連線。"""
+    candidates = list(names.keys())
     candidates = _filter_day_tradable(candidates)
     batches = [
         candidates[i : i + MAX_PER_CONNECTION]
@@ -208,9 +231,9 @@ def build_and_save_subscribe_list(force: bool = False) -> pd.DataFrame:
                 print(f"候選清單已是今天（{today}）存的，直接沿用，不重新查詢 → {_SUBSCRIBE_PATH}", flush=True)
                 return existing
 
-    names = _fubon_normal_tickers()
+    names = _fixed_universe_names()
     if not names:
-        print("  警告：富邦 API 沒回傳任何股票（非盤中？），清單維持空白", flush=True)
+        print("  警告：找不到 tick_universe/tickers 本地清單，清單維持空白", flush=True)
         return pd.DataFrame()
 
     batches = subscription_batches(names)

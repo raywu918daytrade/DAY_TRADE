@@ -3,8 +3,8 @@ finmind/tick_universe.py，399檔4碼股票依成交量排序+0050，共400檔�
 固定範圍 2025-08 ~ 2026-07（含當月至今）。
 
 薄wrapper，核心邏輯在 finmind/backfill_tick_history.py，這支只固定範圍/名單。
-用 finmind_api.run_forever()（跟分K共用同一套額度恢復輪詢邏輯，見
-backfill_history.py::run_forever() 的說明）：撞到400/402不會整個程式結束，
+用 m1_api.run_forever()（跟分K共用同一套額度恢復輪詢邏輯，見
+backfill_m1_history.py::run_forever() 的說明）：撞到400/402不會整個程式結束，
 每60秒查一次額度自動恢復。
 
 ⚠️ 正式跑一定要用終端機 nohup 啟動，不要用 VS Code 執行/偵錯按鈕（同
@@ -40,9 +40,9 @@ finmind/backfill_tick_history.py 檔頭的風險說明，一定要精算過剩�
 
 import asyncio
 
-from finmind.backfill_history import run_forever
+from finmind.backfill_m1_history import run_forever
 from finmind.backfill_tick_history import backfill_tick_history
-from finmind.finmind_api import RequestBudgetExhausted, parse_max_requests, set_burst_mode, set_request_budget
+from finmind.m1_api import RequestBudgetExhausted, parse_max_requests, set_burst_mode, set_request_budget
 from finmind.tick_universe import load_tick_universe
 
 _DEFAULT_START = "2025-08"

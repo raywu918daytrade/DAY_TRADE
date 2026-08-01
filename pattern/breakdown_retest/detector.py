@@ -82,7 +82,11 @@ class BreakdownRetestDetector(BasePatternDetector):
         timeframe: str,
         poc_df: Optional[pd.DataFrame] = None,
     ) -> Optional[PatternResult]:
-        """對單一股票執行跌破支撐反彈做空型態檢測"""
+        """對單一股票執行跌破支撐反彈做空型態檢測
+
+        poc_df: 選填，外部預先批次載入的 POC 資料（避免每支股票各自查一次）。
+        呼叫端要自己先用 data.query.load_poc_adjusted() 載入，不要傳未調整過的
+        load_poc() 結果進來，否則會跟 df（K線，已還原權息）基準對不上。"""
         if df.empty or len(df) < self.min_candles:
             return None
 
@@ -233,8 +237,8 @@ class BreakdownRetestDetector(BasePatternDetector):
 
         try:
             if poc_df is None:
-                from data.query import load_poc
-                stock_poc_df = load_poc(stock_id=stock_id)
+                from data.query import load_poc_adjusted
+                stock_poc_df = load_poc_adjusted(stock_id=stock_id)
             else:
                 stock_poc_df = poc_df[poc_df["stock_id"] == stock_id]
 

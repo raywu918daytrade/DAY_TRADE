@@ -23,7 +23,8 @@ from pattern.head_shoulders_top.detector import HeadShouldersTopDetector
 from pattern.m_top.detector import MTopDetector
 from pattern.triangle.detector import TriangleDetector
 from pattern.w_bottom.detector import WBottomDetector
-from data.query import load_poc, load_volume_profile
+from data.query import load_volume_profile_adjusted
+from data.build_poc import compute_poc_dataframe
 from finmind.tick_universe import load_tick_universe
 
 router = APIRouter(prefix="/api/pattern", tags=["技術型態"])
@@ -205,6 +206,16 @@ def get_pattern_detail(
     limit: int = Query(120, description="K 線視窗根數，預設 120 根"),
 ) -> Dict[str, Any]:
     """回傳 K 線數據（時間已轉為前端所需的 UTC timestamp）以及型態關鍵轉折點與趨勢線線段資訊（支援快取）。"""
+    # 處理直接在 Python 內部調用函式時可能傳入 Query 物件的情況
+    if hasattr(pattern_type, "default"):
+        pattern_type = pattern_type.default
+    if hasattr(timeframe, "default"):
+        timeframe = timeframe.default
+    if hasattr(date, "default"):
+        date = date.default
+    if hasattr(limit, "default"):
+        limit = limit.default
+
     if pattern_type not in DETECTORS:
         raise HTTPException(
             status_code=400,
@@ -264,16 +275,30 @@ def get_pattern_detail(
 
         pattern_output = pattern_dict
 
-    # 載入當日/當前的 Volume Profile & POC 籌碼數據
+    # 載入「整個可視K線範圍」的 Volume Profile & POC 籌碼數據（2026-08-01改：
+    # 原本只查K線視窗最後一天，跟使用者實際打開的視窗範圍（例如120天）完全
+    # 脫鉤，數值看起來不合理、橫條圖也擠成一團貼在單日POC旁邊。現在改成把
+    # df_candles 涵蓋的整段日期範圍內、每個價位的量都加總起來，再用跟
+    # build_poc.py 同一套演算法重新算這個範圍專屬的 POC/VAH/VAL——不能直接
+    # 沿用 db/poc_day 的每日precompute值，那是單日的，範圍一拉大就對不上）
     volume_profile_output = []
     poc_data_output = None
 
     try:
-        query_date = date or (df_candles["date"].iloc[-1].strftime("%Y-%m-%d") if not df_candles.empty else None)
-        if query_date:
-            vp_df = load_volume_profile(stock_id=stock_id, date=query_date)
+        if not df_candles.empty:
+            range_start = df_candles["date"].iloc[0].strftime("%Y-%m-%d")
+            range_end = df_candles["date"].iloc[-1].strftime("%Y-%m-%d")
+            vp_df = load_volume_profile_adjusted(stock_id=stock_id, start_date=range_start)
             if not vp_df.empty:
-                for _, r in vp_df.iterrows():
+                vp_df = vp_df[(vp_df["date"] >= range_start) & (vp_df["date"] <= range_end)]
+
+            if not vp_df.empty:
+                agg = (
+                    vp_df.groupby("price", as_index=False)[["volume", "buy_volume", "sell_volume", "neutral_volume"]]
+                    .sum()
+                    .sort_values("price")
+                )
+                for _, r in agg.iterrows():
                     volume_profile_output.append({
                         "price": float(r["price"]),
                         "volume": int(r["volume"]),
@@ -282,19 +307,20 @@ def get_pattern_detail(
                         "neutral_volume": int(r["neutral_volume"]),
                     })
 
-            poc_df = load_poc(stock_id=stock_id, date=query_date)
-            if not poc_df.empty:
-                r_poc = poc_df.iloc[0]
-                poc_data_output = {
-                    "poc": float(r_poc["poc"]),
-                    "pocs": str(r_poc["pocs"]),
-                    "poc_volume": int(r_poc["poc_volume"]),
-                    "poc_count": int(r_poc["poc_count"]),
-                    "profile_type": str(r_poc["profile_type"]),
-                    "vah": float(r_poc["vah"]),
-                    "val": float(r_poc["val"]),
-                    "total_volume": int(r_poc["total_volume"]),
-                }
+                agg_for_poc = agg.assign(stock_id=stock_id, date="range")
+                poc_df = compute_poc_dataframe(agg_for_poc)
+                if not poc_df.empty:
+                    r_poc = poc_df.iloc[0]
+                    poc_data_output = {
+                        "poc": float(r_poc["poc"]),
+                        "pocs": str(r_poc["pocs"]),
+                        "poc_volume": int(r_poc["poc_volume"]),
+                        "poc_count": int(r_poc["poc_count"]),
+                        "profile_type": str(r_poc["profile_type"]),
+                        "vah": float(r_poc["vah"]),
+                        "val": float(r_poc["val"]),
+                        "total_volume": int(r_poc["total_volume"]),
+                    }
     except Exception:
         pass
 

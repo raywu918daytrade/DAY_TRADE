@@ -207,15 +207,13 @@ def _update_flag(stock_id: str, date_str: str):
 
 
 def _all_stocks() -> list:
-    """股票母體：讀 db/tickers/tickers.parquet 現有內容（見
-    fubon/intraday_tickers.py::load_tickers()），不觸發即時富邦API重新查詢——
-    這裡要的是「現在 db/tickers 裡有記錄的全部股票」，不是「這一刻盤中報的
-    最新清單」，兩者通常一致，但即時查詢還要多一次富邦API往返、且非盤中會
-    回傳空資料，沒必要。db/tickers 由 fubon/intraday_tickers.py::update_tickers()
-    每天更新一次（見 main/premarket.py::refresh_tickers()）。"""
-    from fubon.intraday_tickers import load_tickers
+    """股票母體（2026-08-01改）：讀 db/tickers/tick_universe.parquet 固定的
+    399支排名+0050強制併入共400支（見 finmind/tick_universe.py），不再讀
+    db/tickers/tickers.parquet 的全市場~2700支。說明同
+    data/m1_data_loader.py::_all_stocks()。"""
+    from finmind.tick_universe import load_tick_universe
 
-    return load_tickers()["stock_id"].tolist()
+    return load_tick_universe()
 
 
 def _get_done_stocks(date_str: str) -> set:

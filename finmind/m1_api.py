@@ -20,9 +20,16 @@ volume 單位：實測跟 db/m1 現有資料（Fugle 來源）逐分鐘完全一
 是「股」，db/m1 是「張」，這是既有資料的另一件事，跟這支檔案無關，不在這裡
 處理。）
 
-用法：
-    python -m finmind.api                # 補齊 2026-05（預設，見 __main__）
-    python -m finmind.api 2026 4          # 補齊指定年月
+用法（預設母體固定是 tick_universe.py 那400支，不用另外加旗標；真的要補
+全市場才需要 --all 選擇退出）：
+    python -m finmind.m1_api                          # 補齊 2026-05（預設，見 __main__），固定400支
+    python -m finmind.m1_api 2026 4                    # 補齊指定年月（整月），固定400支
+    python -m finmind.m1_api 2026 6 --start=2026-06-13 --end=2026-06-30
+        # 補指定年月「裡的某段日期」（2026-08-01加，例如db/m1灰色地帶用這個）
+    python -m finmind.m1_api 2026 6 --max-requests=3000
+        # 額度不夠一次補完時，送滿3000筆安全停止，之後重跑（不用帶這個參數）自動接續
+    python -m finmind.m1_api 2026 6 --all
+        # 選擇退出固定400支母體，補當月全市場（舊版行為，通常不需要）
 """
 
 import asyncio
@@ -65,7 +72,7 @@ _DATASET = "TaiwanStockKBar"
 
 def reload_token() -> None:
     """重新讀 .env 的 FINMIND_TOKEN，蓋掉目前記憶體裡的值。長時間背景執行
-    （見 finmind/backfill_history.py 的 run_forever()）撞到 400 TokenError 時，
+    （見 finmind/backfill_m1_history.py 的 run_forever()）撞到 400 TokenError 時，
     使用者可以直接改 .env 換新token，不用重啟程式，下次自動重試前呼叫這個
     就能讀到新值。"""
     global _TOKEN
@@ -332,7 +339,7 @@ def effective_concurrency(default: int, pending: int) -> int:
 
 def parse_max_requests(argv: list[str]) -> tuple[list[str], int | None, bool]:
     """從命令列參數裡挑出 --max-requests=N 跟 --burst，回傳（剩下的位置參數,
-    N或None, 要不要burst）。抽成共用函式是因為 backfill_history.py/
+    N或None, 要不要burst）。抽成共用函式是因為 backfill_m1_history.py/
     backfill_tick_history.py/backfill_all.py/backfill_top1000.py/
     backfill_tick.py 的 __main__ 都要支援同一組旗標，不要複製貼上5份一樣的
     parsing邏輯。
@@ -369,7 +376,12 @@ async def sync_rate_limiter() -> dict:
 
 
 async def _fetch_finmind_day(
-    session: aiohttp.ClientSession, dataset: str, stock_id: str, date_str: str, _retry: int = 0
+    session: aiohttp.ClientSession,
+    dataset: str,
+    stock_id: str,
+    date_str: str,
+    end_date: str | None = None,
+    _retry: int = 0,
 ) -> list[dict]:
     """單一 (dataset, 股票, 交易日) 的原始請求，date_str 格式 YYYY-MM-DD。回傳
     payload['data'] 的原始 list[dict]（未整形，欄位怎麼組成最終 DataFrame由呼叫
@@ -377,6 +389,13 @@ async def _fetch_finmind_day(
     （2026-07-29 從原本寫死 TaiwanStockKBar 的 fetch_kbar_day() 抽出來，讓
     fetch_tick_day()（TaiwanStockPriceTick）共用同一套，不要複製這段
     60行的錯誤處理邏輯——之後FinMind訊息格式一變，只要改一個地方）。
+
+    end_date：選填（2026-08-01 加，給 backfill_tick_adjust_factor.py 用）。
+    TaiwanStockKBar/TaiwanStockPriceTick 這種分K/逐筆資料集本來就只能查一天
+    （FinMind官方限制，見上面docstring），呼叫端不會傳這個參數；但
+    TaiwanStockPrice/TaiwanStockPriceAdj 這種日K資料集支援 start_date~end_date
+    整段區間一次回傳（實測驗證過），不用像分K一樣逐日發request，可以大幅
+    減少 request 數量。
 
     2026-07-14 實測：帳號真實上限就是 6000/小時（跟 _RATE_LIMIT_PER_HOUR 一致，
     衝高流量測過會撞到 402 "Requests reach the upper limit"）。_RateLimiter
@@ -548,27 +567,37 @@ def _save_empty_pairs(pairs: list[tuple[str, str]], year: int, month: int):
 
 
 def _month_universe(
-    year: int, month: int, top_n_by_volume: int | None = None
+    year: int, month: int, top_n_by_volume: int | None = None, stock_list: list[str] | None = None
 ) -> tuple[list[str], list[str]]:
-    """從 db/fugle_day/{year}_{month}.parquet 取得該月「實際交易日」跟「實際
-    有交易的股票清單」——比用 fubon.subscribe_list.all_normal_stocks()（今天
+    """從 db/fugle_day/{year}_{month}.parquet 取得該月「實際交易日」，跟
+    「要補的股票清單」——比用 fubon.subscribe_list.all_normal_stocks()（今天
     的候選股名單）準，那份名單是現在的，跟過去某個月實際有交易的股票對不上
     （例如當時還沒上市、或現在已下市的股票）。
 
     top_n_by_volume: 選填，只取當月「平均日成交量」最高的前N支股票，用來縮小
-    範圍、減少請求數（例如先補流動性夠的股票就好）。跟不帶這個參數的呼叫
-    混用完全沒問題——_existing_pairs() 是直接查 db/m1 實際內容，不是看這次
-    呼叫的範圍設定，之後想把剩下的股票也補齊，直接呼叫不帶這個參數的版本，
-    已經有的會自動跳過，不會重複下載或衝突。
+    範圍、減少請求數。
+    stock_list: 選填（2026-08-01加），直接指定股票清單（例如
+    finmind.tick_universe.load_tick_universe() 那400支），不用當月成交量
+    決定範圍——現在候選股母體已經固定，補歷史資料時應該直接照這份固定清單
+    補，不要再用 top_n_by_volume 動態算。跟 top_n_by_volume 不能同時帶。
+    都不帶則回傳當月全部有交易的股票（原本的預設行為）。
+
+    不管哪種模式，都跟不帶任何篩選參數的呼叫混用沒問題——_existing_pairs()
+    是直接查 db/m1 實際內容，不是看這次呼叫的範圍設定，之後想把剩下的股票
+    也補齊，直接呼叫不帶篩選的版本，已經有的會自動跳過，不會重複下載或衝突。
     """
+    if top_n_by_volume and stock_list:
+        raise ValueError("top_n_by_volume 跟 stock_list 不能同時指定")
     path = _ROOT / f"db/fugle_day/{year}_{month:02d}.parquet"
     if not path.exists():
-        raise FileNotFoundError(f"{path} 不存在，無法確定 {year}-{month:02d} 的交易日/股票清單")
+        raise FileNotFoundError(f"{path} 不存在，無法確定 {year}-{month:02d} 的交易日")
     cols = ["stock_id", "date"] + (["volume"] if top_n_by_volume else [])
     df = pd.read_parquet(path, columns=cols)
     df["date"] = pd.to_datetime(df["date"])
     days = sorted(d.strftime("%Y-%m-%d") for d in df["date"].dt.date.unique())
-    if top_n_by_volume:
+    if stock_list is not None:
+        stocks = sorted(stock_list)
+    elif top_n_by_volume:
         avg_vol = df.groupby("stock_id")["volume"].mean().sort_values(ascending=False)
         stocks = avg_vol.head(top_n_by_volume).index.tolist()
     else:
@@ -600,6 +629,7 @@ async def backfill_month(
     start_date: str | None = None,
     end_date: str | None = None,
     top_n_by_volume: int | None = None,
+    stock_list: list[str] | None = None,
     flush_every: int = 100,
 ):
     """補齊 db/m1/{year}_{month}.parquet 缺的 (股票, 交易日) 組合。
@@ -609,6 +639,10 @@ async def backfill_month(
     top_n_by_volume: 選填，只補當月平均日成交量最高的前N支（見
     _month_universe() 的說明）。之後想補剩下的股票，直接不帶這個參數再呼叫
     一次即可，已經有的會自動跳過，不會跟這次的結果衝突。
+    stock_list: 選填（2026-08-01加），直接指定股票清單（例如
+    finmind.tick_universe.load_tick_universe()），取代 top_n_by_volume 動態
+    算範圍——candidate股票母體現在固定是這400支，補歷史時應該直接照這份
+    清單補，不要再用當月成交量排序。跟 top_n_by_volume 不能同時帶。
     flush_every: 累積多少組結果就寫一次檔。2026-07-14 從2000調降到100
     ——先前2000太大，測試時程式被中途kill掉，累積不到2000組、一筆都沒
     存到db/m1，浪費掉的request額度完全打了水漂；小批次頻繁寫檔，就算隨時
@@ -621,7 +655,7 @@ async def backfill_month(
     自己主動製造這個模式，要在第一個fatal error出現的當下就盡快停止，
     受影響的頂多是當下已經在飛行中的 _CONCURRENCY(5) 筆請求。
     """
-    days, stocks = _month_universe(year, month, top_n_by_volume=top_n_by_volume)
+    days, stocks = _month_universe(year, month, top_n_by_volume=top_n_by_volume, stock_list=stock_list)
     if start_date:
         days = [d for d in days if d >= start_date]
     if end_date:
@@ -733,7 +767,27 @@ async def backfill_month(
 if __name__ == "__main__":
     import sys
 
-    _argv, _max_requests, _burst = parse_max_requests(sys.argv[1:])
+    # 2026-08-01 加 --start=/--end=/--all，讓補特定日期範圍（例如 db/m1
+    # 灰色地帶）可以直接一行command執行，不用寫Python腳本呼叫
+    # backfill_month()。股票母體預設就是 tick_universe.py 那固定400支（不用
+    # 額外加旗標）——candidate股票母體本來就固定是這400支，這才是現在的
+    # 「正常」用法；真的需要舊版「全市場」行為才需要明確帶 --all 選擇退出。
+    # 跟 parse_max_requests() 一樣的「先挑出旗標、剩下當位置參數」寫法。
+    _raw_argv, _max_requests, _burst = parse_max_requests(sys.argv[1:])
+    _argv = []
+    _start_date = None
+    _end_date = None
+    _use_all = False
+    for _a in _raw_argv:
+        if _a.startswith("--start="):
+            _start_date = _a.split("=", 1)[1]
+        elif _a.startswith("--end="):
+            _end_date = _a.split("=", 1)[1]
+        elif _a == "--all":
+            _use_all = True
+        else:
+            _argv.append(_a)
+
     if len(_argv) >= 2:
         _year, _month = int(_argv[0]), int(_argv[1])
     else:
@@ -742,8 +796,13 @@ if __name__ == "__main__":
         set_request_budget(_max_requests)
     if _burst:
         set_burst_mode(True)
+    _stock_list = None
+    if not _use_all:
+        from finmind.tick_universe import load_tick_universe
+
+        _stock_list = load_tick_universe()
     try:
-        asyncio.run(backfill_month(_year, _month))
+        asyncio.run(backfill_month(_year, _month, start_date=_start_date, end_date=_end_date, stock_list=_stock_list))
     except RequestBudgetExhausted as e:
         print(f"\n⏸ {e}")
         print("已達到本次設定的 request 上限，安全停止，之後重跑這支腳本會自動接續")

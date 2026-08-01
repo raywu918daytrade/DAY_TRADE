@@ -6,6 +6,15 @@ K線資料載入器 (Data Loader for Pattern Detection)
 - "3m"  : 3 分鐘標準獨立 K 線 (讀 db/m3_std/ 或由 1m resample)
 - "5m"  : 5 分鐘標準獨立 K 線 (讀 db/m5_std/ 或由 1m resample)
 - "day" : 日 K 線 (讀 db/fugle_day/)
+
+價格基準（2026-08-01加）：db/m1（連帶 db/m3_std/db/m5_std，都是從 db/m1 聚合
+出來的）存的是原始（未還原權息）價格，db/fugle_day 是還原後的（見
+data/m1_data_loader.py 頂部說明）。這支檔案的 1m/3m/5m 分支讀完原始資料後，
+都會用 _apply_adjust_factor() join db/tick_adjust_factor 換算成還原後價格，
+確保回傳的K線價格基準跟 day timeframe、以及 pattern_api.py 疊加的 POC/
+volume_profile（load_poc_adjusted()/load_volume_profile_adjusted()）一致，
+不會重演K線vs籌碼資料基準對不上的同一種bug。db/m1_live（當天即時資料）不用
+調整——「今天」相對於自己必然是同一個基準，raw=adjusted。
 """
 
 from pathlib import Path
@@ -13,9 +22,35 @@ from typing import Dict, Optional
 import pandas as pd
 import pyarrow.dataset as ds
 
+from data.query import _load_adjust_factor
 from data.resample import compute_m3_std, compute_m5_std
 
 _ROOT = Path(__file__).parent.parent
+
+
+def _apply_adjust_factor(df: pd.DataFrame, stock_id: Optional[str] = None) -> pd.DataFrame:
+    """把 df 的 open/high/low/close 換算成還原權息後價格。df 需有 stock_id、
+    date（datetime）欄位；stock_id 參數選填，單一股票查詢時帶入可以讓
+    _load_adjust_factor() 走 pyarrow filter pushdown，不用載入其他股票的
+    factor。"""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["_day"] = df["date"].dt.strftime("%Y-%m-%d")
+    start = df["_day"].min()
+    factor_df = _load_adjust_factor(stock_id, None, start)
+    if factor_df.empty:
+        return df.drop(columns=["_day"])
+    df = df.merge(
+        factor_df[["stock_id", "date", "factor"]].rename(columns={"date": "_day"}),
+        on=["stock_id", "_day"],
+        how="left",
+    )
+    df["factor"] = df["factor"].fillna(1.0)
+    for col in ["open", "high", "low", "close"]:
+        if col in df.columns:
+            df[col] = (df[col] * df["factor"]).round(2).astype("float32")
+    return df.drop(columns=["_day", "factor"])
 
 
 def get_stock_candles(
@@ -88,6 +123,7 @@ def get_stock_candles(
         df["date"] = pd.to_datetime(df["date"], format="mixed")
         df.drop_duplicates(subset=["date"], keep="last", inplace=True)
         df = df.sort_values("date").reset_index(drop=True)
+        df = _apply_adjust_factor(df, stock_id=stock_id)
         if limit and len(df) > limit:
             df = df.iloc[-limit:].reset_index(drop=True)
         return df
@@ -105,6 +141,7 @@ def get_stock_candles(
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 df.drop_duplicates(subset=["date"], keep="last", inplace=True)
                 df = df.sort_values("date").reset_index(drop=True)
+                df = _apply_adjust_factor(df, stock_id=stock_id)
                 if limit and len(df) > limit:
                     df = df.iloc[-limit:].reset_index(drop=True)
                 return df
@@ -176,6 +213,7 @@ def get_all_stocks_candles(
                 df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 df = df[df["date"] <= f"{date} 23:59:59"]
+                df = _apply_adjust_factor(df)
         else:
             dir_path = _ROOT / "db/m1"
             files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")[-1:]
@@ -183,6 +221,7 @@ def get_all_stocks_candles(
                 return {}
             df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
             df["date"] = pd.to_datetime(df["date"], format="mixed")
+            df = _apply_adjust_factor(df)
 
     elif timeframe in ("3m", "5m"):
         std_dir = _ROOT / f"db/{timeframe}_std"
@@ -196,6 +235,7 @@ def get_all_stocks_candles(
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 if date:
                     df = df[df["date"] <= f"{date} 23:59:59"]
+                df = _apply_adjust_factor(df)
             else:
                 m1_candles = get_all_stocks_candles("1m", date=date, limit=limit * 5)
                 res = {}

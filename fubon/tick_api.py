@@ -35,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
-# finmind.tick_api 匯入時會連帶 import finmind.finmind_api，那支檔案本身已經
+# finmind.tick_api 匯入時會連帶 import finmind.m1_api，那支檔案本身已經
 # monkey-patch 過全域 print（加時間戳記+強制flush，見該檔說明），這裡不用
 # 重複做一次——重複patch會把時間戳記包兩層，變成 "[HH:MM:SS] [HH:MM:SS] ..."。
 from finmind.tick_api import save_tick

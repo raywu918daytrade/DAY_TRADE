@@ -71,7 +71,7 @@ def _source_mtime() -> float:
     不是掃全部檔案取最大值。
 
     2026-07-26 討論：原本掃全部檔案取最大mtime，會被完全無關、正在補
-    2019~2023歷史資料缺口的背景程式（finmind.backfill_history）誤觸發
+    2019~2023歷史資料缺口的背景程式（finmind.backfill_m1_history）誤觸發
     ——它會持續改到db/m1裡的舊月份檔案（例如2023_05.parquet），這種
     更新跟vwap_ml實際會用到的近期資料無關，卻讓cache被判定過期、觸發
     不必要的10幾分鐘重算（訓練時常用 start_date=2024-01-01之後，2019~
@@ -130,7 +130,7 @@ def _prepare_data(
     start_date（2026-07-26新增）：直接限制 load_m1()/load_m3()/load_m5()
     載入的範圍，不是像過去那樣先載入全部歷史、事後才篩選train_df——
     使用者實際上固定用 start_date="2024-01-01"，先載全部歷史（目前含
-    2019~2023，正在被另一個獨立的 finmind.backfill_history 背景作業
+    2019~2023，正在被另一個獨立的 finmind.backfill_m1_history 背景作業
     持續補資料）再事後過濾，等於白白多算了完全用不到的資料，也讓
     _cache_is_fresh() 更容易被那個背景作業誤觸發成「過期」。不同
     start_date 存在各自獨立的cache檔案（見 _cache_path_for()），互不
