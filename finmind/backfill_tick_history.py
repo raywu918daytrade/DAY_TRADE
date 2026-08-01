@@ -30,6 +30,8 @@ db/fugle_day 的「股」（db/fugle_day 同一天同一支股票的volume會是
     python -m finmind.backfill_tick_history 2025-08 2026-07      # 指定範圍
     python -m finmind.backfill_tick_history --max-requests=3000  # 送滿3000筆就安全停止（見下方說明）
     python -m finmind.backfill_tick_history --max-requests=3000 --burst  # 上面那個+不節流，接近同時發出去
+    python -m finmind.backfill_tick_history 2024-01 2025-12 --max-requests=3000 --burst
+
 
 電腦快關機、想把剩下的額度用完不浪費：帶 --max-requests=N（可以跟其他參數
 併用，順序不拘），送滿N筆request就存檔收工、正常結束（不是錯誤），不用等
@@ -194,8 +196,10 @@ async def backfill_tick_month(
     if budget_holder:
         e = budget_holder[0]
         print(f"  ⏸ {e}")
-        print("  已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了），"
-              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續")
+        print(
+            "  已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了），"
+            "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續"
+        )
         raise e
 
     if fatal_error_holder:
@@ -269,5 +273,7 @@ if __name__ == "__main__":
         asyncio.run(backfill_tick_history(_start, _end))
     except RequestBudgetExhausted as e:
         print(f"\n⏸ {e}")
-        print("已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了）。"
-              "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續。")
+        print(
+            "已達到本次設定的 request 上限，安全停止（已完成的部分都存檔了）。"
+            "之後重跑這支腳本（不用帶 --max-requests）會自動從中斷處繼續。"
+        )
