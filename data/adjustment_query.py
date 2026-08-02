@@ -39,9 +39,39 @@ from data import raw_query
 _ROOT = Path(__file__).parent.parent
 
 
+def _adjust_volume_only(df: pd.DataFrame, stock_id: str | None, date: str | None, start_date: str | None) -> pd.DataFrame:
+    """把 df 的 volume 除以「系統預設、只還原拆股/合股」的 db/tick_adjust_factor
+    （不是這支檔案自己的 db/adjustment_factor），open/high/low/close 不動。
+
+    背景（2026-08-03）：db/adjustment_day 是 Fugle 下載時帶 adjusted="true" 的
+    完整還原日K，實測發現 Fugle 只調整價格、volume 完全沒動（0050拆股前後
+    volume 值跟原始資料一模一樣）——所以 load_pattern_day() 的
+    open/high/low/close 可以直接信任 Fugle 已經處理好，但 volume 一樣有
+    「拆股前後基準不一致」的問題，需要自己修。這裡刻意借用
+    db/tick_adjust_factor（只反映拆股/合股，乾淨無除息雜訊）而不是
+    db/adjustment_factor（混合拆股+除息）——用混合的那張會在每次除息時把
+    volume 算錯，理由同 _adjust_ohlc() 的說明。"""
+    if df.empty:
+        return df
+    from data.query import _load_adjust_factor
+
+    df = df.copy()
+    df["day"] = df["date"].dt.strftime("%Y-%m-%d")
+    factor_df = _load_adjust_factor(stock_id, date, start_date)
+    df = df.merge(
+        factor_df[["stock_id", "date", "factor"]].rename(columns={"date": "day"}),
+        on=["stock_id", "day"],
+        how="left",
+    )
+    df["factor"] = df["factor"].fillna(1.0)
+    df["volume"] = (df["volume"] / df["factor"]).round().astype("int64")
+    return df.drop(columns=["day", "factor"])
+
+
 def load_pattern_day(start_date: str | None = None) -> pd.DataFrame:
     """載入 db/adjustment_day/ 日K（完整還原，pattern 專用，按月分檔）。
-    下載時已經帶 adjusted="true"，本身就是完整還原後的，不用另外換算。
+    下載時已經帶 adjusted="true"，open/high/low/close 不用另外換算；volume
+    另外處理，見 _adjust_volume_only()。
 
     start_date：同 data.raw_query.load_m1() 的說明，預設 None = 讀全部。"""
     paths = raw_query._dataset_paths(_ROOT / "db/adjustment_day", start_date)
@@ -51,12 +81,14 @@ def load_pattern_day(start_date: str | None = None) -> pd.DataFrame:
     df = ds.dataset(paths, format="parquet").to_table().to_pandas()
     df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
+    df = _adjust_volume_only(df, None, None, start_date)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
 def load_pattern_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
     """載入單一股票在 db/adjustment_day/ 的日K（完整還原），只讀該股票的
-    row group，不用像 load_pattern_day() 一樣把全市場都讀進記憶體。
+    row group，不用像 load_pattern_day() 一樣把全市場都讀進記憶體。open/high/
+    low/close 不用另外換算；volume 另外處理，見 _adjust_volume_only()。
 
     date: 選填，格式 "YYYY-MM-DD"，指定只回傳該日那一筆；不填則回傳該股票
     全部日K（依日期排序）。查無資料一律回傳空 DataFrame。"""
@@ -70,6 +102,7 @@ def load_pattern_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
     df = table.to_pandas()
     df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["date"], keep="last", inplace=True)
+    df = _adjust_volume_only(df, stock_id, date, None)
     return df.sort_values("date").reset_index(drop=True)
 
 
@@ -106,7 +139,16 @@ def _adjust_ohlc(df: pd.DataFrame, start_date: str | None) -> pd.DataFrame:
     """共用邏輯：load_pattern_m1()/m3()/m5()/m3_std()/m5_std() 都是「完整時間戳
     識別、OHLC乘上當日完整還原係數」模式，抽成共用函式。照抄
     data/query.py::_adjust_ohlc() 的 pattern，只是換成呼叫
-    _load_adjustment_factor()。"""
+    _load_adjustment_factor()。
+
+    ⚠️ 2026-08-03 刻意跟 data/query.py::_adjust_ohlc() 不一樣的地方：這裡**不**
+    把 volume 除以 factor。data/query.py 那張 db/tick_adjust_factor 只反映拆股/
+    合股（真的會改變股數），volume除以factor是對的；但這裡的
+    db/adjustment_factor 混合了拆股跟一般除權息（factor在除息日也會變動），
+    除息不影響股數，如果對這張混合係數也做volume調整，會在每次除息時把volume
+    錯誤放大/縮小——這張表沒有拆股/除息的區分標記，沒辦法只挑拆股的部分處理，
+    所以維持volume不調整，代價是遇到lookback視窗剛好跨過拆股的股票，volume
+    可能會有斷崖（比每次除息volume都算錯的風險小很多）。"""
     if df.empty:
         return df
     df = df.copy()

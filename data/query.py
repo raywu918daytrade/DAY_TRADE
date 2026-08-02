@@ -63,7 +63,15 @@ def load_m1(start_date: str | None = None) -> pd.DataFrame:
     db/tick_adjust_factor 反推出的每日調整係數，把 open/high/low/close 換算
     成跟 db/fugle_day 一致的還原後基準再回傳，不動 db/m1 本身。缺 factor 的
     (stock_id, date)（該股票沒有tick資料/還沒建 factor）維持原始價格
-    （factor=1.0），不會整筆丟掉。volume 不受影響。
+    （factor=1.0），不會整筆丟掉。
+
+    volume 也會跟著除以 factor（2026-08-03 加）：這裡的 factor 只反映拆股/
+    合股，拆股會直接改變股數（例如1:4拆股股數變4倍），拆股前後的原始股數
+    不是同一個基準，volume 不調整的話，跨過拆股日算 rolling 均量/量能指標
+    會看到一個假的成交量斷崖。volume 除以 factor（factor<1時等於乘上股數
+    變多的倍數）才能讓「價格×成交量」這個成交金額維持不變，是正確的還原
+    方向（跟price乘上factor互為倒數關係）。除息的 factor 固定是1.0（這次
+    系統預設不還原除息），所以除息不會觸發volume調整，符合預期。
 
     跟 load_volume_profile() 不同：這裡不需要 round 後重新聚合——m1 每一列
     本來就用完整時間戳（精確到分鐘）識別，不是像 volume_profile 那樣要用
@@ -84,14 +92,16 @@ def load_m1(start_date: str | None = None) -> pd.DataFrame:
     m1_df["factor"] = m1_df["factor"].fillna(1.0)
     for col in ["open", "high", "low", "close"]:
         m1_df[col] = (m1_df[col] * m1_df["factor"]).round(2).astype("float32")
+    m1_df["volume"] = (m1_df["volume"] / m1_df["factor"]).round().astype("int64")
     return m1_df.drop(columns=["day", "factor"]).sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
 def _adjust_ohlc(df: pd.DataFrame, start_date: str | None) -> pd.DataFrame:
-    """共用邏輯：load_m3()/load_m5()/load_m3_std()/load_m5_std() 都是跟
-    load_m1() 一樣的「完整時間戳識別、OHLC乘上當日係數」模式，抽成共用函式
-    避免四份幾乎一樣的程式碼（load_m1() 沒有直接用這支，是因為它比這幾支
-    早寫、當時還沒抽出來，行為完全等價，不用特別去改）。"""
+    """共用邏輯：load_m3()/load_m5()/load_m3_std()/load_m5_std()/load_day() 都是
+    跟 load_m1() 一樣的「完整時間戳識別、OHLC乘上當日係數、volume除以當日係數」
+    模式，抽成共用函式避免好幾份幾乎一樣的程式碼（load_m1() 沒有直接用這支，
+    是因為它比這幾支早寫、當時還沒抽出來，行為完全等價，不用特別去改）。
+    volume 為什麼要除以 factor：見 load_m1() 的說明。"""
     if df.empty:
         return df
     df["day"] = df["date"].dt.strftime("%Y-%m-%d")
@@ -104,6 +114,8 @@ def _adjust_ohlc(df: pd.DataFrame, start_date: str | None) -> pd.DataFrame:
     df["factor"] = df["factor"].fillna(1.0)
     for col in ["open", "high", "low", "close"]:
         df[col] = (df[col] * df["factor"]).round(2).astype("float32")
+    if "volume" in df.columns:
+        df["volume"] = (df["volume"] / df["factor"]).round().astype("int64")
     return df.drop(columns=["day", "factor"]).sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
@@ -175,6 +187,7 @@ def load_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
     day_df["factor"] = day_df["factor"].fillna(1.0)
     for col in ["open", "high", "low", "close"]:
         day_df[col] = (day_df[col] * day_df["factor"]).round(2).astype("float32")
+    day_df["volume"] = (day_df["volume"] / day_df["factor"]).round().astype("int64")
     return day_df.drop(columns=["day", "factor"]).sort_values("date").reset_index(drop=True)
 
 
