@@ -24,7 +24,7 @@ if str(Path(__file__).parent.parent.parent.parent) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from data.query import load_m1
+from data.raw_query import load_m1
 from strategy.mkt.config import IDX_SYMBOL, TOP_N
 from strategy.mkt.features import add_atr5, add_ret_vs_idx, make_barrier_labels_3class, top_n_by_prev_day_volume
 from strategy.mkt.train import _prepare_data

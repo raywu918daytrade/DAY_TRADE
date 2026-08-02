@@ -16,9 +16,9 @@ FinMind API 封裝 — 下載歷史分K（TaiwanStockKBar），補齊 db/m1/ 更
 
 volume 單位：實測跟 db/m1 現有資料（Fugle 來源）逐分鐘完全一致（同一天同一支
 股票，兩邊每分鐘volume一模一樣），不需要轉換單位就能直接合併進 db/m1。
-（附註：db/m1 這欄跟 db/fugle_day 的 volume 不是同一個單位，db/fugle_day
-是「股」，db/m1 是「張」，這是既有資料的另一件事，跟這支檔案無關，不在這裡
-處理。）
+（附註：db/m1 這欄跟 db/d1（2026-08-03 從 db/fugle_day 改名而來）的 volume
+不是同一個單位，db/d1 是「股」，db/m1 是「張」，這是既有資料的另一件事，
+跟這支檔案無關，不在這裡處理。）
 
 用法（預設母體固定是 tick_universe.py 那400支，不用另外加旗標；真的要補
 全市場才需要 --all 選擇退出）：
@@ -569,10 +569,16 @@ def _save_empty_pairs(pairs: list[tuple[str, str]], year: int, month: int):
 def _month_universe(
     year: int, month: int, top_n_by_volume: int | None = None, stock_list: list[str] | None = None
 ) -> tuple[list[str], list[str]]:
-    """從 db/fugle_day/{year}_{month}.parquet 取得該月「實際交易日」，跟
+    """從 db/adjustment_day/{year}_{month}.parquet（2026-08-03 從 db/fugle_day
+    改名而來，這裡只用日期/成交量、不看價格基準）取得該月「實際交易日」，跟
     「要補的股票清單」——比用 fubon.subscribe_list.all_normal_stocks()（今天
     的候選股名單）準，那份名單是現在的，跟過去某個月實際有交易的股票對不上
     （例如當時還沒上市、或現在已下市的股票）。
+
+    ⚠️ 這裡刻意讀 db/adjustment_day 不是 db/d1——db/d1 從 2026-08-03 起只回補
+    固定的 400 支 tick_universe，「都不帶篩選參數」模式需要回傳「當月全部
+    有交易的股票」（含 400 支範圍以外的），只有 db/adjustment_day 還留著
+    縮小範圍之前的全市場歷史，db/d1 用在這裡會漏掉大部分股票。
 
     top_n_by_volume: 選填，只取當月「平均日成交量」最高的前N支股票，用來縮小
     範圍、減少請求數。
@@ -588,7 +594,7 @@ def _month_universe(
     """
     if top_n_by_volume and stock_list:
         raise ValueError("top_n_by_volume 跟 stock_list 不能同時指定")
-    path = _ROOT / f"db/fugle_day/{year}_{month:02d}.parquet"
+    path = _ROOT / f"db/adjustment_day/{year}_{month:02d}.parquet"
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在，無法確定 {year}-{month:02d} 的交易日")
     cols = ["stock_id", "date"] + (["volume"] if top_n_by_volume else [])

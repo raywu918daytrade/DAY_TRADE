@@ -13,7 +13,8 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 import pandas as pd
 
-from data.query import load_day, load_m1, load_m1_live
+from data.query import load_day, load_m1_live
+from data.raw_query import load_m1
 from strategy.orb.config import DEFAULT_TEST_DAYS
 from strategy.orb.features import (
     FEATURES,

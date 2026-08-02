@@ -51,7 +51,8 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from data.query import load_day, load_m1, load_m3, load_m3_std, load_m5, load_m5_std
+from data.query import load_day
+from data.raw_query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
 from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, TOP_N
 from strategy.mkt.features import (
     FEATURES,
@@ -76,7 +77,7 @@ _SOURCE_DIRS = [
     _ROOT / "db/m5",
     _ROOT / "db/m3_std",
     _ROOT / "db/m5_std",
-    _ROOT / "db/fugle_day",
+    _ROOT / "db/d1",  # 2026-08-03 從 db/fugle_day 改名而來
 ]
 
 

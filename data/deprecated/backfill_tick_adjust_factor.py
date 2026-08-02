@@ -1,4 +1,14 @@
 """
+⚠️ 已淘汰（2026-08-02）：這支只能一次補幾支指定股票（原本只補過0050/0056），
+且算 factor 的方法要比對 db/fugle_day「已還原」資料，還是依賴 Fugle 自己的
+還原邏輯。已被 data/backfill_day_raw_close.py 取代——那支一次性把全部 400 支
+tick_universe 的原始日收盤都存進 db/day_raw_close/，之後
+data/build_tick_adjust_factor.py 直接從原始日K本身的逐日跳空幅度偵測拆股/
+合股，不再需要跟任何「已還原」資料比對。保留這支只是留紀錄，不刪除，不要
+再呼叫。
+
+以下是原始說明：
+
 用 Fugle／富邦日K API 反推每支股票每天的除權息調整係數，把
 db/tick_adjust_factor/ 的涵蓋範圍往前延伸到 db/tick 開始有資料（目前約
 2025-08-01）之前——2026-08-01 發現，除權息事件如果發生在 db/tick 涵蓋範圍

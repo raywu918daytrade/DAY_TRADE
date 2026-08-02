@@ -23,7 +23,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from data.query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
+from data.raw_query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
 from strategy.vwap_dl.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, STD_MULT
 from strategy.vwap_ml.features import make_features
 

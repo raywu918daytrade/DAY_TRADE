@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
-from data.query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
+from data.raw_query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
 from strategy.cnn.config import (
     HOLD_BARS,
     IDX_SYMBOL,

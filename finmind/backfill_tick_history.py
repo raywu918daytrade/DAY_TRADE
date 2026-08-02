@@ -21,9 +21,9 @@ volume 單位（2026-07-29 實測驗證）：tick 的 volume（單筆成交量�
 db/m1 同一天同一支股票的分K volume加總幾乎完全一致（2330 2026-07-28：tick加總
 36220 vs m1加總36184，差距0.1%，來自盤後定盤交易的兩筆tick 13:30/14:30 沒有
 對應的分K），也就是 tick 的 volume 單位是「張」，跟 db/m1 相同、**不是**
-db/fugle_day 的「股」（db/fugle_day 同一天同一支股票的volume會是tick加總的
-約1000倍）——之後如果要拿 tick volume 跟 db/fugle_day 對比，要記得除以1000，
-不需要轉換的是拿去跟 db/m1 比。
+db/d1（2026-08-03 從 db/fugle_day 改名而來）的「股」（db/d1 同一天同一支
+股票的volume會是tick加總的約1000倍）——之後如果要拿 tick volume 跟 db/d1
+對比，要記得除以1000，不需要轉換的是拿去跟 db/m1 比。
 
 用法：
     python -m finmind.backfill_tick_history                      # 2025-08 補到 2026-07（預設）
@@ -88,10 +88,11 @@ def _month_range(start_ym: str, end_ym: str) -> list[tuple[int, int]]:
 
 
 def _tick_month_days(year: int, month: int) -> list[str]:
-    """只借 db/fugle_day 確認哪幾天有開盤（不取股票清單——tick backfill 的
-    股票清單是外部傳入的固定名單，不是這裡動態算的，見
-    m1_api.py::_month_universe() 的股票清單版本，這裡只要交易日）。"""
-    path = _ROOT / f"db/fugle_day/{year}_{month:02d}.parquet"
+    """只借 db/d1（2026-08-03 從 db/fugle_day 改名而來）確認哪幾天有開盤
+    （不取股票清單——tick backfill 的股票清單是外部傳入的固定名單，不是這裡
+    動態算的，見 m1_api.py::_month_universe() 的股票清單版本，這裡只要
+    交易日）。"""
+    path = _ROOT / f"db/d1/{year}_{month:02d}.parquet"
     if not path.exists():
         raise FileNotFoundError(f"{path} 不存在，無法確定 {year}-{month:02d} 的交易日")
     df = pd.read_parquet(path, columns=["date"])

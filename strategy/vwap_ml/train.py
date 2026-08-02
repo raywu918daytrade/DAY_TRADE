@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from data.query import load_m1, load_m3, load_m5
+from data.raw_query import load_m1, load_m3, load_m5
 from strategy.vwap_ml.config import ATR5_FILTER_THRESHOLD, MODEL_TYPE, STD_MULT
 from strategy.vwap_ml.features import FEATURES, make_features
 

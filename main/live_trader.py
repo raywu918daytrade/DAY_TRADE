@@ -290,7 +290,7 @@ _prev_close_cache: dict[str, tuple[str, float]] = {}  # {stock_id: (date_str, pr
 
 
 def _watchlist_prev_close(stock_id: str, date_str: str) -> float | None:
-    """前一交易日收盤價，一天只查一次本機 db/fugle_day/（不是每分鐘都重讀 parquet）。
+    """前一交易日收盤價，一天只查一次本機 db/d1/（不是每分鐘都重讀 parquet）。
     跟策略候選股的均量篩選/當沖資格判斷無關，0050 這種 ETF 不會進策略候選池，
     也要能查得到，所以直接查 data/query.py 的日K，不依賴 state.day。"""
     cached = _prev_close_cache.get(stock_id)

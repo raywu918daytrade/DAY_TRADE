@@ -2,7 +2,7 @@
 DataManager：統一三個交易時段的資料載入介面。
 
 Phase（時段）：
-    PRE_MARKET  盤前  — 載入 D1 日K + 均量過濾（本機 db/fugle_day/）
+    PRE_MARKET  盤前  — 載入 D1 日K + 均量過濾（本機 db/d1/）
     IN_MARKET   盤中  — M1 由 fubon/marketdata_ws.py 的富邦 WebSocket 推送，D1 已在盤前載好
     POST_MARKET 盤後  — 持續收 WebSocket 資料到收盤，D1 不變
 
@@ -28,7 +28,7 @@ def load_d1(stocks: set) -> tuple[pd.DataFrame, set]:
     """
     載入日K並做均量過濾，回傳 (day_df, filtered_stocks)。
 
-    目前固定讀本機 db/fugle_day/。
+    目前固定讀本機 db/d1/。
 
     盤前啟動和每日 06:00 refresh 都呼叫這一個函式。
     """

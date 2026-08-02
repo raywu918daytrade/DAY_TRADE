@@ -30,7 +30,8 @@ import pandas as pd
 if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from data.query import load_day, load_m1, load_m3, load_m5
+from data.query import load_day
+from data.raw_query import load_m1, load_m3, load_m5
 from data.resample import compute_m3, compute_m5
 from strategy.orb.config import (
     BREAKOUT_SEARCH_MINUTES,
@@ -45,12 +46,12 @@ _ROOT = Path(__file__).parent.parent.parent
 _M1_DIR = _ROOT / "db/m1"
 _M3_DIR = _ROOT / "db/m3"
 _M5_DIR = _ROOT / "db/m5"
-_DAY_DIR = _ROOT / "db/fugle_day"
+_DAY_DIR = _ROOT / "db/d1"  # 原始日K，2026-08-03 從 db/fugle_day 改名而來（維持這支訓練管線用原始資料的既有行為）
 _CACHE_DIR = _ROOT / "cache/m1_orb_features"
 _META_COLS = ["stock_id", "date", "hour", "target", "vol_ma20"]
 
 # 日K特徵最長回看窗口（ma_dev_20 用 rolling(20) + shift(1)），算某個月份的
-# 特徵時 db/fugle_day 要多抓這麼多天當緩衝，理由/數值跟 strategy/rally/
+# 特徵時 db/d1 要多抓這麼多天當緩衝，理由/數值跟 strategy/rally/
 # features.py 的 _DAY_LOOKBACK_CALENDAR_DAYS 一樣。
 _DAY_LOOKBACK_CALENDAR_DAYS = 45
 
@@ -61,7 +62,7 @@ _DAY_LOOKBACK_CALENDAR_DAYS = 45
 _M1_LOOKBACK_CALENDAR_DAYS = 20
 
 
-# ── Cache 管理（按月分區，跟 db/m1/db/m3/db/m5/db/fugle_day 同樣的按月分檔慣例）──
+# ── Cache 管理（按月分區，跟 db/m1/db/m3/db/m5/db/d1 同樣的按月分檔慣例）──
 #
 # 2026-07-22 從單一大檔案改成按月分區，理由跟 strategy/rally/features.py
 # 2026-07-21 做的同一個修改一樣：db/m1 因為 finmind.backfill_m1_history 正在

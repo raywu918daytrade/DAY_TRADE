@@ -1,31 +1,39 @@
 """
-日K 一次性歷史回補 — 補 db/fugle_day 缺的「更早以前」歷史，跟
+日K 一次性歷史回補 — 補 db/d1（原始）缺的「更早以前」歷史，跟
 data/day_data_loader.py 是分開的兩支：
     data/day_data_loader.py           日常用，每天增量補「今天」缺的那一小段
     data/backfill_day_history.py      一次性用，把候選股票缺的更早歷史一次補齊
 
+⚠️ 2026-08-03 改：`_download_day()`/`_download_day_fubon()`/`_save_day()`
+（從 data/day_data_loader.py 匯入、直接沿用）預設現在是原始價、寫入
+db/d1（不是以前的 db/fugle_day/完整還原）——這支腳本沒有另外傳
+`adjusted`/`base_dir` 參數，所以自動跟著變成回補 db/d1。如果要回補
+pattern 專用的 db/adjustment_day（完整還原），要另外呼叫
+`data.day_data_loader.update_adjustment_day()`，不是這支腳本的用途。
+
 動機（2026-07-15 發現）：update_day() 沒帶 start_date 時，是用全域「最後一筆
 存檔日期」當起點做增量——新加入候選清單的股票（例如某支 ETF 原本不在富邦
 isNormal 清單裡，後來才開始出現）永遠不會自動往前回補，只會從被發現的那天
-開始累積。實測 0050 這種大型ETF，db/fugle_day 只有 2026-05 之後的資料，
-2016~2026-04 完全沒有，要用這支腳本手動回補。
+開始累積。實測 0050 這種大型ETF，db/d1 只有近期的資料，2016~更早完全沒有，
+要用這支腳本手動回補。
 
-候選清單預設用 data/day_data_loader.py::_all_stocks()（今天的富邦可交易清單），
-所以只會抓「現在還在候選清單裡、但缺更早歷史」的股票——已經下市、不在今天
-清單裡的股票不在處理範圍內（這批通常在最早的一次性歷史匯入時就已經補過，
-現在只是找「新進榜但沒補到位」的漏網之魚，不是要重建整個歷史母體）。
+候選清單預設用 data/day_data_loader.py::_all_stocks()（目前的400支
+tick_universe），所以只會抓「現在還在候選清單裡、但缺更早歷史」的股票——
+已經下市、不在候選清單裡的股票不在處理範圍內（這批通常在最早的一次性歷史
+匯入時就已經補過，現在只是找「新進榜但沒補到位」的漏網之魚，不是要重建
+整個歷史母體）。
 
 核心下載/存檔邏輯沿用 data/day_data_loader.py 的 _download_day()/
 _download_day_fubon()/_save_day()，不重寫一份。
 
-續傳：每次執行前，先掃一次 db/fugle_day 現有資料，算出每支股票「目前最早的
+續傳：每次執行前，先掃一次 db/d1 現有資料，算出每支股票「目前最早的
 存檔日期」，只對「最早日期比 start_date 晚（或完全沒有資料）」的股票，補
 [start_date, 現有最早日期 - 1天]（完全沒資料時補到現在）這一段，已經補到
 start_date 或更早的股票會自動跳過——中途中斷、重新執行這支腳本，會自動只
 處理還沒補完的部分，不會重複下載。
 
 用法：
-    python -m data.backfill_day_history                      # 補到 2016-01-01（預設起點），今天候選清單裡缺的股票
+    python -m data.backfill_day_history                      # 補到 2016-01-01（預設起點），目前候選清單裡缺的股票
     python -m data.backfill_day_history 2016-01-01           # 指定起點
 """
 
@@ -57,13 +65,13 @@ def _ts_print(*args, **kwargs):
 
 _builtins.print = _ts_print
 
-_DEFAULT_START = "2016-01-01"  # db/fugle_day 現有歷史最早的月份附近
+_DEFAULT_START = "2016-01-01"  # db/d1 現有歷史最早的月份附近（沿用原本 db/fugle_day 的起點）
 
 
 def _earliest_dates() -> dict[str, str]:
-    """db/fugle_day 裡每支股票目前最早的存檔日期，一次掃描全部檔案（比逐支股票
+    """db/d1 裡每支股票目前最早的存檔日期，一次掃描全部檔案（比逐支股票
     各自查一次快很多）。股票沒出現過就不在這個 dict 裡。"""
-    day_dir = _ROOT / "db/fugle_day"
+    day_dir = _ROOT / "db/d1"
     if not day_dir.exists():
         return {}
     dataset = ds.dataset(str(day_dir), format="parquet")

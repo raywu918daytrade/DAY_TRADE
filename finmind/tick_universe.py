@@ -3,7 +3,7 @@
 存檔，之後 backfill_tick_history.py 每個月都讀同一份，不會因為某個月成交量
 排名變動就換掉補的股票。
 
-清單定義：db/fugle_day/2026_01.parquet ~ 2026_06.parquet 這6個月，4碼數字股票
+清單定義：db/adjustment_day/2026_01.parquet ~ 2026_06.parquet 這6個月，4碼數字股票
 依平均日成交量排序，取前399名，再強制併入 0050，共400檔。
 
 2026-07-30 發現：光是「4碼數字」（regex ^\\d{4}$）不夠，早期上市的ETF代號
@@ -21,7 +21,7 @@ db/tickers/tickers.parquet，凡是 stock_id 開頭"00"的，industry欄位都�
     python -m finmind.tick_universe   # 算一次、存到 db/tickers/tick_universe.parquet
 
 之後其他程式要讀這份固定清單，呼叫 load_tick_universe()，不要重新呼叫
-build_tick_universe()（那樣清單會因為之後又多了幾個月的 db/fugle_day 資料
+build_tick_universe()（那樣清單會因為之後又多了幾個月的 db/adjustment_day 資料
 而變動，違背「固定清單」的原意）。
 """
 
@@ -48,7 +48,7 @@ def build_tick_universe(
     top_n: int = _TOP_N,
     force_include: list[str] = _FORCE_INCLUDE,
 ) -> pd.DataFrame:
-    """讀 year_months 每個月的 db/fugle_day/{year}_{month}.parquet（只取
+    """讀 year_months 每個月的 db/adjustment_day/{year}_{month}.parquet（只取
     stock_id/date/volume 三欄，比照 m1_api._month_universe() 的做法），
     篩 4碼數字股票、排除"00"開頭的ETF代號（見上面模組docstring的說明，
     0050/0052/0056這種早期ETF代號剛好也是4碼，不能只靠regex ^\\d{4}$濾掉），
@@ -65,7 +65,7 @@ def build_tick_universe(
     """
     frames = []
     for year, month in year_months:
-        path = _ROOT / f"db/fugle_day/{year}_{month:02d}.parquet"
+        path = _ROOT / f"db/adjustment_day/{year}_{month:02d}.parquet"
         if not path.exists():
             raise FileNotFoundError(f"{path} 不存在，無法計算 tick universe")
         frames.append(pd.read_parquet(path, columns=["stock_id", "date", "volume"]))

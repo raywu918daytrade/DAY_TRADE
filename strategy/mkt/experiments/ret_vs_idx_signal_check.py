@@ -30,7 +30,7 @@ if str(Path(__file__).parent.parent.parent.parent) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from data.query import load_m1
+from data.raw_query import load_m1
 from strategy.mkt.config import IDX_SYMBOL
 from strategy.mkt.features import add_ret_vs_idx, top_n_by_prev_day_volume
 

@@ -22,7 +22,7 @@ import pandas as pd
 _ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from data.query import load_poc
+from data.adjustment_query import load_pattern_poc
 from pattern.breakdown_retest.detector import BreakdownRetestDetector
 from pattern.breakout_retest.detector import BreakoutRetestDetector
 from pattern.data_loader import get_all_stocks_candles
@@ -33,7 +33,7 @@ def analyze_overlap(pattern_type: str = "all", min_score: float = 60.0):
     print("正在載入全市場日 K 線與 db/poc_day/ 數據...", flush=True)
 
     candles = get_all_stocks_candles("day", limit=120)
-    pocs_df = load_poc()
+    pocs_df = load_pattern_poc()
 
     if pocs_df.empty:
         print("錯誤: db/poc_day/ 中無資料，請先執行 python -m data.build_poc")

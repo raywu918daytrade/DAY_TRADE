@@ -2,8 +2,23 @@
 日K 資料下載器（Fugle + 富邦 historical/candles）
 
 功能：
-    從 Fugle、富邦 REST API 下載股票日K，按月份分檔存入 db/fugle_day/。
-    flag 機制避免同一支股票在同一天重複下載。
+    從 Fugle、富邦 REST API 下載股票日K，按月份分檔存入 db/d1/（原始）或
+    db/adjustment_day/（完整還原，pattern 專用）。flag 機制避免同一支股票在
+    同一天重複下載。
+
+⚠️ 2026-08-03 改：拆成兩個獨立目的的下載函式，共用同一套抓取/重試/多執行緒
+邏輯（只差 adjusted 參數跟輸出目錄/flag檔）：
+    update_day()            → db/d1/（原始，不帶 adjusted，系統預設資料源，
+                               data/query.py::load_day() 查詢時再套拆股/合股
+                               factor）
+    update_adjustment_day() → db/adjustment_day/（完整還原，帶
+                               adjusted="true"，只給 pattern 系列
+                               [data/adjustment_query.py] 用，因為技術型態
+                               偵測需要除息缺口也被抹平，見
+                               data/adjustment_query.py 檔頭說明）
+這支檔案原本叫 fugle_day 的下載器，只下載完整還原版本；改動之前 db/fugle_day
+被兩種不同需求依賴（原始資料源 + pattern專用還原源），拆開之後 db/fugle_day
+整個目錄改名成 db/adjustment_day，原始下載改成新的 db/d1。
 
 Fugle + 富邦同時下載：
     待下載清單拆一半，Fugle 那一半沿用原本的 ThreadPoolExecutor（多執行緒併發，
@@ -16,10 +31,16 @@ Fugle + 富邦同時下載：
 
 主要函式：
     update_day(start_date, stocks, workers)
-        增量下載指定標的的日K，多執行緒並發，5 workers 約 5 分鐘下載 1500 支
+        增量下載指定標的的原始日K，多執行緒並發，5 workers 約 5 分鐘下載 1500 支
         （這是 Fugle 那一半的預估，富邦那一半另外跑）。
+    update_adjustment_day(start_date, stocks, workers)
+        同上，但抓完整還原版本，寫入 db/adjustment_day/。
 
-資料格式（db/fugle_day/YYYY_M.parquet）：
+⚠️ update_day() 跟 update_adjustment_day() 要依序執行、不能同時跑——兩者都會
+用到 Fugle 雙帳號 + 富邦三路併發下載，同時跑會互搶同一組 rate limit
+（見 scripts/update_daily.py）。
+
+資料格式（db/d1/YYYY_M.parquet、db/adjustment_day/YYYY_M.parquet）：
     stock_id, date(str), open, high, low, close(float32), volume(int64)
 """
 
@@ -41,7 +62,10 @@ load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
 
-_FLAG_PATH = _ROOT / "db/fugle_day_flags/day_flag.parquet"
+_D1_DIR = "db/d1"
+_ADJUSTMENT_DAY_DIR = "db/adjustment_day"
+_D1_FLAG_PATH = _ROOT / "db/d1_flags/day_flag.parquet"
+_ADJUSTMENT_DAY_FLAG_PATH = _ROOT / "db/adjustment_day_flags/day_flag.parquet"
 
 # _save_day()/_update_flag() 都是「讀舊檔→merge→寫回去」，Fugle 執行緒池、富邦
 # 執行緒同時呼叫會搶同一個檔案（比照 data/m1_data_loader.py 的作法），這裡直接
@@ -50,12 +74,11 @@ _save_lock = threading.Lock()
 _flag_lock = threading.Lock()
 
 
-def _day_file_path(date: str) -> Path:
-    """依資料日期決定存入哪個月份檔（月份補零，需與 push_day_to_hf.py 的
-    pd.Period.astype(str) 命名一致，否則同一個月會在本機/HF Hub 各自產生
-    一個檔名不同的分檔，觸發 schema 衝突）"""
+def _day_file_path(date: str, base_dir: str = _D1_DIR) -> Path:
+    """依資料日期決定存入哪個月份檔（月份補零，維持跟 db/m1 等其他資料夾一致
+    的命名慣例）"""
     ts = pd.Timestamp(date)
-    return _ROOT / f"db/fugle_day/{ts.year}_{ts.month:02d}.parquet"
+    return _ROOT / f"{base_dir}/{ts.year}_{ts.month:02d}.parquet"
 
 
 def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
@@ -76,19 +99,21 @@ def _atomic_to_parquet(df: pd.DataFrame, file_path: str, **kwargs):
         raise
 
 
-def _fetch_year(stock_id: str, from_date: str, to_date: str, token: str = None) -> pd.DataFrame:
+def _fetch_year(stock_id: str, from_date: str, to_date: str, token: str = None, adjusted: bool = False) -> pd.DataFrame:
     """單次請求（區間 < 1 年）。404 代表這支股票在這段區間還沒有資料（例如
     尚未上市／尚未開始交易），回傳空 DataFrame，不當例外處理——2026-07-15
     實測：對現在才被列入候選清單、但更早以前還沒上市的股票回補歷史時很常見
     （例如某支股票2016年404、2023年正常有資料），如果讓它往上拋例外，
     _download_day() 的年度迴圈會被中斷，之後年份（明明有資料）也不會再嘗試，
     整支股票這次直接算失敗。例外只保留給真正的請求失敗（限流、逾時、其他
-    錯誤）。"""
-    r = fugle_api.historical_candles(
-        stock_id,
-        token=token,
-        **{"from": from_date, "to": to_date, "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"},
-    )
+    錯誤）。
+
+    adjusted：預設 False（原始價，給 db/d1 用）；update_adjustment_day() 呼叫
+    時帶 True，跟 Fugle 要完整還原版本（給 db/adjustment_day / pattern 用）。"""
+    params = {"from": from_date, "to": to_date, "fields": "open,high,low,close,volume", "sort": "asc"}
+    if adjusted:
+        params["adjusted"] = "true"
+    r = fugle_api.historical_candles(stock_id, token=token, **params)
     if r.status_code == 404:
         return pd.DataFrame()
     r.raise_for_status()
@@ -101,20 +126,23 @@ def _fetch_year(stock_id: str, from_date: str, to_date: str, token: str = None) 
     return df
 
 
-def _download_day(stock_id: str, start_date: str, end_date: str | None = None, token: str = None) -> pd.DataFrame:
+def _download_day(
+    stock_id: str, start_date: str, end_date: str | None = None, token: str = None, adjusted: bool = False
+) -> pd.DataFrame:
     """自動切割成年度區間（Fugle 限制每次 < 1 年）。end_date 選填，預設到今天；
     data/backfill_day_history.py 回補歷史缺口時會指定成「現有資料最早日期的
     前一天」，避免重複下載已經有的部分。
 
     token：不帶用預設 FUGLE 帳號，第二組 Fugle 執行緒池（_update_day_fugle2）
-    會傳入 fugle_api.TOKEN_DAYTRADE 走另一組獨立 rate limit。"""
+    會傳入 fugle_api.TOKEN_DAYTRADE 走另一組獨立 rate limit。
+    adjusted：說明同 _fetch_year()。"""
     now = datetime.now(_TW)
     end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else now.date()
     cur = datetime.strptime(start_date, "%Y-%m-%d").date()
     chunks = []
     while cur <= end:
         chunk_end = min(cur.replace(year=cur.year + 1) - timedelta(days=1), end)
-        df = _fetch_year(stock_id, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"), token=token)
+        df = _fetch_year(stock_id, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"), token=token, adjusted=adjusted)
         if not df.empty:
             chunks.append(df)
         cur = chunk_end + timedelta(days=1)
@@ -123,22 +151,21 @@ def _download_day(stock_id: str, start_date: str, end_date: str | None = None, t
     return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
-def _fetch_year_fubon(sdk, stock_id: str, from_date: str, to_date: str) -> pd.DataFrame:
+def _fetch_year_fubon(sdk, stock_id: str, from_date: str, to_date: str, adjusted: bool = False) -> pd.DataFrame:
     """單次請求（區間 < 1 年），富邦 historical/candles 不帶 timeframe 就是日K，
     from/to 用法跟 Fugle 一致（見 fubon/fubon_api.py::historical_candles()）。
 
     這支股票在這段區間還沒有資料時（例如尚未上市），把 SDK 拋出的例外當成
     「這段沒資料」處理、回傳空 DataFrame，不往上拋——理由同 _fetch_year() 的
     說明，避免中斷 _download_day_fubon() 的年度迴圈，讓後面明明有資料的年份
-    也抓不到。"""
+    也抓不到。adjusted：說明同 _fetch_year()。"""
     from fubon import fubon_api as trade_api
 
+    params = {"from": from_date, "to": to_date, "fields": "open,high,low,close,volume", "sort": "asc"}
+    if adjusted:
+        params["adjusted"] = "true"
     try:
-        bars = trade_api.historical_candles(
-            sdk,
-            stock_id,
-            **{"from": from_date, "to": to_date, "fields": "open,high,low,close,volume", "sort": "asc", "adjusted": "true"},
-        )
+        bars = trade_api.historical_candles(sdk, stock_id, **params)
     except Exception as e:
         print(f"    {stock_id} {from_date}~{to_date} 富邦查詢失敗（視為這段沒資料）: {e}")
         return pd.DataFrame()
@@ -150,7 +177,7 @@ def _fetch_year_fubon(sdk, stock_id: str, from_date: str, to_date: str) -> pd.Da
     return df
 
 
-def _download_day_fubon(sdk, stock_id: str, start_date: str, end_date: str | None = None) -> pd.DataFrame:
+def _download_day_fubon(sdk, stock_id: str, start_date: str, end_date: str | None = None, adjusted: bool = False) -> pd.DataFrame:
     """自動切割成年度區間，比照 _download_day()。end_date 選填，用法同 _download_day()。"""
     now = datetime.now(_TW)
     end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else now.date()
@@ -158,7 +185,7 @@ def _download_day_fubon(sdk, stock_id: str, start_date: str, end_date: str | Non
     chunks = []
     while cur <= end:
         chunk_end = min(cur.replace(year=cur.year + 1) - timedelta(days=1), end)
-        df = _fetch_year_fubon(sdk, stock_id, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"))
+        df = _fetch_year_fubon(sdk, stock_id, cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d"), adjusted=adjusted)
         if not df.empty:
             chunks.append(df)
         cur = chunk_end + timedelta(days=1)
@@ -167,7 +194,7 @@ def _download_day_fubon(sdk, stock_id: str, start_date: str, end_date: str | Non
     return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
-def _save_day(new_df: pd.DataFrame):
+def _save_day(new_df: pd.DataFrame, base_dir: str = _D1_DIR):
     new_df = new_df[["stock_id", "date", "open", "high", "low", "close", "volume"]].copy()
     for col in ["open", "high", "low", "close"]:
         new_df[col] = new_df[col].astype("float32")
@@ -175,7 +202,7 @@ def _save_day(new_df: pd.DataFrame):
 
     with _save_lock:
         for month, group in new_df.groupby(pd.to_datetime(new_df["date"]).dt.to_period("M")):
-            file_path = _day_file_path(str(month.to_timestamp().date()))
+            file_path = _day_file_path(str(month.to_timestamp().date()), base_dir=base_dir)
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             if os.path.exists(file_path):
                 for attempt in range(3):
@@ -193,17 +220,17 @@ def _save_day(new_df: pd.DataFrame):
             _atomic_to_parquet(group, file_path, index=False, compression="zstd")
 
 
-def _update_flag(stock_id: str, date_str: str):
+def _update_flag(stock_id: str, date_str: str, flag_path: Path = _D1_FLAG_PATH):
     with _flag_lock:
         new_row = pd.DataFrame([{"stock_id": stock_id, "date": date_str}])
-        if os.path.exists(_FLAG_PATH):
-            df = pd.read_parquet(_FLAG_PATH)
+        if os.path.exists(flag_path):
+            df = pd.read_parquet(flag_path)
             df = pd.concat([df, new_row], ignore_index=True)
             df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
         else:
             df = new_row
-        os.makedirs(os.path.dirname(_FLAG_PATH), exist_ok=True)
-        _atomic_to_parquet(df, _FLAG_PATH, index=False)
+        os.makedirs(os.path.dirname(flag_path), exist_ok=True)
+        _atomic_to_parquet(df, flag_path, index=False)
 
 
 def _all_stocks() -> list:
@@ -216,19 +243,19 @@ def _all_stocks() -> list:
     return load_tick_universe()
 
 
-def _get_done_stocks(date_str: str) -> set:
-    if not os.path.exists(_FLAG_PATH):
+def _get_done_stocks(date_str: str, flag_path: Path = _D1_FLAG_PATH) -> set:
+    if not os.path.exists(flag_path):
         return set()
-    df = pd.read_parquet(_FLAG_PATH)
+    df = pd.read_parquet(flag_path)
     return set(df[df["date"] == date_str]["stock_id"].tolist())
 
 
-def _last_stored_dates() -> dict[str, str]:
-    """db/fugle_day/ 裡每支股票目前最新的存檔日期，一次掃描全部檔案（比逐支
+def _last_stored_dates(base_dir: str = _D1_DIR) -> dict[str, str]:
+    """base_dir 裡每支股票目前最新的存檔日期，一次掃描全部檔案（比逐支
     股票各自查一次快很多）。比照 data/backfill_day_history.py::_earliest_dates()
     的做法，但這裡要的是每支股票的「最新」日期，不是「最早」。股票沒出現過
     就不在這個 dict 裡（呼叫端要自己 fallback 一個起始日期）。"""
-    day_dir = _ROOT / "db/fugle_day"
+    day_dir = _ROOT / base_dir
     if not day_dir.exists():
         return {}
     dataset = ds.dataset(str(day_dir), format="parquet")
@@ -239,12 +266,20 @@ def _last_stored_dates() -> dict[str, str]:
 
 
 def _update_day_fugle(
-    stocks: list, stock_start_dates: dict[str, str], date_str: str, workers: int, token: str = None, label: str = "Fugle"
+    stocks: list,
+    stock_start_dates: dict[str, str],
+    date_str: str,
+    workers: int,
+    token: str = None,
+    label: str = "Fugle",
+    adjusted: bool = False,
+    base_dir: str = _D1_DIR,
+    flag_path: Path = _D1_FLAG_PATH,
 ):
     """Fugle 那一份：多執行緒併發，429 交給 Retry-After 被動重試
     （見 _fetch_year()），workers=5 約 5 分鐘下載 1500 支。
 
-    token/label：讓 update_day() 可以開兩組 Fugle 執行緒池各用一組帳號
+    token/label：讓呼叫端可以開兩組 Fugle 執行緒池各用一組帳號
     （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。
 
     stock_start_dates：逐支股票各自的起始日期（見 update_day() 的說明，
@@ -256,6 +291,10 @@ def _update_day_fugle(
     空結果可能是暫時性問題（API異常、限流），標記完成的話當天重跑也不會
     再重試，之前 3055/4707/6174/2466 這幾支卡住好幾週就是類似情況。真的
     確認有資料才標記完成，避免同一天內對已確認有結果的股票重複打API。
+
+    adjusted/base_dir/flag_path：2026-08-03加，讓 update_day()（原始，
+    db/d1）跟 update_adjustment_day()（完整還原，db/adjustment_day）共用
+    這套下載邏輯。
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -265,10 +304,10 @@ def _update_day_fugle(
         nonlocal completed
         time.sleep(0.2)  # 每執行緒小延遲，5 執行緒合計 ~1 req/s
         try:
-            df = _download_day(stock_id, stock_start_dates[stock_id], token=token)
+            df = _download_day(stock_id, stock_start_dates[stock_id], token=token, adjusted=adjusted)
             if not df.empty:
-                _save_day(df)
-                _update_flag(stock_id, date_str)
+                _save_day(df, base_dir=base_dir)
+                _update_flag(stock_id, date_str, flag_path=flag_path)
             return stock_id, len(df), None
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
@@ -288,17 +327,26 @@ def _update_day_fugle(
                 print(f"  [{label} {completed}/{len(stocks)}] 進度更新")
 
 
-def _update_day_fubon(stocks: list, stock_start_dates: dict[str, str], date_str: str, sdk):
+def _update_day_fubon(
+    stocks: list,
+    stock_start_dates: dict[str, str],
+    date_str: str,
+    sdk,
+    adjusted: bool = False,
+    base_dir: str = _D1_DIR,
+    flag_path: Path = _D1_FLAG_PATH,
+):
     """富邦那一半：單一執行緒依序下載，1.05秒/支，維持在 60 req/min 以內留緩衝
     （比照 data/m1_data_loader.py 的作法）。
 
-    stock_start_dates/空結果不標記完成：說明同 _update_day_fugle()。"""
+    stock_start_dates/空結果不標記完成：說明同 _update_day_fugle()。
+    adjusted/base_dir/flag_path：說明同 _update_day_fugle()。"""
     for i, stock_id in enumerate(stocks, 1):
         try:
-            df = _download_day_fubon(sdk, stock_id, stock_start_dates[stock_id])
+            df = _download_day_fubon(sdk, stock_id, stock_start_dates[stock_id], adjusted=adjusted)
             if not df.empty:
-                _save_day(df)
-                _update_flag(stock_id, date_str)
+                _save_day(df, base_dir=base_dir)
+                _update_flag(stock_id, date_str, flag_path=flag_path)
             if i % 100 == 0 or i == len(stocks):
                 print(f"  [富邦 {i}/{len(stocks)}] 進度更新")
         except Exception as e:
@@ -306,24 +354,16 @@ def _update_day_fubon(stocks: list, stock_start_dates: dict[str, str], date_str:
         time.sleep(1.05)
 
 
-def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
-    """
-    日線，flag 避免同日重複下載。待下載清單拆三份，Fugle 兩組帳號
-    （FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦一份同時下載。
-    workers: 每組 Fugle 執行緒池的並發數（預設 5，約 5 分鐘下載 1500 支）
-
-    start_date：選填，明確指定的話對這次待下載的股票全部套用同一個起始日期
-    （例如手動重跑想強制指定範圍）。**不指定（預設，日常排程走這條）時，
-    2026-07-26 改成逐支查詢各自的起始日期**（每支股票用「db/fugle_day 裡
-    這支自己最新存到哪」當起點，沒資料的股票才 fallback 到這個月1號）——
-    改之前是全部股票共用同一個全域最新日期，一旦某支股票落後（例如某次
-    API暫時異常沒抓到），之後每天都只會查「今天附近」這一小段，永遠問不到
-    這支自己真正缺的那一大段，實測 3055/4707/6174/2466 這4支就是卡在這個
-    問題，最新資料停在好幾週前不會自動追上。比照
-    data/backfill_day_history.py::_earliest_dates() 逐支查詢的做法（那支
-    是查最早日期補「更早的歷史」，這裡查最新日期補「跟上今天」，方向不同
-    但用同一套思路）。
-    """
+def _update_day_generic(
+    start_date: str | None,
+    stocks: list | None,
+    workers: int,
+    adjusted: bool,
+    base_dir: str,
+    flag_path: Path,
+):
+    """update_day()/update_adjustment_day() 共用的核心邏輯，只差 adjusted
+    參數跟輸出目錄/flag檔——見這兩支函式各自的 docstring。"""
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
     if not fugle_api.TOKEN_DAYTRADE:
@@ -331,17 +371,17 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
 
     now = datetime.now(_TW)
     date_str = now.strftime("%Y-%m-%d")
-    os.makedirs(_ROOT / "db/fugle_day", exist_ok=True)
+    os.makedirs(_ROOT / base_dir, exist_ok=True)
 
     candidates = _all_stocks() if stocks is None else stocks
-    done = _get_done_stocks(date_str)
+    done = _get_done_stocks(date_str, flag_path=flag_path)
     wait_stocks = [s for s in candidates if s not in done]
 
     if start_date is not None:
         stock_start_dates = {sid: start_date for sid in wait_stocks}
         start_date_desc = start_date
     else:
-        last_dates = _last_stored_dates()
+        last_dates = _last_stored_dates(base_dir=base_dir)
         default_start = f"{now.year}-{now.month:02d}-01"
         stock_start_dates = {sid: last_dates.get(sid, default_start) for sid in wait_stocks}
         behind = sorted(set(stock_start_dates.values()))
@@ -352,7 +392,7 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     fugle_half2 = wait_stocks[third : 2 * third]
     fubon_half = wait_stocks[2 * third :]
     print(
-        f"start_date={start_date_desc}，Fugle {len(fugle_half1)} 支、"
+        f"[{base_dir}] start_date={start_date_desc}，Fugle {len(fugle_half1)} 支、"
         f"Fugle(daytrade) {len(fugle_half2)} 支（各 {workers} 並發）、"
         f"富邦 {len(fubon_half)} 支，同時下載..."
     )
@@ -362,12 +402,21 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)
     try:
-        t_fugle1 = threading.Thread(target=_update_day_fugle, args=(fugle_half1, stock_start_dates, date_str, workers))
+        t_fugle1 = threading.Thread(
+            target=_update_day_fugle,
+            args=(fugle_half1, stock_start_dates, date_str, workers),
+            kwargs={"adjusted": adjusted, "base_dir": base_dir, "flag_path": flag_path},
+        )
         t_fugle2 = threading.Thread(
             target=_update_day_fugle,
             args=(fugle_half2, stock_start_dates, date_str, workers, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+            kwargs={"adjusted": adjusted, "base_dir": base_dir, "flag_path": flag_path},
         )
-        t_fubon = threading.Thread(target=_update_day_fubon, args=(fubon_half, stock_start_dates, date_str, sdk))
+        t_fubon = threading.Thread(
+            target=_update_day_fubon,
+            args=(fubon_half, stock_start_dates, date_str, sdk),
+            kwargs={"adjusted": adjusted, "base_dir": base_dir, "flag_path": flag_path},
+        )
         t_fugle1.start()
         t_fugle2.start()
         t_fubon.start()
@@ -377,7 +426,46 @@ def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
     finally:
         trade_api.logout(sdk)
 
-    print("日K 下載完成")
+    print(f"[{base_dir}] 下載完成")
+
+
+def update_day(start_date: str = None, stocks: list = None, workers: int = 5):
+    """
+    原始日線（不還原權息），寫入 db/d1/，flag 避免同日重複下載。待下載清單拆
+    三份，Fugle 兩組帳號（FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦
+    一份同時下載。workers: 每組 Fugle 執行緒池的並發數（預設 5，約 5 分鐘
+    下載 1500 支）
+
+    start_date：選填，明確指定的話對這次待下載的股票全部套用同一個起始日期
+    （例如手動重跑想強制指定範圍）。**不指定（預設，日常排程走這條）時，
+    2026-07-26 改成逐支查詢各自的起始日期**（每支股票用「db/d1 裡這支自己
+    最新存到哪」當起點，沒資料的股票才 fallback 到這個月1號）——改之前是
+    全部股票共用同一個全域最新日期，一旦某支股票落後（例如某次 API暫時異常
+    沒抓到），之後每天都只會查「今天附近」這一小段，永遠問不到這支自己真正
+    缺的那一大段，實測 3055/4707/6174/2466 這4支就是卡在這個問題，最新資料
+    停在好幾週前不會自動追上。比照 data/backfill_day_history.py 逐支查詢的
+    做法（那支是查最早日期補「更早的歷史」，這裡查最新日期補「跟上今天」，
+    方向不同但用同一套思路）。
+
+    ⚠️ 跟 update_adjustment_day() 要依序執行、不能同時跑，見檔頭說明。
+    """
+    _update_day_generic(start_date, stocks, workers, adjusted=False, base_dir=_D1_DIR, flag_path=_D1_FLAG_PATH)
+
+
+def update_adjustment_day(start_date: str = None, stocks: list = None, workers: int = 5):
+    """
+    完整還原日線（Fugle adjusted="true"，含拆股/合股+一般除權息），寫入
+    db/adjustment_day/，只給 pattern 系列（data/adjustment_query.py）用，
+    理由見 data/adjustment_query.py 檔頭說明（型態偵測需要除息缺口也被抹平，
+    否則會誤判轉折點，2026-08-03 用 1101 除息實測過影響幅度足以跨過偵測器
+    門檻）。用法/參數同 update_day()。
+
+    ⚠️ 跟 update_day() 要依序執行、不能同時跑（兩者都用 Fugle雙帳號+富邦三路
+    併發下載，同時跑會互搶同一組 rate limit），見 scripts/update_daily.py。
+    """
+    _update_day_generic(
+        start_date, stocks, workers, adjusted=True, base_dir=_ADJUSTMENT_DAY_DIR, flag_path=_ADJUSTMENT_DAY_FLAG_PATH
+    )
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ if str(Path(__file__).parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backtest.intraday_backtest import intraday_backtest
-from data.query import load_m1
+from data.raw_query import load_m1
 
 _ROOT = Path(__file__).parent
 

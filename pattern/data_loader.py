@@ -5,16 +5,16 @@ K線資料載入器 (Data Loader for Pattern Detection)
 - "1m"  : 1 分鐘 K 線 (讀 db/m1/ 或 db/m1_live/)
 - "3m"  : 3 分鐘標準獨立 K 線 (讀 db/m3_std/ 或由 1m resample)
 - "5m"  : 5 分鐘標準獨立 K 線 (讀 db/m5_std/ 或由 1m resample)
-- "day" : 日 K 線 (讀 db/fugle_day/)
+- "day" : 日 K 線 (讀 db/adjustment_day/)
 
-價格基準（2026-08-01加）：db/m1（連帶 db/m3_std/db/m5_std，都是從 db/m1 聚合
-出來的）存的是原始（未還原權息）價格，db/fugle_day 是還原後的（見
-data/m1_data_loader.py 頂部說明）。這支檔案的 1m/3m/5m 分支讀完原始資料後，
-都會用 _apply_adjust_factor() join db/tick_adjust_factor 換算成還原後價格，
-確保回傳的K線價格基準跟 day timeframe、以及 pattern_api.py 疊加的 POC/
-volume_profile（load_poc_adjusted()/load_volume_profile_adjusted()）一致，
-不會重演K線vs籌碼資料基準對不上的同一種bug。db/m1_live（當天即時資料）不用
-調整——「今天」相對於自己必然是同一個基準，raw=adjusted。
+價格基準（2026-08-01加，2026-08-03改）：pattern 系列是系統裡唯一需要「完整
+還原（含一般除權息）」基準的地方——除息造成的真實跳空會讓型態偵測的轉折點
+判斷誤判（實測數字見 data/adjustment_query.py 檔頭說明），跟系統預設的
+「只還原拆股/合股」基準（data/query.py）不一樣。這支檔案不再直接戳
+db/m1／db/fugle_day 路徑，統一透過 data/raw_query.py（讀原始資料）+
+data/adjustment_query.py（套用 pattern 專用完整還原係數）取得資料，
+不自己維護一套 factor 換算邏輯。db/m1_live（當天即時資料）不用調整——
+「今天」相對於自己必然是同一個基準，raw=adjusted。
 """
 
 from pathlib import Path
@@ -22,23 +22,24 @@ from typing import Dict, Optional
 import pandas as pd
 import pyarrow.dataset as ds
 
-from data.query import _load_adjust_factor
+from data import raw_query
+from data.adjustment_query import load_pattern_day, load_pattern_day_by_stock, _load_adjustment_factor
 from data.resample import compute_m3_std, compute_m5_std
 
 _ROOT = Path(__file__).parent.parent
 
 
-def _apply_adjust_factor(df: pd.DataFrame, stock_id: Optional[str] = None) -> pd.DataFrame:
-    """把 df 的 open/high/low/close 換算成還原權息後價格。df 需有 stock_id、
-    date（datetime）欄位；stock_id 參數選填，單一股票查詢時帶入可以讓
-    _load_adjust_factor() 走 pyarrow filter pushdown，不用載入其他股票的
+def _apply_pattern_adjust_factor(df: pd.DataFrame, stock_id: Optional[str] = None) -> pd.DataFrame:
+    """把 df 的 open/high/low/close 換算成 pattern 專用完整還原後價格。df 需有
+    stock_id、date（datetime）欄位；stock_id 參數選填，單一股票查詢時帶入可以
+    讓 _load_adjustment_factor() 走 pyarrow filter pushdown，不用載入其他股票的
     factor。"""
     if df.empty:
         return df
     df = df.copy()
     df["_day"] = df["date"].dt.strftime("%Y-%m-%d")
     start = df["_day"].min()
-    factor_df = _load_adjust_factor(stock_id, None, start)
+    factor_df = _load_adjustment_factor(stock_id, None, start)
     if factor_df.empty:
         return df.drop(columns=["_day"])
     df = df.merge(
@@ -77,20 +78,11 @@ def get_stock_candles(
         except Exception:
             limit = 120
     if timeframe == "day":
-        dir_path = _ROOT / "db/fugle_day"
-        if not dir_path.exists():
-            return pd.DataFrame()
-        dataset = ds.dataset(str(dir_path), format="parquet")
-        filt = ds.field("stock_id") == stock_id
+        df = load_pattern_day_by_stock(stock_id, date=None)
+        if df.empty:
+            return df
         if date:
-            filt = filt & (ds.field("date") <= f"{date} 23:59:59")
-        table = dataset.to_table(filter=filt)
-        if table.num_rows == 0:
-            return pd.DataFrame()
-        df = table.to_pandas()
-        df["date"] = pd.to_datetime(df["date"], format="mixed")
-        df.drop_duplicates(subset=["date"], keep="last", inplace=True)
-        df = df.sort_values("date").reset_index(drop=True)
+            df = df[df["date"] <= f"{date} 23:59:59"]
         if limit and len(df) > limit:
             df = df.iloc[-limit:].reset_index(drop=True)
         return df
@@ -109,10 +101,10 @@ def get_stock_candles(
                         df_live = df_live.iloc[-limit:].reset_index(drop=True)
                     return df_live
 
-        dir_path = _ROOT / "db/m1"
-        if not dir_path.exists():
+        dataset_dir = _ROOT / "db/m1"
+        if not dataset_dir.exists():
             return pd.DataFrame()
-        dataset = ds.dataset(str(dir_path), format="parquet")
+        dataset = ds.dataset(str(dataset_dir), format="parquet")
         filt = ds.field("stock_id") == stock_id
         if date:
             filt = filt & (ds.field("date") <= f"{date} 23:59:59")
@@ -123,7 +115,7 @@ def get_stock_candles(
         df["date"] = pd.to_datetime(df["date"], format="mixed")
         df.drop_duplicates(subset=["date"], keep="last", inplace=True)
         df = df.sort_values("date").reset_index(drop=True)
-        df = _apply_adjust_factor(df, stock_id=stock_id)
+        df = _apply_pattern_adjust_factor(df, stock_id=stock_id)
         if limit and len(df) > limit:
             df = df.iloc[-limit:].reset_index(drop=True)
         return df
@@ -141,7 +133,7 @@ def get_stock_candles(
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 df.drop_duplicates(subset=["date"], keep="last", inplace=True)
                 df = df.sort_values("date").reset_index(drop=True)
-                df = _apply_adjust_factor(df, stock_id=stock_id)
+                df = _apply_pattern_adjust_factor(df, stock_id=stock_id)
                 if limit and len(df) > limit:
                     df = df.iloc[-limit:].reset_index(drop=True)
                 return df
@@ -178,20 +170,11 @@ def get_all_stocks_candles(
         except Exception:
             limit = 120
     if timeframe == "day":
-        dir_path = _ROOT / "db/fugle_day"
-        if not dir_path.exists():
-            return {}
-        # 僅讀最近幾個月以優化載入速度 (包含足夠歷史檔以確保裁切出 limit 根)
         ref_date = date if (date and isinstance(date, str)) else "today"
         cutoff = start_date or (pd.Timestamp(ref_date) - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
-        cutoff_file = pd.Timestamp(cutoff).strftime("%Y_%m")
-        files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet" and f.stem >= cutoff_file)
-        if not files:
-            files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")[-2:]
-        if not files:
+        df = load_pattern_day(start_date=cutoff)
+        if df.empty:
             return {}
-        df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
-        df["date"] = pd.to_datetime(df["date"], format="mixed")
         if date and isinstance(date, str):
             df = df[df["date"] <= f"{date} 23:59:59"]
 
@@ -213,7 +196,7 @@ def get_all_stocks_candles(
                 df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 df = df[df["date"] <= f"{date} 23:59:59"]
-                df = _apply_adjust_factor(df)
+                df = _apply_pattern_adjust_factor(df)
         else:
             dir_path = _ROOT / "db/m1"
             files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")[-1:]
@@ -221,7 +204,7 @@ def get_all_stocks_candles(
                 return {}
             df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
             df["date"] = pd.to_datetime(df["date"], format="mixed")
-            df = _apply_adjust_factor(df)
+            df = _apply_pattern_adjust_factor(df)
 
     elif timeframe in ("3m", "5m"):
         std_dir = _ROOT / f"db/{timeframe}_std"
@@ -235,7 +218,7 @@ def get_all_stocks_candles(
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 if date:
                     df = df[df["date"] <= f"{date} 23:59:59"]
-                df = _apply_adjust_factor(df)
+                df = _apply_pattern_adjust_factor(df)
             else:
                 m1_candles = get_all_stocks_candles("1m", date=date, limit=limit * 5)
                 res = {}
@@ -278,26 +261,16 @@ def get_latest_candle_timestamp(timeframe: str = "day", date: Optional[str] = No
 
 
 def get_stocks_10d_avg_vol_lots(date: Optional[str] = None) -> Dict[str, float]:
-    """從 db/fugle_day/ 計算全市場各股票近 10 個交易日的平均成交量 (單位: 張 = 1000 股)。
+    """從 db/adjustment_day/ 計算全市場各股票近 10 個交易日的平均成交量 (單位: 張 = 1000 股)。
 
     Returns:
         Dict[stock_id, float] (例如 {"2330": 28450.5})
     """
-    dir_path = _ROOT / "db/fugle_day"
-    if not dir_path.exists():
-        return {}
-
     ref_date = date if (date and isinstance(date, str)) else "today"
     cutoff = (pd.Timestamp(ref_date) - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
-    cutoff_file = pd.Timestamp(cutoff).strftime("%Y_%m")
-    files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet" and f.stem >= cutoff_file)
-    if not files:
-        files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")[-2:]
-    if not files:
+    df = load_pattern_day(start_date=cutoff)
+    if df.empty:
         return {}
-
-    df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
-    df["date"] = pd.to_datetime(df["date"], format="mixed")
     if date and isinstance(date, str):
         df = df[df["date"] <= f"{date} 23:59:59"]
 
@@ -309,5 +282,3 @@ def get_stocks_10d_avg_vol_lots(date: Optional[str] = None) -> Dict[str, float]:
             avg_vols[str(sid)] = round(avg_shares / 1000.0, 1)
 
     return avg_vols
-
-

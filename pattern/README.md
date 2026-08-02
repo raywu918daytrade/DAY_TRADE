@@ -262,7 +262,7 @@ pattern/
   ```
 
 ### 2. `GET /api/pattern/scan`
-- **用途**：全市場型態選股過濾（支援多型態與全型態一次掃描）。
+- **用途**：型態選股過濾（支援多型態與全型態一次掃描）。母體固定為 `db/tickers/tick_universe.parquet` 約 400 檔股票。
 - **查詢參數**：
   - `pattern_type` (str): 型態種類，支援 3 種傳參方式：
     1. **單一型態**：`triangle`
@@ -272,15 +272,15 @@ pattern/
   - `date` (str, 選填): 基準日期 `YYYY-MM-DD`（預設最新交易日）。
   - `min_score` (float): 最低信心分數門檻，預設 `60.0`。
   - `min_vol_lots` (float, 選填): **日 K 10日均量過濾門檻 (張)**，預設 `1000.0` 張（設為 0 不限制）。
-  - `only_tick_universe` (bool, 選填): **是否只過濾具備 Tick / Volume Profile / POC 資料的 400 檔股票**，預設 `false`。
   - `limit` (int): K 線視窗根數，預設 `120` 根。
-- **回傳內容**：符合條件的股票代號清單，包含 `pattern_types` (已選型態陣列)、`only_tick_universe` 與 `results` 平舖陣列。每筆匹配結果包含 `in_tick_universe` 布林標籤 (標示是否屬 400 檔逐筆成交個股)。若同一股票符合多個型態，會保留各自獨立的型態匹配項目，並按信心分數全域遞減排序。
+- **回傳內容**：符合條件的股票清單，包含 `pattern_types` 與 `results` 平舖陣列。每筆匹配結果包含 `stock_name` / `name`（股票中文名稱，例如 `"台積電"`）與 `in_tick_universe: true`。若同一股票符合多個型態，會保留各自獨立的型態匹配項目，並按信心分數全域遞減排序。
 
 ### 3. `GET /api/pattern/{stock_id}/detail`
 - **用途**：取得單一股票的 K 線歷史數據、型態繪圖座標、當日 Volume Profile 成交量分布與 POC / VAH / VAL 數據。
 - **查詢參數**：`pattern_type`, `timeframe`, `date`, `limit`
 - **回傳內容**：
   - `stock_id`: 股票代號（例如 `"2330"`）。
+  - `stock_name`: 股票中文名稱（例如 `"台積電"`）。
   - `in_tick_universe`: 布林值（例如 `true` / `false`），標示該股票是否屬於 400 檔 Tick Universe 逐筆成交個股。
   - `pattern_type` & `pattern_name`: 型態英文 ID 與中文名稱（例如 `"head_shoulders_top"` 與 `"頭肩頂"`）。
   - `candles`: K 線陣列，`time` 欄位已依 `CLAUDE.md` 規範轉換為台北本地時間 UTC Timestamp 秒數。
@@ -298,10 +298,10 @@ pattern/
 
 ## 11. 智慧快取機制 (In-Memory Caching)
 
-為了避免全市場 2,700+ 支股票重複掃描運算，採用**雙軌智慧記憶體快取**：
+為了避免 tick_universe 約 400 檔重複掃描運算，採用**雙軌智慧記憶體快取**：
 
 - **快取 Key 結構**：
-  `(pattern_type, timeframe, date, min_score, min_vol_lots, only_tick_universe, limit, latest_ts)`
+  `(pattern_type, timeframe, date, min_score, min_vol_lots, limit, latest_ts)`
 - **自動失效與更新**：
   - 快取 Key 自動綁定 `get_latest_candle_timestamp()`（最新 K 線時間戳）。
   - **盤中時間**：每分鐘寫入新 1 分 K 線時，時間戳更新，快取自動失效並重算最新型態。

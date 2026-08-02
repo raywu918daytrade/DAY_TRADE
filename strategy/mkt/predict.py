@@ -15,7 +15,8 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 import pandas as pd
 
-from data.query import load_day, load_m1, load_m1_live
+from data.query import load_day, load_m1_live
+from data.raw_query import load_m1
 from data.resample import compute_m3, compute_m3_std, compute_m5, compute_m5_std
 from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, MODEL_TYPE, TOP_N
 from strategy.mkt.features import (

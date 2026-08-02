@@ -27,7 +27,7 @@ if str(Path(__file__).parent.parent.parent.parent) not in sys.path:
 
 import pandas as pd
 
-from data.query import load_m1
+from data.raw_query import load_m1
 from strategy.mkt.config import IDX_SYMBOL
 from strategy.mkt.features import make_barrier_labels_3class
 
