@@ -32,6 +32,14 @@ class StrategyState:
         # 共識訊號拆成「多方」「空方」兩欄分開比對時，判斷這個策略算不算
         # 進哪一欄的依據。
         self.directions = module.DIRECTIONS
+        # 這個策略要不要吃即時 tick 資料（module.USES_TICKS，選填，見
+        # strategy/breakout_retest_ml/up/live.py 的說明）——用 getattr 給
+        # 預設值 False，因為大部分策略模組不會宣告這個屬性（跟強制要有的
+        # DIRECTIONS 不同）。main/live_trader.py::on_minute() 依這個決定
+        # 要不要把 ticks_by_stock 塞進 predict_live() 的呼叫參數——沒有
+        # **kwargs 的策略（orb/mkt/cnn/vwap_ml/vwap_dl）硬塞這個參數會
+        # TypeError，不能無條件全部策略都傳。
+        self.uses_ticks = getattr(module, "USES_TICKS", False)
         self.model = None
         self.prewarm_cache: dict = {}
 
@@ -64,3 +72,11 @@ class AppState:
         # 開機前如果 db/m1_live/ 本來就沒有缺口（例如開盤前就啟動），這個
         # backfill 幾乎瞬間跑完，不會有感覺得到的延遲。
         self.backfill_done = threading.Event()
+
+        # 富邦 WebSocket realtime_token（見 fubon/marketdata_ws.py::
+        # FubonM1Collector.__init__ 的 on_token_ready callback）：
+        # fubon/tick_ws.py::FubonTickCollector 重用這個 token 開 tick 訂閱
+        # 連線，不用再登入一次富邦帳號（避免重複登入的 race condition，
+        # 跟 backfill_done 一樣是給不同執行緒溝通用的旗標）。
+        self.fubon_ws_token: str | None = None
+        self.fubon_ws_token_ready = threading.Event()

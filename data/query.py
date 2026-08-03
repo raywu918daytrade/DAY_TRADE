@@ -16,6 +16,8 @@ data/adjustment_query.py，不要用這支——理由見那支檔頭說明。
     load_m1()      → db/m1/        歷史分K（訓練用，按月分檔，已還原拆股/合股）
     load_day()     → db/d1/        日K（模型特徵用，按月分檔，已還原拆股/合股）
     load_m1_live() → db/m1_live/   今日即時分K（交易用，收盤後丟棄，當天raw==已還原）
+    load_tick_live() → db/tick_live/ 今日即時成交明細（由 fubon/tick_ws.py 收集，
+                                    交易用，收盤後丟棄，schema 跟 db/tick 一致）
 
 單支股票查詢（用 pyarrow filter pushdown，不用像 load_day() 整個資料集讀進記憶體）：
     load_day_by_stock(stock_id)  → db/d1/       單一股票的全部日K
@@ -222,6 +224,23 @@ def load_tick_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["date"], keep="last", inplace=True)
     return df.sort_values("date").reset_index(drop=True)
+
+
+def load_tick_live(date: str = None) -> pd.DataFrame:
+    """載入今日即時成交明細（db/tick_live/YYYY-MM-DD.parquet），由
+    fubon/tick_ws.py::FubonTickCollector 收集，schema 跟 db/tick 一致
+    （stock_id, date, deal_price, volume, tick_type）。跟 load_m1_live()
+    同樣的「今日單檔」讀法，不用 pyarrow dataset filter pushdown（單日
+    檔案不大，直接整個讀進來，供 main/live_trader.py::on_minute() 每分鐘
+    組 ticks_by_stock 用）。"""
+    if date is None:
+        date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    path = _ROOT / f"db/tick_live/{date}.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    df["date"] = pd.to_datetime(df["date"], format="mixed")
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
 def load_m1_live(date: str = None) -> pd.DataFrame:

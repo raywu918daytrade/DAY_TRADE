@@ -110,12 +110,17 @@ def _parse_candle(raw: bytes | str) -> dict | None:
 class FubonM1Collector:
     """管理最多 5 條 candles WebSocket 連線，收到的分K先 buffer，定期存檔。"""
 
-    def __init__(self, on_minute=None, backfill_done=None):
+    def __init__(self, on_minute=None, backfill_done=None, on_token_ready=None):
         self._on_minute = on_minute
         # threading.Event（見 main/state.py::AppState.backfill_done 的說明），
         # _backfill_intraday() 補完才 set()，讓呼叫端（on_minute）知道資料
         # 缺口補齊了沒有。留空（手動測試/單獨跑這個檔案時）就不做這個追蹤。
         self._backfill_done = backfill_done
+        # 選填 callback(token)，在拿到 realtime_token() 之後立刻呼叫（見 start()）。
+        # 給 fubon/tick_ws.py::FubonTickCollector 重用同一個 token 開連線，不用
+        # 再登入一次富邦帳號——重複登入是已經修過的真實 bug（見 main/live_trader.py
+        # 的 _startup_done 說明），tick collector 不該再犯一次。
+        self._on_token_ready = on_token_ready
         self._sdk = None
         self._clients: list = []
         self._buffer: dict[tuple[str, str], dict] = {}  # (stock_id, minute_str) -> row
@@ -146,6 +151,8 @@ class FubonM1Collector:
             raise RuntimeError("訂閱清單是空的，請先跑 python -m fubon.subscribe_list")
 
         token = trade_api.realtime_token(self._sdk)
+        if self._on_token_ready:
+            self._on_token_ready(token)
 
         total = 0
         for i, batch in enumerate(batches, 1):

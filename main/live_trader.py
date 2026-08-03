@@ -400,6 +400,19 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     _backfill_pending = not state.backfill_done.is_set()
     if _backfill_pending:
         print(f"[on_minute] {minute_str[11:16]} 分K缺口還沒補完，這一分鐘先跳過推論", flush=True)
+
+    # 即時 tick 資料（fubon/tick_ws.py 收集，見 data/query.py::load_tick_live()
+    # 的說明）：只有真的有策略需要（module.USES_TICKS，見 main/state.py::
+    # StrategyState.uses_ticks）才讀檔組字典，避免沒人要用就白白讀
+    # db/tick_live/。目前沒有任何策略啟用 USES_TICKS，這段實際上不會執行。
+    ticks_by_stock = None
+    if any(s.uses_ticks for s in state.strategies.values()):
+        from data.query import load_tick_live
+
+        tick_live_df = load_tick_live(date_str)
+        if not tick_live_df.empty:
+            ticks_by_stock = {sid: g for sid, g in tick_live_df.groupby("stock_id")}
+
     for s in state.strategies.values():
         if (h, m) < s.session_start or (h, m) > s.session_end:
             continue  # 這個策略還沒開始/已經過了進場窗口，不產生新訊號（既有持倉SL/TP由下面reconcile統一監控，不受這裡影響）
@@ -416,15 +429,20 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         if cache_key in _infer_cache:
             raw_results = _infer_cache[cache_key]
         else:
-            raw_results = s.predict_live(
-                minute_str,
-                state.day,
+            predict_kwargs = dict(
                 model=s.model,
                 threshold=0,
                 day_trade_stocks=state.day_trade_stocks,
                 m1_live=m1_live if not m1_live.empty else None,
                 **s.prewarm_cache,
             )
+            # 只有宣告 USES_TICKS 的策略才傳 ticks_by_stock——orb/mkt/cnn/
+            # vwap_ml/vwap_dl 的 predict_live() 沒有 **kwargs，無條件塞這個
+            # 參數會直接 TypeError（見 main/state.py::StrategyState.uses_ticks
+            # 的說明）。
+            if s.uses_ticks:
+                predict_kwargs["ticks_by_stock"] = ticks_by_stock
+            raw_results = s.predict_live(minute_str, state.day, **predict_kwargs)
             _infer_cache[cache_key] = raw_results
 
         # 只保留這個策略設定允許的方向（module.DIRECTIONS，見 main/state.py
@@ -592,7 +610,21 @@ def _run_collector_after_startup():
     collector 開始，確保兩邊不會同時摸到同一個 model。
     """
     _startup_done.wait()
-    _collector.start_collector(on_minute, backfill_done=state.backfill_done)
+
+    def _on_token_ready(token: str):
+        state.fubon_ws_token = token
+        state.fubon_ws_token_ready.set()
+
+    _collector.start_collector(on_minute, backfill_done=state.backfill_done, on_token_ready=_on_token_ready)
+
+
+def _run_tick_collector_after_startup():
+    """成交明細（tick）收集器，等分K collector 先登入拿到 realtime_token()
+    才開始（見 state.fubon_ws_token_ready、main/collector.py::
+    start_tick_collector() 的說明）——全程只用富邦帳號登入一次，重用同一個
+    token 開 tick 訂閱連線，不再另外呼叫一次富邦登入。"""
+    _startup_done.wait()
+    _collector.start_tick_collector(state.fubon_ws_token_ready, lambda: state.fubon_ws_token)
 
 
 if __name__ == "__main__":
@@ -607,6 +639,9 @@ if __name__ == "__main__":
     # _run_collector_after_startup() 的說明，避免跟 _startup() 同時呼叫模型
     # 推論導致 OpenMP crash）。
     threading.Thread(target=_run_collector_after_startup, daemon=True).start()
+    # 成交明細（tick）收集器：等分K collector 登入完成、拿到 token 後才開始，
+    # 全程只登入富邦帳號一次（見 _run_tick_collector_after_startup() 的說明）。
+    threading.Thread(target=_run_tick_collector_after_startup, daemon=True).start()
 
     # uvicorn 跑主執行緒（阻塞）
     config = get_uvicorn_config(host="0.0.0.0", port=8000)

@@ -109,6 +109,14 @@ def subscribe_candles(stock_client, symbol: str):
     stock_client.subscribe({"channel": "candles", "symbol": symbol})
 
 
+def subscribe_trades(stock_client, symbol: str):
+    """訂閱成交明細 tick channel（跟 candles 不同，是逐筆成交，不是分K），
+    見 fubon/tick_ws.py::FubonTickCollector。連線本身用 open_candles_connection()
+    開就好（channel-agnostic，只是 build_websocket_client(mode, token).stock），
+    不需要另外包一個 open_trades_connection()。"""
+    stock_client.subscribe({"channel": "trades", "symbol": symbol})
+
+
 if __name__ == "__main__":
     sdk, accounts = login()
     print("登入成功，帳戶：")
