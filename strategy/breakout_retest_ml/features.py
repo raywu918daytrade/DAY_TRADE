@@ -2,10 +2,10 @@
 breakout_retest_ml 特徵工程。
 
 流程：
-1. 日 K breakout_retest + poc_confluence 硬過濾 → 候選（以收盤日 D 為準）
+1. 日 K breakout_retest 硬過濾（支撐線＝前壓力轉支撐；不再要求 POC）→ 候選（以收盤日 D 為準）
 2. 下一交易日 09:10~10:00，硬觸發：
    - M1 陽線實體 K（body_ratio 達門檻、非上影線主導）
-   - Tick 有方向大量買進（大單買比 + CVD>0；tick_type=1 為外盤）
+   - Tick 方向：大單買比達門檻且 > 大單賣比（買賣對抗），可選 CVD>0
 3. Triple Barrier 標籤（+1 止盈 / -1 止損 / 0 時間牆）→ target 0/1/2
 """
 
@@ -36,6 +36,7 @@ from strategy.breakout_retest_ml.config import (
     MIN_PATTERN_SCORE,
     MIN_TICK_LARGE_BUY_RATIO,
     REQUIRE_CVD_POSITIVE,
+    REQUIRE_LARGE_BUY_GT_SELL,
     SESSION_END,
     SESSION_START,
     SL_PCT,
@@ -55,6 +56,8 @@ FEATURES = [
     "upper_shadow_ratio",
     "volume_surge_ratio",
     "tick_large_buy_ratio",
+    "tick_large_sell_ratio",
+    "tick_large_net_ratio",
     "cvd_30s_delta",
 ]
 
@@ -93,11 +96,15 @@ def _passes_m1_body_trigger(cur: pd.Series) -> tuple[bool, dict]:
     }
 
 
-def _passes_tick_large_buy(tick_feat: dict) -> bool:
-    """有方向的大量買進：大單買比達門檻，且（可選）CVD 為正。"""
-    if tick_feat["tick_large_buy_ratio"] < MIN_TICK_LARGE_BUY_RATIO:
+def _passes_tick_direction(tick_feat: dict) -> bool:
+    """大單買賣對抗後定方向：買比達門檻、買>賣，且（可選）CVD>0。"""
+    buy = float(tick_feat.get("tick_large_buy_ratio", 0.0) or 0.0)
+    sell = float(tick_feat.get("tick_large_sell_ratio", 0.0) or 0.0)
+    if buy < MIN_TICK_LARGE_BUY_RATIO:
         return False
-    if REQUIRE_CVD_POSITIVE and tick_feat["cvd_30s_delta"] <= 0:
+    if REQUIRE_LARGE_BUY_GT_SELL and buy <= sell:
+        return False
+    if REQUIRE_CVD_POSITIVE and float(tick_feat.get("cvd_30s_delta", 0.0) or 0.0) <= 0:
         return False
     return True
 
@@ -112,7 +119,7 @@ def _volume_surge(cur_vol: float, hist_vols: np.ndarray) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 日 K 候選（硬過濾 POC）
+# 日 K 候選（支撐線＝前壓力；POC 非硬門檻）
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -140,11 +147,12 @@ def find_day_candidates(
     stock_ids: list[str] | None = None,
     min_score: float = MIN_PATTERN_SCORE,
     day_step: int = 1,
-    require_poc: bool = True,
+    require_poc: bool = False,
 ) -> pd.DataFrame:
     """對 tick_universe 掃描日 K breakout_retest。
 
-    require_poc=True（預設）：只保留 poc_confluence=True（支撐 ≈ POC）。
+    require_poc=False（預設）：保留所有達分的 breakout（支撐線＝前壓力）；
+    True 時才只留 poc_confluence。
     回傳的 candidate_date 是型態成立的日 K 收盤日；實際盤中觸發在下一交易日。
     """
     detector = BreakoutRetestDetector()
@@ -229,7 +237,7 @@ def detect_candidate_asof(
         res = detector.detect(window, stock_id, "day", poc_df=stock_poc)
     except Exception:
         return None
-    if res is None or res.score < min_score or not res.details.get("poc_confluence"):
+    if res is None or res.score < min_score:
         return None
     return {
         "stock_id": stock_id,
@@ -242,6 +250,7 @@ def detect_candidate_asof(
         "poc_diff_pct": (
             float(res.details["poc_diff_pct"]) if res.details.get("poc_diff_pct") is not None else np.nan
         ),
+        "poc_confluence": bool(res.details.get("poc_confluence")),
     }
 
 
@@ -251,8 +260,13 @@ def detect_candidate_asof(
 
 
 def _tick_features_at(ticks: pd.DataFrame, trigger_ts: pd.Timestamp) -> dict:
-    """觸發時刻前 CVD(30s) 與大單買比(60s)。"""
-    empty = {"tick_large_buy_ratio": 0.0, "cvd_30s_delta": 0.0}
+    """觸發時刻前 CVD(30s) 與大單買／賣比(60s)。"""
+    empty = {
+        "tick_large_buy_ratio": 0.0,
+        "tick_large_sell_ratio": 0.0,
+        "tick_large_net_ratio": 0.0,
+        "cvd_30s_delta": 0.0,
+    }
     if ticks is None or ticks.empty:
         return empty
 
@@ -275,15 +289,23 @@ def _tick_features_at(ticks: pd.DataFrame, trigger_ts: pd.Timestamp) -> dict:
     lb_win = t[t["date"] >= lb_start]
     if lb_win.empty:
         large_buy_ratio = 0.0
+        large_sell_ratio = 0.0
     else:
         total = float(lb_win["volume"].sum())
-        large_buy = float(
-            lb_win.loc[(lb_win["tick_type"] == 1) & (lb_win["volume"] > TICK_LARGE_LOT), "volume"].sum()
-        )
-        large_buy_ratio = (large_buy / total) if total > 0 else 0.0
+        vol = lb_win["volume"].astype(float)
+        large_buy = float(vol[(lb_win["tick_type"] == 1) & (vol > TICK_LARGE_LOT)].sum())
+        large_sell = float(vol[(lb_win["tick_type"] != 1) & (vol > TICK_LARGE_LOT)].sum())
+        if total > 0:
+            large_buy_ratio = large_buy / total
+            large_sell_ratio = large_sell / total
+        else:
+            large_buy_ratio = 0.0
+            large_sell_ratio = 0.0
 
     return {
         "tick_large_buy_ratio": round(large_buy_ratio, 4),
+        "tick_large_sell_ratio": round(large_sell_ratio, 4),
+        "tick_large_net_ratio": round(large_buy_ratio - large_sell_ratio, 4),
         "cvd_30s_delta": round(cvd_delta, 2),
     }
 
@@ -372,6 +394,8 @@ def collect_m1_body_triggers(
                 "dist_to_poc_pct": round((close - poc) / poc * 100.0, 4) if poc else 0.0,
                 "dist_to_support_pct": round((close - support) / support * 100.0, 4) if support else 0.0,
                 "tick_large_buy_ratio": tick_feat["tick_large_buy_ratio"],
+                "tick_large_sell_ratio": tick_feat["tick_large_sell_ratio"],
+                "tick_large_net_ratio": tick_feat["tick_large_net_ratio"],
                 "cvd_30s_delta": tick_feat["cvd_30s_delta"],
             }
         )
@@ -386,22 +410,29 @@ def find_intraday_trigger(
     only_at: pd.Timestamp | None = None,
     require_tick: bool = True,
 ) -> dict | None:
-    """在 SESSION 內找第一個硬觸發：M1 陽線實體 K（+ 可選 Tick 大量買進）。"""
+    """在 SESSION 內找第一個硬觸發：M1 陽線實體 K（+ 可選 Tick 大單方向）。"""
     rows = collect_m1_body_triggers(
         m1_day, resistance=resistance, matched_poc=matched_poc, ticks=ticks, only_at=only_at
     )
     for row in rows:
-        if require_tick and not _passes_tick_large_buy(row):
+        if require_tick and not _passes_tick_direction(row):
             continue
         return row
     return None
 
 
 def filter_trigger_tick_hard(df: pd.DataFrame) -> pd.DataFrame:
-    """對物化 trigger 表套用 Tick 大量買進硬過濾。"""
+    """對物化 trigger 表套用 Tick 大單買賣對抗硬過濾。"""
     if df is None or df.empty:
         return df
     out = df[df["tick_large_buy_ratio"] >= MIN_TICK_LARGE_BUY_RATIO]
+    if REQUIRE_LARGE_BUY_GT_SELL:
+        sell = (
+            out["tick_large_sell_ratio"]
+            if "tick_large_sell_ratio" in out.columns
+            else 0.0
+        )
+        out = out[out["tick_large_buy_ratio"] > sell]
     if REQUIRE_CVD_POSITIVE:
         out = out[out["cvd_30s_delta"] > 0]
     return out.reset_index(drop=True)
@@ -496,6 +527,12 @@ def build_event_dataset(
                 "dist_to_poc_pct": trigger["dist_to_poc_pct"],
                 "dist_to_support_pct": trigger["dist_to_support_pct"],
                 "tick_large_buy_ratio": trigger["tick_large_buy_ratio"],
+                "tick_large_sell_ratio": trigger.get("tick_large_sell_ratio", 0.0),
+                "tick_large_net_ratio": trigger.get(
+                    "tick_large_net_ratio",
+                    float(trigger["tick_large_buy_ratio"])
+                    - float(trigger.get("tick_large_sell_ratio", 0.0) or 0.0),
+                ),
                 "cvd_30s_delta": trigger["cvd_30s_delta"],
                 "target": target,
                 "label_raw": float(label_raw),
@@ -553,6 +590,21 @@ def build_event_dataset_from_triggers(
                 "dist_to_poc_pct": float(tr["dist_to_poc_pct"]),
                 "dist_to_support_pct": float(tr["dist_to_support_pct"]),
                 "tick_large_buy_ratio": float(tr["tick_large_buy_ratio"]),
+                "tick_large_sell_ratio": (
+                    float(tr["tick_large_sell_ratio"])
+                    if "tick_large_sell_ratio" in tr.index and pd.notna(tr["tick_large_sell_ratio"])
+                    else 0.0
+                ),
+                "tick_large_net_ratio": (
+                    float(tr["tick_large_net_ratio"])
+                    if "tick_large_net_ratio" in tr.index and pd.notna(tr["tick_large_net_ratio"])
+                    else float(tr["tick_large_buy_ratio"])
+                    - (
+                        float(tr["tick_large_sell_ratio"])
+                        if "tick_large_sell_ratio" in tr.index and pd.notna(tr["tick_large_sell_ratio"])
+                        else 0.0
+                    )
+                ),
                 "cvd_30s_delta": float(tr["cvd_30s_delta"]),
                 "target": target,
                 "label_raw": float(label_raw),
@@ -598,7 +650,7 @@ def make_features(
         flush=True,
     )
     if candidates is None:
-        day_cands = load_breakout_retest_day(start_date=start_date, only_poc=True)
+        day_cands = load_breakout_retest_day(start_date=start_date, only_poc=False)
         if not day_cands.empty:
             print(f"[breakout_retest_ml] 讀 db/breakout_retest_day：{len(day_cands):,}", flush=True)
             candidates = day_cands
@@ -611,7 +663,7 @@ def make_features(
             if not poc_df.empty:
                 poc_df = poc_df[poc_df["stock_id"].isin(stock_ids)]
             candidates = find_day_candidates(
-                day_df, poc_df, stock_ids=stock_ids, day_step=day_step, require_poc=True
+                day_df, poc_df, stock_ids=stock_ids, day_step=day_step, require_poc=False
             )
 
     print(f"[breakout_retest_ml] 候選日數: {len(candidates)}", flush=True)

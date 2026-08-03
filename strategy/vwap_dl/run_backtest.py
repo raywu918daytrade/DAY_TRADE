@@ -9,6 +9,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backtest.intraday_platform import print_trades, run_backtest
+from finmind.tick_universe import load_tick_universe
 from strategy.vwap_dl.config import BACKTEST_HOLD_BARS, BACKTEST_SL_PCT, BACKTEST_TP_PCT, SESSION_END, SESSION_START
 from strategy.vwap_dl.predict import predict
 from strategy.vwap_dl.train import load_model
@@ -43,6 +44,7 @@ def run(
         hold_bars=BACKTEST_HOLD_BARS,
         first_entry_time=f"{SESSION_START[0]:02d}:{SESSION_START[1]:02d}",
         last_entry_time=f"{SESSION_END[0]:02d}:{SESSION_END[1]:02d}",
+        stock_ids=load_tick_universe(),
     )
     print()
     print_trades(trades_df)

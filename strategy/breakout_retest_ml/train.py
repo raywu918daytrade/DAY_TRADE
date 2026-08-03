@@ -107,7 +107,7 @@ def prepare_candidates(start_date: str | None = "2025-07-01", day_step: int = 1)
 
     _ = day_step  # 保留 CLI 相容；物化掃全日步進=1
     build_day(force=True, start_date=start_date or "2025-07-01")
-    candidates = load_breakout_retest_day(start_date=start_date, only_poc=True)
+    candidates = load_breakout_retest_day(start_date=start_date, only_poc=False)
     print(f"POC 候選 {len(candidates)} 筆（db/breakout_retest_day）")
     print("盤中快照請再跑: python -m data.build_breakout_retest_trigger")
     return candidates

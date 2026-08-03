@@ -371,6 +371,8 @@ _BREAKOUT_TRIGGER_COLS = [
     "lower_shadow_ratio",
     "volume_surge_ratio",
     "tick_large_buy_ratio",
+    "tick_large_sell_ratio",
+    "tick_large_net_ratio",
     "cvd_30s_delta",
     "dist_to_poc_pct",
     "dist_to_support_pct",

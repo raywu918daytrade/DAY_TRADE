@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from data.raw_query import load_m1, load_m3, load_m5
+from data.raw_query import iter_m1_months, iter_m3_months, iter_m5_months
 from strategy.vwap_ml.config import ATR5_FILTER_THRESHOLD, MODEL_TYPE, STD_MULT
 from strategy.vwap_ml.features import FEATURES, make_features
 
@@ -127,8 +127,9 @@ def _prepare_data(
     參數呼叫這支函式每次都會重新跑一次完整流程，比較慢，但只有做實驗時
     才會這樣用，不影響正式train/predict。
 
-    start_date（2026-07-26新增）：直接限制 load_m1()/load_m3()/load_m5()
-    載入的範圍，不是像過去那樣先載入全部歷史、事後才篩選train_df——
+    start_date（2026-07-26新增）：直接限制 iter_m1_months()/iter_m3_months()/
+    iter_m5_months() 載入的範圍，不是像過去那樣先載入全部歷史、事後才篩選
+    train_df——
     使用者實際上固定用 start_date="2024-01-01"，先載全部歷史（目前含
     2019~2023，正在被另一個獨立的 finmind.backfill_m1_history 背景作業
     持續補資料）再事後過濾，等於白白多算了完全用不到的資料，也讓
@@ -142,39 +143,29 @@ def _prepare_data(
         print(f"cache比來源資料新，直接讀取cache... [{cache_path.name}]")
         return pd.read_parquet(cache_path)
 
-    print(f"載入分K...{f'（start_date={start_date}）' if start_date else '（全部歷史）'}")
-    m1 = load_m1(start_date=start_date)
-    # 讀現成的 m3/m5 批次快取（data/build_m3_m5_rolling.py 預先算好），不要
-    # 讓 make_features() 內部用 compute_m3()/compute_m5() 對全市場全歷史
-    # 重新現算一次——那樣等於又製造出兩份跟 m1 一樣大的 dataframe，是
-    # 2026-07-26 訓練全歷史資料時記憶體爆掉的主因之一，見
-    # features.py::add_vwap_features() 的說明。
-    m3 = load_m3(start_date=start_date)
-    m5 = load_m5(start_date=start_date)
+    # 逐月讀取＋逐月跑 make_features()，不要一次把 start_date 到現在全部
+    # 月份的 m1/m3/m5 讀進記憶體（2026-08-03 vwap_ml 回測記憶體爆炸時發現：
+    # db/m3、db/m5 是 build_m3_m5_rolling.py 預先算好的「每分鐘一列」批次
+    # 快取，跟 m1 同量級，2024-01起到現在三份一次讀完是32個月×3張近1.3億列
+    # 的表，遠超一次全部讀進pandas能負擔的記憶體）。make_features() 內部
+    # 的 _trim_to_needed_window() 只留當日開盤到 SESSION_END+
+    # LABEL_HORIZON_MINUTES 這段（約全交易日的1/3），但這個裁切原本是在
+    # 全部月份都讀完之後才做，幫不上尖峰記憶體；改成逐月讀取，每個月讀完
+    # 立刻跑完整pipeline（含裁切、VWAP z-score、候選觸發、label、ATR5
+    # 過濾），只保留篩選後很小的候選事件，讀下一個月前，這個月的原始
+    # m1/m3/m5就可以被回收——尖峰記憶體從「32個月全部」降到「單月」等級。
+    # VWAP/label 都是當日內計算（VWAP從當天開盤累積、label最多看未來
+    # LABEL_HORIZON_MINUTES分鐘），不會跨月甚至跨日，逐月切開處理不影響
+    # 任何數值結果。
+    print(f"逐月載入分K並算特徵...{f'（start_date={start_date}）' if start_date else '（全部歷史）'}")
+    month_dfs = []
+    for m1, m3, m5 in zip(iter_m1_months(start_date), iter_m3_months(start_date), iter_m5_months(start_date)):
+        month_df = make_features(m1, std_mult=std_mult, atr5_threshold=atr5_threshold, m3=m3, m5=m5)
+        if not month_df.empty:
+            month_dfs.append(month_df)
 
-    # stock_id 原本是 object（Python字串）dtype，全歷史規模下記憶體被嚴重
-    # 放大（2026-07-26實測：db/m1 全歷史1.56億列只有3090種不重複代號，
-    # deep memory profile顯示這一欄單獨就佔了m1總記憶體12.4GB裡的8.3GB，
-    # 是造成訓練時記憶體衝到40GB的主因——m1/m3/m5三份dataframe的stock_id
-    # 欄位加起來將近25GB）。轉成category（整數編碼+一份代號對照表）大幅
-    # 降低記憶體。三份dataframe要共用同一組categories（各自先
-    # drop_duplicates()取出代號集合再取聯集，不要直接對上億列呼叫
-    # unique()，那一步本身也很花記憶體/時間），這樣後面
-    # merge(on=["stock_id","date"])才不會因為categories不一致，把
-    # category悄悄轉回object，記憶體效果就白做了。
-    stock_ids = pd.unique(
-        pd.concat(
-            [m1["stock_id"].drop_duplicates(), m3["stock_id"].drop_duplicates(), m5["stock_id"].drop_duplicates()],
-            ignore_index=True,
-        )
-    )
-    stock_dtype = pd.CategoricalDtype(categories=stock_ids)
-    m1["stock_id"] = m1["stock_id"].astype(stock_dtype)
-    m3["stock_id"] = m3["stock_id"].astype(stock_dtype)
-    m5["stock_id"] = m5["stock_id"].astype(stock_dtype)
-
-    print("算 VWAP z-score / 候選觸發 / 三分類標籤...")
-    df = make_features(m1, std_mult=std_mult, atr5_threshold=atr5_threshold, m3=m3, m5=m5)
+    print("合併各月候選事件 / 算三分類標籤結果...")
+    df = pd.concat(month_dfs, ignore_index=True) if month_dfs else pd.DataFrame(columns=FEATURES + ["target"])
     df = df.dropna(subset=FEATURES + ["target"])
     df["target"] = df["target"].astype(int)
     print(f"有效樣本: {len(df):,} 筆")

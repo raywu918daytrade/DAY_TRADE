@@ -19,7 +19,7 @@ if str(Path(__file__).parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backtest.intraday_backtest import intraday_backtest
-from data.raw_query import load_m1
+from data.raw_query import iter_m1_months, load_m1
 
 _ROOT = Path(__file__).parent
 
@@ -78,23 +78,41 @@ def run_backtest(
     init_cash: float = 1_000_000,
     min_vol_threshold: int = 500,
     vol_window: int = 20,
+    stock_ids: list[str] | None = None,
 ):
+    """
+    stock_ids（2026-08-03新增，選填）：限制回測只交易這份清單裡的股票
+    （例如 finmind.tick_universe.load_tick_universe() 的400支固定候選股
+    母體）。留空＝不過濾，維持原本吃全市場的行為，不影響orb/rally/mkt/
+    vwap_ml既有呼叫端。"""
     t0 = time()
 
-    print("載入分K...")
-    m1 = load_m1()
-
-    # 只保留 df_proba 涵蓋的日期範圍（+ 幾天緩衝給 rolling volume 暖機用），
-    # 不要整段歷史都拿去 pivot/回測——df_proba 通常只有最後 test_days 天
-    # （見 strategy/*/predict.py 的 test_only 篩選），只交易得到這個窗口，
-    # 但 gen_entries() 的 `entries & (avg_vol >= ...)` 是兩個布林 DataFrame
+    # 逐月讀取＋逐月裁到 df_proba 涵蓋的日期範圍（+ 幾天緩衝給 rolling volume
+    # 暖機用），不要一次把全部歷史月份的m1讀進記憶體再篩（2026-08-03比照
+    # strategy/vwap_ml/train.py::_prepare_data() 的做法——db/m1 隨 finmind
+    # 的backfill持續往回補資料只會越來越大，先載全部再篩的舊寫法遲早會變
+    # 記憶體/時間瓶頸）。df_proba 通常只有最後 test_days 天（見
+    # strategy/*/predict.py 的 test_only 篩選），只交易得到這個窗口，但
+    # gen_entries() 的 `entries & (avg_vol >= ...)` 是兩個布林 DataFrame
     # 做 & 運算，index 不同時 pandas 會取聯集而不是交集，若這裡不先篩，
     # entries 的 index 會被 avg_vol（全歷史）撐大，intraday_backtest() 的
     # 主迴圈就會跑遍全部歷史分K，而不是只跑實際可能交易的這幾十天
     # （2026-07-17 發現：ORB 回測因此多跑 10 個月分K，慢了10倍以上）。
+    print("載入分K...")
     start = df_proba.index.min() - pd.Timedelta(days=5)
     end = df_proba.index.max()
-    m1 = m1[(m1["date"] >= start) & (m1["date"] <= end)]
+    month_frames = []
+    for month_df in iter_m1_months(start_date=start.strftime("%Y-%m-%d")):
+        month_df = month_df[(month_df["date"] >= start) & (month_df["date"] <= end)]
+        if stock_ids is not None:
+            month_df = month_df[month_df["stock_id"].isin(stock_ids)]
+        if not month_df.empty:
+            month_frames.append(month_df)
+    m1 = (
+        pd.concat(month_frames, ignore_index=True)
+        if month_frames
+        else pd.DataFrame(columns=["stock_id", "date", "open", "high", "low", "close", "volume"])
+    )
 
     price = prepare_price(m1)
     volume = m1.pivot(index="date", columns="stock_id", values="volume")

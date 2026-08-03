@@ -5,7 +5,7 @@
     stock_id, candidate_date, pattern_score, resistance_price,
     matched_poc, poc_diff_pct, poc_confluence
 
-含／不含 POC 共振都存；策略端預設再 filter poc_confluence==True。
+含／不含 POC 共振都存；POC 欄位可作特徵，策略端不再硬過濾 poc_confluence。
 偵測需要日 K 回看視窗，因此以「全宇宙重掃後按 candidate_date 月份寫檔」為主
 （400 檔約 1 分鐘）。incremental：來源日 K／POC 沒比較新就跳過。
 

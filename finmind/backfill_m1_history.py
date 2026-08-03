@@ -63,6 +63,7 @@ from finmind.m1_api import (
     check_quota,
     parse_max_requests,
     reload_token,
+    set_burst_mode,
     set_request_budget,
     sync_rate_limiter,
 )

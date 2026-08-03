@@ -32,16 +32,18 @@ MIN_BODY_RATIO = 0.50
 MAX_UPPER_SHADOW_RATIO = 0.35
 
 # ── Triple Barrier（報酬率）───────────────────────────────────────────────
-# 規格書 ±3% 偏嚴；第一版用 ±2%，之後可對照實驗
-TP_PCT = 0.02
-SL_PCT = 0.02
+# 進場後最多 30 根 M1；先觸 ±3% 平倉，否則時間牆（震盪）
+TP_PCT = 0.03
+SL_PCT = 0.03
 
-# ── Tick 硬過濾／特徵（tick_type=1 為外盤買進，有方向）──────────────────
+# ── Tick 硬過濾／特徵（tick_type=1 外盤買、!=1 內盤賣）──────────────────
 TICK_CVD_SECONDS = 30
-TICK_LARGE_BUY_SECONDS = 60
+TICK_LARGE_BUY_SECONDS = 60  # 大單買／賣同一視窗秒數
 TICK_LARGE_LOT = 50  # 單筆 > 50 張視為大單
-# 觸發前 60s：大單買量 / 總量 ≥ 此值，才算「大量買進」
+# 觸發前 60s：大單買量 / 總量 ≥ 此值
 MIN_TICK_LARGE_BUY_RATIO = 0.10
+# 大買比必須嚴格大於大賣比（買賣對抗後才定多頭方向）
+REQUIRE_LARGE_BUY_GT_SELL = True
 # 觸發前 30s CVD（買−賣）必須為正
 REQUIRE_CVD_POSITIVE = True
 
@@ -49,7 +51,7 @@ REQUIRE_CVD_POSITIVE = True
 MODEL_TYPE = os.environ.get("BREAKOUT_RETEST_ML_MODEL_TYPE", "lgbm")
 THRESHOLD = float(os.environ.get("BREAKOUT_RETEST_ML_THRESHOLD", "0.6"))
 
-# ── 回測出場（與 label 的 Triple Barrier 對齊第一版 ±2%/30 分）────────────
+# ── 回測出場（與 label 的 Triple Barrier 對齊 ±3%/30 分）──────────────────
 BACKTEST_TP_PCT = TP_PCT
 BACKTEST_SL_PCT = SL_PCT
 BACKTEST_HOLD_BARS = LABEL_HORIZON_MINUTES

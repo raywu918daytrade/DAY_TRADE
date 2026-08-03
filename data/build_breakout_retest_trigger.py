@@ -1,7 +1,7 @@
 """
 物化盤中觸發快照 → db/breakout_retest_trigger/{YYYY_MM}.parquet
 
-對 db/breakout_retest_day（poc_confluence=True）的下一交易日，
+對 db/breakout_retest_day（全部達分候選，不限 poc_confluence）的下一交易日，
 在 09:10～10:00 寫入每一根「M1 陽線實體 K」及其 Tick 特徵（不套大單門檻）。
 M1 價格用 load_pattern_m1（與 Layer1 day/POC 同一還原基準：pattern 專用完整還原）。
 
@@ -39,6 +39,8 @@ _COLS = [
     "lower_shadow_ratio",
     "volume_surge_ratio",
     "tick_large_buy_ratio",
+    "tick_large_sell_ratio",
+    "tick_large_net_ratio",
     "cvd_30s_delta",
     "dist_to_poc_pct",
     "dist_to_support_pct",
@@ -85,7 +87,7 @@ def build(
     t0 = time.time()
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    cands = load_breakout_retest_day(start_date=start_date, only_poc=True)
+    cands = load_breakout_retest_day(start_date=start_date, only_poc=False)
     if cands.empty:
         print("無 Layer1 候選，請先 python -m data.build_breakout_retest_day", flush=True)
         return cands
@@ -157,6 +159,8 @@ def build(
                     "lower_shadow_ratio": h["lower_shadow_ratio"],
                     "volume_surge_ratio": h["volume_surge_ratio"],
                     "tick_large_buy_ratio": h["tick_large_buy_ratio"],
+                    "tick_large_sell_ratio": h["tick_large_sell_ratio"],
+                    "tick_large_net_ratio": h["tick_large_net_ratio"],
                     "cvd_30s_delta": h["cvd_30s_delta"],
                     "dist_to_poc_pct": h["dist_to_poc_pct"],
                     "dist_to_support_pct": h["dist_to_support_pct"],

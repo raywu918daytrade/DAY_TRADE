@@ -44,6 +44,20 @@ def _dataset_paths(dir_path: Path, start_date: str | None) -> str | list[str]:
     return [str(f) for f in files if f.stem >= cutoff]
 
 
+def _month_file_list(dir_path: Path, start_date: str | None) -> list[str]:
+    """跟 _dataset_paths() 一樣依 start_date 篩月份檔案，但一律回傳**檔案
+    路徑清單**（不會像 _dataset_paths() 在 start_date=None 時偷懶回傳整個
+    資料夾字串），iter_m1_months() 等逐月yield的函式需要真的逐檔迭代，不能
+    把一個目錄字串直接丟給 ds.dataset() 當「單一檔案」處理。"""
+    if not dir_path.exists():
+        return []
+    if start_date is None:
+        return sorted(str(f) for f in dir_path.iterdir() if f.suffix == ".parquet")
+    cutoff = pd.Timestamp(start_date).strftime("%Y_%m")
+    files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")
+    return [str(f) for f in files if f.stem >= cutoff]
+
+
 def load_m1(start_date: str | None = None) -> pd.DataFrame:
     """載入 db/m1/ 分K（原始價格，未還原權息，訓練資料，~2787 支，按月分檔）。
 
@@ -62,6 +76,44 @@ def load_m1(start_date: str | None = None) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], format="mixed")
     df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def iter_m1_months(start_date: str | None = None):
+    """逐月yield db/m1/分K（原始價格），跟 load_m1() 用同一套dtype正規化/
+    去重邏輯，但**不會把所有月份一次讀進記憶體**——呼叫端（例如
+    strategy/vwap_ml/train.py::_prepare_data()）需要對「當月裁到session
+    window後的資料量」跑pipeline時，一次讀全部月份（load_m1()）會讓峰值
+    記憶體卡在裁切之前，逐月處理才能把峰值壓到單月等級（2026-08-03
+    vwap_ml回測記憶體爆炸時發現，見 strategy/vwap_ml/train.py::
+    _prepare_data() 的說明）。
+
+    start_date：同 load_m1()，None代表讀全部月份。"""
+    paths = _month_file_list(_ROOT / "db/m1", start_date)
+    for path in paths:
+        df = ds.dataset(path, format="parquet").to_table().to_pandas()
+        df["date"] = pd.to_datetime(df["date"], format="mixed")
+        df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
+        yield df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def iter_m3_months(start_date: str | None = None):
+    """逐月yield db/m3/ rolling 3分鐘K（原始價格），同 iter_m1_months()
+    的動機，去重行為維持跟 load_m3() 一致（不去重）。"""
+    path = _ROOT / "db/m3"
+    for p in _month_file_list(path, start_date):
+        df = ds.dataset(p, format="parquet").to_table().to_pandas()
+        df["date"] = pd.to_datetime(df["date"])
+        yield df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def iter_m5_months(start_date: str | None = None):
+    """逐月yield db/m5/ rolling 5分鐘K（原始價格），同 iter_m1_months()
+    的動機，去重行為維持跟 load_m5() 一致（不去重）。"""
+    path = _ROOT / "db/m5"
+    for p in _month_file_list(path, start_date):
+        df = ds.dataset(p, format="parquet").to_table().to_pandas()
+        df["date"] = pd.to_datetime(df["date"])
+        yield df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
 def load_m3(start_date: str | None = None) -> pd.DataFrame:

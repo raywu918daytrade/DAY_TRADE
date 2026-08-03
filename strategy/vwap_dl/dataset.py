@@ -110,15 +110,21 @@ def _add_market_relative(df: pd.DataFrame, day_open: pd.Series, idx_symbol: str)
     return df
 
 
-def _build_wide_frame(m1: pd.DataFrame) -> pd.DataFrame:
-    """m1 → 寬表：正規化 OHLCV + atr/ma/大盤相對 + VWAP z-score merge。"""
+def _build_wide_frame(m1: pd.DataFrame, m3: pd.DataFrame, m5: pd.DataFrame) -> pd.DataFrame:
+    """m1 → 寬表：正規化 OHLCV + atr/ma/大盤相對 + VWAP z-score merge。
+
+    m3/m5（2026-08-03改）：改成呼叫端傳入——原本這裡會自己再呼叫一次
+    load_m3()/load_m5()，跟 build_dataset() 裡已經為了 make_features() 載入
+    的 m3/m5 完全重複（多載一次全市場全歷史），而且呼叫端對 m3/m5 做的
+    start_date/stock_ids 過濾也會在這裡被忽略掉。改成直接吃呼叫端已經篩過
+    的版本，不重新載入。"""
     m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
     m1["day_date"] = m1["date"].dt.date
 
-    m3 = load_m3().rename(
+    m3 = m3.rename(
         columns={"open": "m3_open", "high": "m3_high", "low": "m3_low", "close": "m3_close", "volume": "m3_volume_raw"}
     )
-    m5 = load_m5().rename(
+    m5 = m5.rename(
         columns={"open": "m5_open", "high": "m5_high", "low": "m5_low", "close": "m5_close", "volume": "m5_volume_raw"}
     )
 
@@ -282,7 +288,26 @@ def build_dataset(
     end_date: str = "",
     std_mult: float = STD_MULT,
     force_rebuild: bool = False,
+    stock_ids: list[str] | None = "__default__",
 ) -> list[str]:
+    """
+    stock_ids（2026-08-03新增）：限制只用這份清單裡的股票建shard。預設
+    （不傳，走 "__default__" sentinel）＝ finmind.tick_universe.
+    load_tick_universe() 的400支固定候選股母體——vwap_dl 現在訓練/回測/
+    即時交易統一用同一批母體，不用每個呼叫端自己記得傳。傳 None 才是
+    「不過濾，吃全市場」，只給明確需要全市場實驗時用。
+
+    2026-08-03發現：db/m1/db/m3/db/m5 按月分檔，2026-08-01之前backfill的
+    月份檔案還是舊的全市場~2700支（含大量權證/冷門股，量能經常個位數），
+    寫入端（data/m1_data_loader.py、finmind/backfill_m1_history.py）雖然
+    已經改成固定抓400支，但既有檔案不會因此自動變乾淨——讀取端要自己
+    過濾，才能保證訓練/回測用的股票池，跟即時交易的候選股（400支）一致。
+    """
+    if stock_ids == "__default__":
+        from finmind.tick_universe import load_tick_universe
+
+        stock_ids = load_tick_universe()
+
     months = _source_months(start_date, end_date)
     if not months:
         return []
@@ -295,25 +320,32 @@ def build_dataset(
             print(f"  {month} shard 已是最新，略過重算")
         return months
 
-    # 載入原始資料
+    # 載入原始資料（帶 start_date 給 load_m1/m3/m5，不要載入整段 db/m1 歷史
+    # 才事後篩——原本這裡沒傳 start_date，每次建shard都會把全部月份讀進
+    # 記憶體，跟 strategy/vwap_ml/train.py 修過的問題是同一類）。
     print("載入原始資料...")
-    raw_m1 = load_m1()
+    raw_m1 = load_m1(start_date=start_date or None)
     if start_date:
         raw_m1 = raw_m1[raw_m1["date"] >= start_date]
     if end_date:
         raw_m1 = raw_m1[raw_m1["date"] <= end_date]
+    if stock_ids is not None:
+        raw_m1 = raw_m1[raw_m1["stock_id"].isin(stock_ids)]
     raw_m1["day_date"] = raw_m1["date"].dt.date
 
     print("算 VWAP z-score / 候選觸發 / 三分類標籤（引用 vwap_ml/features.py，ATR5 過濾由內部處理）...")
     m1 = raw_m1
-    m3 = load_m3()
-    m5 = load_m5()
+    m3 = load_m3(start_date=start_date or None)
+    m5 = load_m5(start_date=start_date or None)
     if start_date:
         m3 = m3[m3["date"] >= start_date]
         m5 = m5[m5["date"] >= start_date]
     if end_date:
         m3 = m3[m3["date"] <= end_date]
         m5 = m5[m5["date"] <= end_date]
+    if stock_ids is not None:
+        m3 = m3[m3["stock_id"].isin(stock_ids)]
+        m5 = m5[m5["stock_id"].isin(stock_ids)]
 
     candidates = make_features(m1, std_mult=std_mult, m3=m3, m5=m5)
     candidates = candidates.dropna(subset=["target"])
@@ -326,7 +358,7 @@ def build_dataset(
 
     # 建寬表
     print("建寬表 + 正規化 + 技術指標...")
-    wide = _build_wide_frame(m1)
+    wide = _build_wide_frame(m1, m3, m5)
 
     # VWAP z-score merge 回 wide
     vwap_z_cols = candidates[["stock_id", "date", "m1_vwap_z", "m3_vwap_z", "m5_vwap_z"]].drop_duplicates(
