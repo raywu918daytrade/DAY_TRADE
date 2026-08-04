@@ -35,6 +35,12 @@ _SOURCE_DIRS = ["db/m1", "db/m3", "db/m5", "db/m3_std", "db/m5_std"]
 # 2026-07-28 新增 4 個大盤 VWAP 特徵（market_z_score_m5 /
 #   market_vwap_alignment_score / market_vwap_spread_1_5 /
 #   velocity_ratio_to_market），GRU_INPUT_DIM 同步從 14 改為 18。
+# 2026-08-04 曾經試過加 m3_std/m5_std 獨立K棒形態（body_ratio/
+#   upper_shadow_ratio/lower_shadow_ratio 各時間框各3個，_add_std_bar_shape()
+#   函式還在，供之後想重試時直接重用）——離線指標（accuracy/AUC/延續類
+#   precision）全面變好，但實際回測從 10筆/80%勝率/+1.20% 掉到
+#   4筆/50%勝率/-0.13%，判斷是這個改動讓結果變差，改回不用，
+#   GRU_INPUT_DIM 改回 18。
 _GRU_FEATURE_COLS = [
     "m1_open",
     "m1_high",
@@ -97,6 +103,48 @@ def _add_atr_ma(df: pd.DataFrame, g_day, day_open: pd.Series) -> None:
         df[name] = (ma / day_open).fillna(0)
 
 
+def _add_std_bar_shape(df: pd.DataFrame, prefix: str, std_df: pd.DataFrame) -> pd.DataFrame:
+    """把獨立K棒（m3_std/m5_std，一根一列，`date`=收盤時刻）的形態特徵——
+    body_ratio/upper_shadow_ratio/lower_shadow_ratio（公式同
+    strategy/breakout_retest_ml/features.py::_shadow_ratios()，都用該K棒
+    自己的全長 high-low 正規化，全長<=0時三個比例都是0）——用
+    `pd.merge_asof(direction="backward")` 併回逐分鐘寬表 df，而不是普通
+    merge：獨立K棒不是每分鐘都有新值（3分K要等3分鐘才收一根），要取「這
+    一分鐘為止，最後一根已經收盤的K棒」。`std_df["date"]` 標記的是K棒收盤
+    時刻，backward+預設 allow_exact_matches=True 剛好符合「K棒收盤那一
+    分鐘起，資訊才算已知」的語意，不會有未來函數。收盤前（例如當天前
+    3/5分鐘）沒有值，fillna(0)，比照 atr5/market_* 欄位的做法。
+
+    merge_asof 要求兩邊都按 `on`（這裡是 date）全域排序，不能只排
+    [stock_id, date]（by分組不保證跨組date單調遞增）——df/std_df 進來時
+    可能是 [stock_id, date] 排序，這裡各自重排一次。呼叫端不用管排序，
+    回傳的 df 沒有保證維持任何特定排序（下游 _build_candidate_data() 是
+    用 groupby 處理，不依賴frame本身的排序）。
+    """
+    std_df = std_df.sort_values("date").copy()
+    full = std_df["high"] - std_df["low"]
+    safe_full = full.where(full > 0, np.nan)
+    std_df[f"{prefix}_body_ratio"] = ((std_df["close"] - std_df["open"]).abs() / safe_full).fillna(0)
+    std_df[f"{prefix}_upper_shadow_ratio"] = (
+        (std_df["high"] - std_df[["open", "close"]].max(axis=1)) / safe_full
+    ).fillna(0)
+    std_df[f"{prefix}_lower_shadow_ratio"] = (
+        (std_df[["open", "close"]].min(axis=1) - std_df["low"]) / safe_full
+    ).fillna(0)
+
+    shape_cols = [f"{prefix}_body_ratio", f"{prefix}_upper_shadow_ratio", f"{prefix}_lower_shadow_ratio"]
+    merged = pd.merge_asof(
+        df.sort_values("date"),
+        std_df[["stock_id", "date"] + shape_cols],
+        on="date",
+        by="stock_id",
+        direction="backward",
+    )
+    for col in shape_cols:
+        merged[col] = merged[col].fillna(0)
+    return merged
+
+
 def _add_market_relative(df: pd.DataFrame, day_open: pd.Series, idx_symbol: str) -> pd.DataFrame:
     ret_since_open = df["close"] / day_open - 1
     idx = (
@@ -110,14 +158,18 @@ def _add_market_relative(df: pd.DataFrame, day_open: pd.Series, idx_symbol: str)
     return df
 
 
-def _build_wide_frame(m1: pd.DataFrame, m3: pd.DataFrame, m5: pd.DataFrame) -> pd.DataFrame:
-    """m1 → 寬表：正規化 OHLCV + atr/ma/大盤相對 + VWAP z-score merge。
+def _build_wide_frame(
+    m1: pd.DataFrame, m3: pd.DataFrame, m5: pd.DataFrame, m3_std: pd.DataFrame, m5_std: pd.DataFrame
+) -> pd.DataFrame:
+    """m1 → 寬表：正規化 OHLCV + atr/ma/大盤相對 + VWAP z-score merge +
+    獨立K棒形態（m3_std/m5_std，2026-08-04新增，見 _add_std_bar_shape()）。
 
     m3/m5（2026-08-03改）：改成呼叫端傳入——原本這裡會自己再呼叫一次
     load_m3()/load_m5()，跟 build_dataset() 裡已經為了 make_features() 載入
     的 m3/m5 完全重複（多載一次全市場全歷史），而且呼叫端對 m3/m5 做的
     start_date/stock_ids 過濾也會在這裡被忽略掉。改成直接吃呼叫端已經篩過
-    的版本，不重新載入。"""
+    的版本，不重新載入。m3_std/m5_std 比照同一個原則，也是呼叫端傳入已經
+    篩過範圍/股票池的版本。"""
     m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
     m1["day_date"] = m1["date"].dt.date
 
@@ -138,6 +190,9 @@ def _build_wide_frame(m1: pd.DataFrame, m3: pd.DataFrame, m5: pd.DataFrame) -> p
         on=["stock_id", "date"],
         how="left",
     )
+
+    wide = _add_std_bar_shape(wide, "m3s", m3_std)
+    wide = _add_std_bar_shape(wide, "m5s", m5_std)
 
     day_open_pre = (
         wide.groupby(["stock_id", "day_date"], group_keys=False)["open"].transform("first").replace(0, np.nan)
@@ -347,7 +402,27 @@ def build_dataset(
         m3 = m3[m3["stock_id"].isin(stock_ids)]
         m5 = m5[m5["stock_id"].isin(stock_ids)]
 
-    candidates = make_features(m1, std_mult=std_mult, m3=m3, m5=m5)
+    # 獨立K棒（2026-08-04新增，見 _add_std_bar_shape()）：跟 m3/m5 rolling
+    # 用同一套 start_date/end_date/stock_ids 過濾。
+    m3_std = load_m3_std(start_date=start_date or None)
+    m5_std = load_m5_std(start_date=start_date or None)
+    if start_date:
+        m3_std = m3_std[m3_std["date"] >= start_date]
+        m5_std = m5_std[m5_std["date"] >= start_date]
+    if end_date:
+        m3_std = m3_std[m3_std["date"] <= end_date]
+        m5_std = m5_std[m5_std["date"] <= end_date]
+    if stock_ids is not None:
+        m3_std = m3_std[m3_std["stock_id"].isin(stock_ids)]
+        m5_std = m5_std[m5_std["stock_id"].isin(stock_ids)]
+
+    # 2026-08-04修：之前這裡沒傳 atr5_threshold，make_features() 會用它自己
+    # 在 strategy/vwap_ml/features.py 裡的預設值（綁定的是 vwap_ml.config.
+    # ATR5_FILTER_THRESHOLD，不是這裡 import 進來的 vwap_dl.config.
+    # ATR5_FILTER_THRESHOLD）——等於 vwap_dl 自己的 ATR5_FILTER_THRESHOLD
+    # 從頭到尾沒真的生效過，一直在用 vwap_ml 那份的值（剛好兩邊都設0.01，
+    # 才没被發現）。這裡明確傳進去，兩個常數才會分開運作。
+    candidates = make_features(m1, std_mult=std_mult, atr5_threshold=ATR5_FILTER_THRESHOLD, m3=m3, m5=m5)
     candidates = candidates.dropna(subset=["target"])
     candidates["target"] = candidates["target"].astype(int)
     print(f"  有效候選樣本: {len(candidates):,} 筆")
@@ -358,7 +433,7 @@ def build_dataset(
 
     # 建寬表
     print("建寬表 + 正規化 + 技術指標...")
-    wide = _build_wide_frame(m1, m3, m5)
+    wide = _build_wide_frame(m1, m3, m5, m3_std, m5_std)
 
     # VWAP z-score merge 回 wide
     vwap_z_cols = candidates[["stock_id", "date", "m1_vwap_z", "m3_vwap_z", "m5_vwap_z"]].drop_duplicates(

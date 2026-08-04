@@ -21,7 +21,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from data.query import load_m1_live
-from strategy.vwap_dl.config import DEVICE, THRESHOLD
+from strategy.vwap_dl.config import ATR5_FILTER_THRESHOLD, DEVICE, THRESHOLD
 from strategy.vwap_dl.dataset import _GRU_FEATURE_COLS, _RESNET_COLS
 from strategy.vwap_dl.train import (
     ShardedDataset,
@@ -143,7 +143,12 @@ def predict_live(
 
     m3 = compute_m3(m1)
     m5 = compute_m5(m1)
-    cand_df = make_features(m1, m3=m3, m5=m5)
+    # 2026-08-04修：之前沒傳 atr5_threshold，make_features() 會退回它自己
+    # 在 vwap_ml/features.py 裡的預設值（vwap_ml.config.ATR5_FILTER_THRESHOLD），
+    # 不是這裡 import 進來的 vwap_dl 自己那份——train.py::build_dataset() 也
+    # 有同樣的bug，一併修過，見那邊的說明。這裡不修的話，訓練跟即時推論
+    # 兩邊會用不同的ATR5門檻篩候選，訓練集跟即時看到的候選分布對不起來。
+    cand_df = make_features(m1, atr5_threshold=ATR5_FILTER_THRESHOLD, m3=m3, m5=m5)
 
     # 只保留當下這一分鐘的候選
     current = cand_df[cand_df["date"] == pd.Timestamp(minute_str)]
@@ -154,7 +159,8 @@ def predict_live(
         return []
 
     # 建寬表 + 正規化（比照 dataset.py::_build_wide_frame）
-    from strategy.vwap_dl.dataset import _add_atr_ma, _add_market_relative, _normalize_ohlcv
+    from data.resample import compute_m3_std, compute_m5_std
+    from strategy.vwap_dl.dataset import _add_atr_ma, _add_market_relative, _add_std_bar_shape, _normalize_ohlcv
 
     m3 = m3.rename(
         columns={"open": "m3_open", "high": "m3_high", "low": "m3_low", "close": "m3_close", "volume": "m3_volume_raw"}
@@ -173,6 +179,18 @@ def predict_live(
         how="left",
     )
 
+    # 獨立K棒形態（2026-08-04新增，見 dataset.py::_add_std_bar_shape()）——
+    # predict_live() 是自己現算「今天」資料（批次快取 db/m3_std/db/m5_std
+    # 不含「今天」），比照 m3/m5 rolling 用 compute_m3()/compute_m5() 現算
+    # 的做法，這裡也用 data/resample.py 的 compute_m3_std()/compute_m5_std()
+    # 現算，不能只在 dataset.py 建shard時加、忘記這裡同步加——訓練/推論
+    # 兩邊特徵沒對齊，模型會拿到跟訓練時不同的輸入，而且維度不變不會報錯，
+    # 很容易漏掉。
+    m3_std = compute_m3_std(m1)
+    m5_std = compute_m5_std(m1)
+    wide = _add_std_bar_shape(wide, "m3s", m3_std)
+    wide = _add_std_bar_shape(wide, "m5s", m5_std)
+
     day_open_pre = (
         wide.groupby(["stock_id", "day_date"], group_keys=False)["open"].transform("first").replace(0, np.nan)
     )
@@ -182,14 +200,25 @@ def predict_live(
     _add_atr_ma(wide, g_day, day_open)
     _normalize_ohlcv(wide, "m1", day_open, g_day)
 
-    # VWAP z-score merge
-    vwap_z = current[["stock_id", "date", "m1_vwap_z", "m3_vwap_z", "m5_vwap_z"]].drop_duplicates(
-        subset=["stock_id", "date"]
-    )
+    # VWAP z-score + 大盤 VWAP 特徵 merge（2026-08-04修：market_z_score_m5/
+    # market_vwap_alignment_score/market_vwap_spread_1_5/velocity_ratio_to_market
+    # 這4欄2026-07-28就加進 _GRU_FEATURE_COLS/GRU_INPUT_DIM了，但這裡從來
+    # 沒有把它們從 current merge 進 wide——day_df[_GRU_FEATURE_COLS] 選欄位
+    # 時這4欄根本不存在，predict_live() 只要被呼叫到候選就會直接 KeyError
+    # 炸掉，等於vwap_dl即時推論從那天起就沒真的成功執行過。這裡一併補上。）
+    vwap_cols = [
+        "m1_vwap_z",
+        "m3_vwap_z",
+        "m5_vwap_z",
+        "market_z_score_m5",
+        "market_vwap_alignment_score",
+        "market_vwap_spread_1_5",
+        "velocity_ratio_to_market",
+    ]
+    vwap_z = current[["stock_id", "date"] + vwap_cols].drop_duplicates(subset=["stock_id", "date"])
     wide = wide.merge(vwap_z, on=["stock_id", "date"], how="left")
-    wide["m1_vwap_z"] = wide["m1_vwap_z"].fillna(0)
-    wide["m3_vwap_z"] = wide["m3_vwap_z"].fillna(0)
-    wide["m5_vwap_z"] = wide["m5_vwap_z"].fillna(0)
+    for col in vwap_cols:
+        wide[col] = wide[col].fillna(0)
 
     # 對每個候選股票組裝 tensor
     candidate_stocks = set(current["stock_id"].unique())
@@ -223,9 +252,8 @@ def predict_live(
     if not stock_ids:
         return []
 
-    # ATR5 過濾
-    from strategy.vwap_dl.config import ATR5_FILTER_THRESHOLD
-
+    # ATR5 過濾（跟 make_features() 內部那層重複，見上面呼叫處的說明——這層
+    # 保留當作雙重保險，不影響結果）
     keep = np.array(atr5_vals) >= ATR5_FILTER_THRESHOLD
     if not keep.any():
         return []

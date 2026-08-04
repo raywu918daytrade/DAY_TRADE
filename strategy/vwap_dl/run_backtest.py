@@ -52,4 +52,4 @@ def run(
 
 
 if __name__ == "__main__":
-    run(test_days=30, threshold=0.6, start_date="2024-01-01")
+    run(test_days=90, threshold=0.6, start_date="2024-01-01")
