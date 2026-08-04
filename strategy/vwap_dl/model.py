@@ -74,6 +74,16 @@ class ResNetGRUModel(nn.Module):
     ResNet 看近 10 分鐘原始 OHLCV → local embedding。
     GRU 從 9:00 到當下逐分鐘看 18 維特徵（含 VWAP z-score + 大盤 VWAP 特徵）。
     Concat → MLP → 3 分類 logits。
+
+    2026-08-04 曾經試過在GRU分支加 _TemporalAttention（對逐步輸出做加權
+    平均取代單純用h_n[-1]，理由是解決「最後hidden state瓶頸」）——離線
+    指標進步（Accuracy 0.50→0.55、AUC 0.68→0.71），但回測在30天/90天
+    兩個窗口都一致變差（30天10筆/80.0%/+1.20%→7筆/71.4%/+0.32%；90天
+    21筆/71.4%/+1.60%→19筆/68.4%/+1.25%），判斷是label定義的「回歸」
+    跟backtest的「賺錢」本來就是兩件事、AUC整體排序進步不保證
+    threshold=0.6這個切點附近的樣本也變好，改回不用。備份在
+    models/vwap_dl_cnngru.pt.bak_pre_attn，之後想重新驗證可以直接復用
+    這份說明，不用重新設計。
     """
 
     def __init__(

@@ -159,8 +159,7 @@ def predict_live(
         return []
 
     # 建寬表 + 正規化（比照 dataset.py::_build_wide_frame）
-    from data.resample import compute_m3_std, compute_m5_std
-    from strategy.vwap_dl.dataset import _add_atr_ma, _add_market_relative, _add_std_bar_shape, _normalize_ohlcv
+    from strategy.vwap_dl.dataset import _add_atr_ma, _add_market_relative, _normalize_ohlcv
 
     m3 = m3.rename(
         columns={"open": "m3_open", "high": "m3_high", "low": "m3_low", "close": "m3_close", "volume": "m3_volume_raw"}
@@ -178,18 +177,6 @@ def predict_live(
         on=["stock_id", "date"],
         how="left",
     )
-
-    # 獨立K棒形態（2026-08-04新增，見 dataset.py::_add_std_bar_shape()）——
-    # predict_live() 是自己現算「今天」資料（批次快取 db/m3_std/db/m5_std
-    # 不含「今天」），比照 m3/m5 rolling 用 compute_m3()/compute_m5() 現算
-    # 的做法，這裡也用 data/resample.py 的 compute_m3_std()/compute_m5_std()
-    # 現算，不能只在 dataset.py 建shard時加、忘記這裡同步加——訓練/推論
-    # 兩邊特徵沒對齊，模型會拿到跟訓練時不同的輸入，而且維度不變不會報錯，
-    # 很容易漏掉。
-    m3_std = compute_m3_std(m1)
-    m5_std = compute_m5_std(m1)
-    wide = _add_std_bar_shape(wide, "m3s", m3_std)
-    wide = _add_std_bar_shape(wide, "m5s", m5_std)
 
     day_open_pre = (
         wide.groupby(["stock_id", "day_date"], group_keys=False)["open"].transform("first").replace(0, np.nan)
