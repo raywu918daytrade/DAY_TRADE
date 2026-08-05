@@ -20,7 +20,7 @@
 # predict_live() 一律明確傳 threshold=0（見該檔案），這個預設值從來沒被
 # 用到過，run_backtest.py 也已經改成直接傳 model_type 參數（不再讀
 # ORB_MODEL_TYPE），確認完全沒有消費者後拿掉。
-THRESHOLD_BY_MODEL = {"rfc": 0.60, "lgbm": 0.85, "xgb": 0.8}
+THRESHOLD_BY_MODEL = {"rfc": 0.60, "lgbm": 0.7, "xgb": 0.65}
 
 # ── Triple Barrier 參數（標籤怎麼定義，沿用 rally 的定義） ──────────────────
 # 2026-07-11 測過改成 2%：test_days=10 AUC 幾乎沒變（0.4925→0.4916），

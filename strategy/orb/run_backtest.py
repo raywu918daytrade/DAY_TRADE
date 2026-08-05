@@ -81,6 +81,6 @@ def run(
 if __name__ == "__main__":
     run(
         test_days=DEFAULT_TEST_DAYS,
-        threshold=0.85,
+        threshold=0.7,
         model_type="lgbm",
     )

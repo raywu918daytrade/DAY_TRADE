@@ -21,7 +21,7 @@ load_dotenv(_ROOT / ".env", override=True)
 # 多策略同時下單的資金分配/訊號衝突問題——等實盤穩定、真的要多策略同時
 # 交易時，要先設計好這塊，不要假設現在的架構已經支援。
 STRATEGY_MODULES = [
-    s.strip() for s in os.environ.get("STRATEGY_MODULES", "strategy.orb.xgb.live").split(",") if s.strip()
+    s.strip() for s in os.environ.get("STRATEGY_MODULES", "strategy.orb.lgbm.live").split(",") if s.strip()
 ]
 
 # 多策略「前N名重疊」比對：每個策略各自依 proba 排名取前N名（不管有沒有過
