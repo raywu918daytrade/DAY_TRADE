@@ -28,6 +28,11 @@ STRATEGY_MODULES = [
 # 該策略自己的門檻），同一支股票同時出現在2個以上策略的前N名，視為多模型
 # 共識訊號，額外推送給前端參考（見 main/live_trader.py 的 on_minute()）。
 CONSENSUS_TOP_N = int(os.environ.get("CONSENSUS_TOP_N", "10"))
+# 進共識前N名比對的信心度下限（2026-08-04要求）：proba 沒到這個門檻的，
+# 就算排進前N名也不列入共識比對，避免信心度很低（例如10%、20%）的股票只
+# 因為「排名還算前面」就被兩個策略同時湊到、誤判成共識。跟各策略自己的
+# threshold（決定要不要送出訊號）是兩件事，這個只影響共識判斷。
+CONSENSUS_MIN_PROBA = float(os.environ.get("CONSENSUS_MIN_PROBA", "0.5"))
 
 # 多空衝突（反轉）訊號：同一支股票同一分鐘，如果「某策略」看多信心度 ≥ 這個
 # 門檻、「某策略」（可以是同一個或不同策略）看空信心度也 ≥ 這個門檻，代表

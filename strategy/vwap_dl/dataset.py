@@ -23,7 +23,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from data.raw_query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
+from data.raw_query import iter_m1_months, iter_m3_months, iter_m3_std_months, iter_m5_months, iter_m5_std_months
 from strategy.vwap_dl.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, STD_MULT
 from strategy.vwap_ml.features import make_features
 
@@ -41,6 +41,11 @@ _SOURCE_DIRS = ["db/m1", "db/m3", "db/m5", "db/m3_std", "db/m5_std"]
 #   precision）全面變好，但實際回測從 10筆/80%勝率/+1.20% 掉到
 #   4筆/50%勝率/-0.13%，判斷是這個改動讓結果變差，改回不用，
 #   GRU_INPUT_DIM 改回 18。
+# 2026-08-04 也曾試過加 m1_engulfing（M1吞噬型態，_add_engulfing() 函式
+#   還在，供之後想重試時直接重用）——搭配STD_MULT=1.5一起測，30天/90天
+#   回測都比基準差（10筆/80%/+1.20%→5筆/40%/+0.05%；21筆/71.4%/+1.60%→
+#   13筆/61.5%/+0.86%），改回不用，GRU_INPUT_DIM 改回 18（STD_MULT保留
+#   1.5，只有吞噬特徵這個改動被判斷是變差的原因才拿掉）。
 _GRU_FEATURE_COLS = [
     "m1_open",
     "m1_high",
@@ -101,6 +106,30 @@ def _add_atr_ma(df: pd.DataFrame, g_day, day_open: pd.Series) -> None:
     for name, window in [("ma10", 10), ("ma5", 5), ("ma3", 3)]:
         ma = _degroup(g_day["close"].rolling(window, min_periods=window).mean(), df.index)
         df[name] = (ma / day_open).fillna(0)
+
+
+def _add_engulfing(df: pd.DataFrame, g_day) -> None:
+    """M1吞噬型態（經典反轉訊號，2026-08-04新增）：
+    bullish_engulfing = 當前陽線的實體完全包住前一根陰線的實體（看漲反轉）
+    bearish_engulfing = 當前陰線的實體完全包住前一根陽線的實體（看跌反轉）
+
+    輸出單一signed特徵 m1_engulfing ∈ {-1,0,+1}（bearish/都不是/bullish），
+    比照 add_market_vwap_features()::market_vwap_alignment_score 的
+    {-1,0,1}慣例，不拆成兩個獨立的0/1旗標——bullish/bearish互斥（同一根
+    K棒不可能同時是陽線又是陰線），沒有必要各自佔一個維度。
+
+    每天第一根K棒沒有「前一根」，shift(1)後prev_open/prev_close是NaN，
+    NaN參與的比較（<,>,<=,>=）在pandas/numpy裡結果是False，不會誤判成
+    任何一種吞噬，不用額外處理邊界。"""
+    prev_open = g_day["open"].shift(1)
+    prev_close = g_day["close"].shift(1)
+    prev_bearish = prev_close < prev_open
+    prev_bullish = prev_close > prev_open
+    curr_bullish = df["close"] > df["open"]
+    curr_bearish = df["close"] < df["open"]
+    bullish_engulf = prev_bearish & curr_bullish & (df["open"] <= prev_close) & (df["close"] >= prev_open)
+    bearish_engulf = prev_bullish & curr_bearish & (df["open"] >= prev_close) & (df["close"] <= prev_open)
+    df["m1_engulfing"] = np.select([bullish_engulf, bearish_engulf], [1, -1], default=0)
 
 
 def _add_std_bar_shape(df: pd.DataFrame, prefix: str, std_df: pd.DataFrame) -> pd.DataFrame:
@@ -303,10 +332,6 @@ def _month_bound(date_str: str) -> str:
     return f"{date_str[:4]}_{date_str[5:7]}"
 
 
-def _month_key(day_date) -> str:
-    return f"{day_date.year}_{day_date.month:02d}"
-
-
 def _source_months(start_date: str, end_date: str) -> list[str]:
     m1_dir = _ROOT / "db/m1"
     months = sorted(p.stem for p in m1_dir.glob("*.parquet"))
@@ -375,108 +400,86 @@ def build_dataset(
             print(f"  {month} shard 已是最新，略過重算")
         return months
 
-    # 載入原始資料（帶 start_date 給 load_m1/m3/m5，不要載入整段 db/m1 歷史
-    # 才事後篩——原本這裡沒傳 start_date，每次建shard都會把全部月份讀進
-    # 記憶體，跟 strategy/vwap_ml/train.py 修過的問題是同一類）。
-    print("載入原始資料...")
-    raw_m1 = load_m1(start_date=start_date or None)
-    if start_date:
-        raw_m1 = raw_m1[raw_m1["date"] >= start_date]
-    if end_date:
-        raw_m1 = raw_m1[raw_m1["date"] <= end_date]
-    if stock_ids is not None:
-        raw_m1 = raw_m1[raw_m1["stock_id"].isin(stock_ids)]
-    raw_m1["day_date"] = raw_m1["date"].dt.date
+    # 逐月讀取＋逐月算特徵＋逐月組裝（2026-08-04改，比照
+    # strategy/vwap_ml/train.py::_prepare_data() 的做法）：原本這裡一次讀完
+    # start_date到現在全部月份的m1/m3/m5/m3_std/m5_std，一次算完
+    # make_features()/_build_wide_frame()，只有最後組裝shard才逐月處理——
+    # 真正花記憶體的兩步（算VWAP z-score候選觸發/三分類標籤、建寬表）完全
+    # 沒有分批，STD_MULT/ATR5_FILTER_THRESHOLD調鬆一點候選變多時就會把
+    # 記憶體衝爆（2026-08-04 STD_MULT從2.0調到1.5時實測發現，free記憶體一度
+    # 只剩~60MB、swap被逼到快用完）。改成每個月讀完立刻算完特徵、組裝完
+    # shard，讀下一個月前這個月的資料就能被回收，尖峰記憶體壓到單月等級。
+    print("逐月載入原始資料並算特徵...")
+    m1_iter = iter_m1_months(start_date or None)
+    m3_iter = iter_m3_months(start_date or None)
+    m5_iter = iter_m5_months(start_date or None)
+    m3_std_iter = iter_m3_std_months(start_date or None)
+    m5_std_iter = iter_m5_std_months(start_date or None)
 
-    print("算 VWAP z-score / 候選觸發 / 三分類標籤（引用 vwap_ml/features.py，ATR5 過濾由內部處理）...")
-    m1 = raw_m1
-    m3 = load_m3(start_date=start_date or None)
-    m5 = load_m5(start_date=start_date or None)
-    if start_date:
-        m3 = m3[m3["date"] >= start_date]
-        m5 = m5[m5["date"] >= start_date]
-    if end_date:
-        m3 = m3[m3["date"] <= end_date]
-        m5 = m5[m5["date"] <= end_date]
-    if stock_ids is not None:
-        m3 = m3[m3["stock_id"].isin(stock_ids)]
-        m5 = m5[m5["stock_id"].isin(stock_ids)]
-
-    # 獨立K棒（2026-08-04新增，見 _add_std_bar_shape()）：跟 m3/m5 rolling
-    # 用同一套 start_date/end_date/stock_ids 過濾。
-    m3_std = load_m3_std(start_date=start_date or None)
-    m5_std = load_m5_std(start_date=start_date or None)
-    if start_date:
-        m3_std = m3_std[m3_std["date"] >= start_date]
-        m5_std = m5_std[m5_std["date"] >= start_date]
-    if end_date:
-        m3_std = m3_std[m3_std["date"] <= end_date]
-        m5_std = m5_std[m5_std["date"] <= end_date]
-    if stock_ids is not None:
-        m3_std = m3_std[m3_std["stock_id"].isin(stock_ids)]
-        m5_std = m5_std[m5_std["stock_id"].isin(stock_ids)]
-
-    # 2026-08-04修：之前這裡沒傳 atr5_threshold，make_features() 會用它自己
-    # 在 strategy/vwap_ml/features.py 裡的預設值（綁定的是 vwap_ml.config.
-    # ATR5_FILTER_THRESHOLD，不是這裡 import 進來的 vwap_dl.config.
-    # ATR5_FILTER_THRESHOLD）——等於 vwap_dl 自己的 ATR5_FILTER_THRESHOLD
-    # 從頭到尾沒真的生效過，一直在用 vwap_ml 那份的值（剛好兩邊都設0.01，
-    # 才没被發現）。這裡明確傳進去，兩個常數才會分開運作。
-    candidates = make_features(m1, std_mult=std_mult, atr5_threshold=ATR5_FILTER_THRESHOLD, m3=m3, m5=m5)
-    candidates = candidates.dropna(subset=["target"])
-    candidates["target"] = candidates["target"].astype(int)
-    print(f"  有效候選樣本: {len(candidates):,} 筆")
-
-    if len(candidates) == 0:
-        print("沒有候選樣本，跳過存檔。")
-        return []
-
-    # 建寬表
-    print("建寬表 + 正規化 + 技術指標...")
-    wide = _build_wide_frame(m1, m3, m5, m3_std, m5_std)
-
-    # VWAP z-score merge 回 wide
-    vwap_z_cols = candidates[["stock_id", "date", "m1_vwap_z", "m3_vwap_z", "m5_vwap_z"]].drop_duplicates(
-        subset=["stock_id", "date"]
-    )
-    wide = wide.merge(vwap_z_cols, on=["stock_id", "date"], how="left")
-    wide["m1_vwap_z"] = wide["m1_vwap_z"].fillna(0)
-    wide["m3_vwap_z"] = wide["m3_vwap_z"].fillna(0)
-    wide["m5_vwap_z"] = wide["m5_vwap_z"].fillna(0)
-
-    # 2026-07-28 新增：大盤（0050）VWAP 特徵 merge 回 wide（同一分鐘所有股票共用
-    # 同一組大盤值，所以按 date 去重後 merge）。
-    market_cols = candidates[
-        [
-            "date",
-            "market_z_score_m5",
-            "market_vwap_alignment_score",
-            "market_vwap_spread_1_5",
-            "velocity_ratio_to_market",
-        ]
-    ].drop_duplicates("date")
-    wide = wide.merge(market_cols, on="date", how="left")
-    wide["market_z_score_m5"] = wide["market_z_score_m5"].fillna(0)
-    wide["market_vwap_alignment_score"] = wide["market_vwap_alignment_score"].fillna(0)
-    wide["market_vwap_spread_1_5"] = wide["market_vwap_spread_1_5"].fillna(0)
-    wide["velocity_ratio_to_market"] = wide["velocity_ratio_to_market"].fillna(0)
-
-    # 依月份分組候選，逐月建視窗
-    candidates["_month"] = candidates["date"].apply(_month_key)
-    cand_by_month = {m: g.drop(columns="_month") for m, g in candidates.groupby("_month")}
-
-    for month in months:
+    for month, m1, m3, m5, m3_std, m5_std in zip(months, m1_iter, m3_iter, m5_iter, m3_std_iter, m5_std_iter):
         if month not in stale_months:
             print(f"  {month} shard 已是最新，略過重算")
             continue
 
-        cand_this = cand_by_month.get(month)
-        if cand_this is None or len(cand_this) == 0:
+        if end_date:
+            m1 = m1[m1["date"] <= end_date]
+            m3 = m3[m3["date"] <= end_date]
+            m5 = m5[m5["date"] <= end_date]
+            m3_std = m3_std[m3_std["date"] <= end_date]
+            m5_std = m5_std[m5_std["date"] <= end_date]
+        if stock_ids is not None:
+            m1 = m1[m1["stock_id"].isin(stock_ids)]
+            m3 = m3[m3["stock_id"].isin(stock_ids)]
+            m5 = m5[m5["stock_id"].isin(stock_ids)]
+            m3_std = m3_std[m3_std["stock_id"].isin(stock_ids)]
+            m5_std = m5_std[m5_std["stock_id"].isin(stock_ids)]
+
+        # 2026-08-04修：之前這裡沒傳 atr5_threshold，make_features() 會用它
+        # 自己在 strategy/vwap_ml/features.py 裡的預設值（綁定的是
+        # vwap_ml.config.ATR5_FILTER_THRESHOLD，不是這裡 import 進來的
+        # vwap_dl.config.ATR5_FILTER_THRESHOLD）——等於 vwap_dl 自己的
+        # ATR5_FILTER_THRESHOLD 從頭到尾沒真的生效過，一直在用 vwap_ml 那份
+        # 的值（剛好兩邊都設0.01，才没被發現）。這裡明確傳進去，兩個常數
+        # 才會分開運作。
+        candidates = make_features(m1, std_mult=std_mult, atr5_threshold=ATR5_FILTER_THRESHOLD, m3=m3, m5=m5)
+        candidates = candidates.dropna(subset=["target"])
+        candidates["target"] = candidates["target"].astype(int)
+        print(f"  {month} 有效候選樣本: {len(candidates):,} 筆")
+
+        if len(candidates) == 0:
             print(f"  {month} 沒有候選樣本，略過存檔")
             continue
 
-        print(f"  組裝 {month}（{len(cand_this):,} 候選）...")
-        data, meta = _build_candidate_data(wide, cand_this)
+        wide = _build_wide_frame(m1, m3, m5, m3_std, m5_std)
+
+        # VWAP z-score merge 回 wide
+        vwap_z_cols = candidates[["stock_id", "date", "m1_vwap_z", "m3_vwap_z", "m5_vwap_z"]].drop_duplicates(
+            subset=["stock_id", "date"]
+        )
+        wide = wide.merge(vwap_z_cols, on=["stock_id", "date"], how="left")
+        wide["m1_vwap_z"] = wide["m1_vwap_z"].fillna(0)
+        wide["m3_vwap_z"] = wide["m3_vwap_z"].fillna(0)
+        wide["m5_vwap_z"] = wide["m5_vwap_z"].fillna(0)
+
+        # 2026-07-28 新增：大盤（0050）VWAP 特徵 merge 回 wide（同一分鐘所有
+        # 股票共用同一組大盤值，所以按 date 去重後 merge）。
+        market_cols = candidates[
+            [
+                "date",
+                "market_z_score_m5",
+                "market_vwap_alignment_score",
+                "market_vwap_spread_1_5",
+                "velocity_ratio_to_market",
+            ]
+        ].drop_duplicates("date")
+        wide = wide.merge(market_cols, on="date", how="left")
+        wide["market_z_score_m5"] = wide["market_z_score_m5"].fillna(0)
+        wide["market_vwap_alignment_score"] = wide["market_vwap_alignment_score"].fillna(0)
+        wide["market_vwap_spread_1_5"] = wide["market_vwap_spread_1_5"].fillna(0)
+        wide["velocity_ratio_to_market"] = wide["velocity_ratio_to_market"].fillna(0)
+
+        print(f"  組裝 {month}（{len(candidates):,} 候選）...")
+        data, meta = _build_candidate_data(wide, candidates)
         if len(meta) == 0:
             print(f"  {month} 視窗組裝後無有效樣本，略過存檔")
             continue

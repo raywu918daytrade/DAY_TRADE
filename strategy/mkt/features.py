@@ -14,7 +14,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from strategy.mkt.config import HOLD_BARS, IDX_SYMBOL, SL_PCT, TOP_N, TP_PCT
+from strategy.mkt.config import HOLD_BARS, IDX_SYMBOL, SL_PCT, TP_PCT
 
 
 def add_ret_vs_idx(m1: pd.DataFrame, idx_symbol: str = IDX_SYMBOL) -> pd.DataFrame:
@@ -351,28 +351,6 @@ def top_n_by_prev_day_volume(m1: pd.DataFrame, n: int = 500) -> pd.DataFrame:
     daily_vol["rank"] = daily_vol.groupby("day_date")["prev_day_volume"].rank(ascending=False, method="first")
     keep = daily_vol[daily_vol["rank"] <= n][["stock_id", "day_date"]]
     return m1.merge(keep, on=["stock_id", "day_date"], how="inner")
-
-
-def top_n_stock_ids_by_latest_volume(m1_hist: pd.DataFrame, n: int = TOP_N) -> set:
-    """給即時推論用：從歷史 m1（load_m1()，不含今天，因為 db/m1 是收盤後才
-    更新）取「最後一個交易日」全天成交量前 n 名股票代號，當作「今天」的
-    流動性篩選名單。
-
-    跟 top_n_by_prev_day_volume() 邏輯一致（都是用前一交易日的量排名），
-    那支是回測用、對整個多日 df 逐日 shift(1) 算出「每一天」各自的名單；
-    這支只需要算出「今天」單獨這一天要用的名單，開盤前算一次就整天沿用
-    （見 predict.py::build_prewarm_cache()），不用每分鐘重算一次。
-
-    m1_hist 需已有 stock_id/date/volume 欄位（day_date 若沒有會自動從 date
-    算，方便直接對 load_m1() 的原始輸出呼叫，不用呼叫端自己先加 day_date）。
-    """
-    if "day_date" not in m1_hist.columns:
-        m1_hist = m1_hist.assign(day_date=pd.to_datetime(m1_hist["date"]).dt.date)
-    daily_vol = m1_hist.groupby(["stock_id", "day_date"])["volume"].sum().reset_index()
-    latest_day = daily_vol["day_date"].max()
-    latest = daily_vol[daily_vol["day_date"] == latest_day]
-    top = latest.sort_values("volume", ascending=False).head(n)
-    return set(top["stock_id"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

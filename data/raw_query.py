@@ -116,6 +116,26 @@ def iter_m5_months(start_date: str | None = None):
         yield df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
+def iter_m3_std_months(start_date: str | None = None):
+    """逐月yield db/m3_std/ 標準獨立3分K棒（原始價格），同 iter_m1_months()
+    的動機，去重行為維持跟 load_m3_std() 一致（不去重）。"""
+    path = _ROOT / "db/m3_std"
+    for p in _month_file_list(path, start_date):
+        df = ds.dataset(p, format="parquet").to_table().to_pandas()
+        df["date"] = pd.to_datetime(df["date"])
+        yield df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
+def iter_m5_std_months(start_date: str | None = None):
+    """逐月yield db/m5_std/ 標準獨立5分K棒（原始價格），同 iter_m1_months()
+    的動機，去重行為維持跟 load_m5_std() 一致（不去重）。"""
+    path = _ROOT / "db/m5_std"
+    for p in _month_file_list(path, start_date):
+        df = ds.dataset(p, format="parquet").to_table().to_pandas()
+        df["date"] = pd.to_datetime(df["date"])
+        yield df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+
 def load_m3(start_date: str | None = None) -> pd.DataFrame:
     """載入 db/m3/ 3 分鐘K（原始價格），rolling 版本，每分鐘一列（由
     build_m3_m5_rolling.py 預先聚合）。一般情況請用

@@ -265,6 +265,17 @@ def _last_stored_dates(base_dir: str = _D1_DIR) -> dict[str, str]:
     return df.groupby("stock_id")["date"].max().to_dict()
 
 
+def _has_today_data(df: pd.DataFrame, date_str: str) -> bool:
+    """判斷下載回來的資料是否真的包含「今天」這一天（2026-08-04發現：day K
+    也有跟 m1 一樣的問題——如果在今天日K還沒發布時執行，API 回傳非空
+    （有更早的歷史），但最新一筆只到昨天，這時候不能標記 flag，否則收盤後
+    重跑會被誤判成「今天已處理過」而跳過，today 這一天永遠抓不到。比照
+    data/m1_data_loader.py::_has_today_data() 的同一種修法，day K 的 date
+    欄位是純日期字串（YYYY-MM-DD，不含時分秒），用完全比對即可，不用像
+    m1 那樣 str.startswith()。"""
+    return bool((df["date"] == date_str).any())
+
+
 def _update_day_fugle(
     stocks: list,
     stock_start_dates: dict[str, str],
@@ -307,7 +318,10 @@ def _update_day_fugle(
             df = _download_day(stock_id, stock_start_dates[stock_id], token=token, adjusted=adjusted)
             if not df.empty:
                 _save_day(df, base_dir=base_dir)
-                _update_flag(stock_id, date_str, flag_path=flag_path)
+                if _has_today_data(df, date_str):
+                    _update_flag(stock_id, date_str, flag_path=flag_path)
+                else:
+                    print(f"  [{label}] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓）")
             return stock_id, len(df), None
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
@@ -346,7 +360,10 @@ def _update_day_fubon(
             df = _download_day_fubon(sdk, stock_id, stock_start_dates[stock_id], adjusted=adjusted)
             if not df.empty:
                 _save_day(df, base_dir=base_dir)
-                _update_flag(stock_id, date_str, flag_path=flag_path)
+                if _has_today_data(df, date_str):
+                    _update_flag(stock_id, date_str, flag_path=flag_path)
+                else:
+                    print(f"  [富邦] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓）")
             if i % 100 == 0 or i == len(stocks):
                 print(f"  [富邦 {i}/{len(stocks)}] 進度更新")
         except Exception as e:

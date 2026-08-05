@@ -90,6 +90,7 @@ from main import premarket as _premarket
 from main.backfill import run_startup_backfill
 from main.config import (
     CONFLICT_THRESHOLD,
+    CONSENSUS_MIN_PROBA,
     CONSENSUS_TOP_N,
     FORCE_CLOSE_HOUR as _FORCE_CLOSE_HOUR,
     FORCE_CLOSE_MIN as _FORCE_CLOSE_MIN,
@@ -467,7 +468,11 @@ def on_minute(minute_str: str, df: pd.DataFrame):
 
         top = sorted(all_results, key=lambda x: -x["proba"])[:5]
         for direction in ("up", "down"):
-            dir_results = [r for r in all_results if r["direction"] == direction]
+            # 信心度沒到 CONSENSUS_MIN_PROBA 就不列入共識比對（2026-08-04要求），
+            # 避免排名前面但信心度其實很低的股票被誤判成共識。
+            dir_results = [
+                r for r in all_results if r["direction"] == direction and r["proba"] >= CONSENSUS_MIN_PROBA
+            ]
             if dir_results:
                 top_by_direction[direction][s.name] = sorted(dir_results, key=lambda x: -x["proba"])[:CONSENSUS_TOP_N]
         for r in all_results:

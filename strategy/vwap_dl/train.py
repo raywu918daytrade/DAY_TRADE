@@ -19,7 +19,7 @@ import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
-from strategy.vwap_dl.config import DEVICE
+from strategy.vwap_dl.config import DEVICE, STD_MULT
 from strategy.vwap_dl.dataset import available_months, build_dataset, load_shard_data, load_shard_meta
 from strategy.vwap_dl.model import ResNetGRUModel, N_CLASSES
 
@@ -134,7 +134,7 @@ def train(
     start_date: str = "",
     end_date: str = "",
     force_rebuild: bool = False,
-    std_mult: float = 2.0,
+    std_mult: float = STD_MULT,
 ) -> ResNetGRUModel | None:
     """
     訓練 ResNet + GRU 混合模型。
@@ -158,7 +158,7 @@ def train(
         start_date: 資料起日 YYYY-MM-DD（預設空字串＝全部歷史）
         end_date:   資料迄日 YYYY-MM-DD（預設空字串＝全部歷史）
         force_rebuild: 是否強制重建 cache（預設 False）
-        std_mult: VWAP z-score 偏離標準差門檻（預設 2.0）
+        std_mult: VWAP z-score 偏離標準差門檻（預設沿用 config.STD_MULT）
 
     回傳：
         訓練好的 ResNetGRUModel，若資料不足則回傳 None。
@@ -508,7 +508,7 @@ def main(
     start_date: str = "",
     end_date: str = "",
     force_rebuild: bool = False,
-    std_mult: float = 2.0,
+    std_mult: float = STD_MULT,
 ) -> None:
     """
     CLI 進入點。支援三種模式：
@@ -545,7 +545,7 @@ def main(
         parser.add_argument("--start_date", type=str, default="", help="資料起日 YYYY-MM-DD")
         parser.add_argument("--end_date", type=str, default="", help="資料迄日 YYYY-MM-DD")
         parser.add_argument("--force_rebuild", action="store_true", help="強制重建 cache")
-        parser.add_argument("--std_mult", type=float, default=2.0, help="VWAP z-score 門檻")
+        parser.add_argument("--std_mult", type=float, default=STD_MULT, help="VWAP z-score 門檻")
         args = parser.parse_args()
         mode = args.mode
         test_days = args.test_days
@@ -612,7 +612,7 @@ if __name__ == "__main__":
     start_date = "2024-01-01"
     end_date = ""
     force_rebuild = False
-    std_mult = 2.0
+    std_mult = STD_MULT
 
     main(
         mode=mode,

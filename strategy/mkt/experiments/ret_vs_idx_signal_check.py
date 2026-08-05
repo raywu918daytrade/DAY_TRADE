@@ -31,19 +31,23 @@ import numpy as np
 import pandas as pd
 
 from data.raw_query import load_m1
+from finmind.tick_universe import load_tick_universe
 from strategy.mkt.config import IDX_SYMBOL
-from strategy.mkt.features import add_ret_vs_idx, top_n_by_prev_day_volume
+from strategy.mkt.features import add_ret_vs_idx
 
 
-def _load_base(top_n: int | None = None) -> pd.DataFrame:
+def _load_base(since: str | None = None, universe_only: bool = False) -> pd.DataFrame:
     """載入分K + 算好 ret_vs_idx，各 forward_minutes 共用同一份，不用重複載入。
 
-    top_n: 留空=不過濾；設數字則只留每天依前一日成交量排序前 top_n 名的股票
-    （見 strategy/mkt/features.py::top_n_by_prev_day_volume，2026-07-14
-    驗證過流動性過濾能提升訊號密度，這裡進一步驗證過濾後 decile 的優勢
-    是否也更明顯）。"""
+    since（2026-07-25新增）：只讀這個日期之後的月份檔案（見
+    data/raw_query.py::load_m1() 的 start_date），加快小規模快速驗證，
+    不用每次都讀全部歷史。
+
+    universe_only（2026-07-25新增，取代舊的top_n參數）：True=只留
+    tick_universe固定400支，跟正式pipeline（train.py::_prepare_data()）
+    用同一套母體；False=不過濾，看全市場。"""
     print("載入分K...")
-    m1 = load_m1()
+    m1 = load_m1(start_date=since)
     m1["date"] = pd.to_datetime(m1["date"])
     m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
     m1["day_date"] = m1["date"].dt.date
@@ -54,11 +58,11 @@ def _load_base(top_n: int | None = None) -> pd.DataFrame:
     df = add_ret_vs_idx(m1)
     df = df[df["stock_id"] != IDX_SYMBOL]  # 排除 0050 自己（ret_vs_idx 恆為 0）
 
-    if top_n:
-        print(f"流動性過濾：只留每天前一日量排名前{top_n}名的股票...")
+    if universe_only:
+        print("股票母體過濾：tick_universe固定400支...")
         before = df["stock_id"].nunique()
-        df = top_n_by_prev_day_volume(df, n=top_n)
-        print(f"  股票數: {before} → {df['stock_id'].nunique()}（依日期各自篩選）")
+        df = df[df["stock_id"].isin(set(load_tick_universe()))]
+        print(f"  股票數: {before} → {df['stock_id'].nunique()}")
 
     return df
 
@@ -110,17 +114,12 @@ def run(df_base: pd.DataFrame, forward_minutes: int = 5):
 
 
 if __name__ == "__main__":
-    # HOLD_BARS=10 已經定案，這裡只比較 5/10 分鐘（跟持有時間對得上的窗口），
-    # 不重跑 15/30（那兩個之前已經驗證過訊號會衰退/反轉，跟這次要驗證的
-    # 「流動性過濾後優勢是否更明顯」無關）。
-    print(f"\n{'#'*70}\n不過濾（全部股票）\n{'#'*70}")
-    base_all = _load_base()
-    for _fwd in [5, 10]:
+    # 2026-07-25討論：重新驗證HOLD_BARS要不要改30——之前（2026-07-14）在
+    # top_n=100母體上驗證過15/30分鐘訊號衰退/反轉，但母體已經改成
+    # tick_universe固定400支（見config.py），用since限制在最近幾個月，
+    # 快速確認結論在新母體上是否還成立，不用重跑全部歷史。
+    print(f"\n{'#'*70}\ntick_universe固定400支（最近3個月）\n{'#'*70}")
+    base_universe = _load_base(since="2026-05-01", universe_only=True)
+    for _fwd in [5, 10, 15, 30]:
         print(f"\n{'='*70}\nforward_minutes = {_fwd}\n{'='*70}")
-        run(base_all, forward_minutes=_fwd)
-
-    print(f"\n{'#'*70}\n前一日量排名前100\n{'#'*70}")
-    base_top100 = _load_base(top_n=100)
-    for _fwd in [5, 10]:
-        print(f"\n{'='*70}\nforward_minutes = {_fwd}\n{'='*70}")
-        run(base_top100, forward_minutes=_fwd)
+        run(base_universe, forward_minutes=_fwd)

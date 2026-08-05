@@ -25,16 +25,22 @@ import numpy as np
 import pandas as pd
 
 from data.raw_query import load_m1
-from strategy.mkt.config import IDX_SYMBOL, TOP_N
-from strategy.mkt.features import add_atr5, add_ret_vs_idx, make_barrier_labels_3class, top_n_by_prev_day_volume
+from finmind.tick_universe import load_tick_universe
+from strategy.mkt.config import IDX_SYMBOL
+from strategy.mkt.features import add_atr5, add_ret_vs_idx, make_barrier_labels_3class
 from strategy.mkt.train import _prepare_data
 
 
-def _atr5_full_day(top_n: int = TOP_N, since: str | None = None) -> pd.DataFrame:
-    """對完整一天（含9:00~9:10暖機期）、流動性過濾後的m1算atr5——保留
-    day內的分鐘連續性，rolling(5)/shift(1)才不會算錯。只回傳
+def _atr5_full_day(since: str | None = None) -> pd.DataFrame:
+    """對完整一天（含9:00~9:10暖機期）、tick_universe固定400支過濾後的m1
+    算atr5——保留day內的分鐘連續性，rolling(5)/shift(1)才不會算錯。只回傳
     stock_id/day_date/date/atr5，之後拿去merge。since可選，篩日期範圍
-    加快測試（例如"2026-06-01"）。"""
+    加快測試（例如"2026-06-01"）。
+
+    ⚠️ 2026-07-25改用tick_universe固定母體，不再用top_n動態排名——見
+    strategy/mkt/train.py::_prepare_data() 的說明，兩邊要用同一套母體，
+    這支診斷腳本的結果才能對應到正式pipeline實際會用的資料。
+    """
     m1 = load_m1()
     m1["date"] = pd.to_datetime(m1["date"])
     if since is not None:
@@ -44,7 +50,7 @@ def _atr5_full_day(top_n: int = TOP_N, since: str | None = None) -> pd.DataFrame
 
     df = add_ret_vs_idx(m1)
     df = df[df["stock_id"] != IDX_SYMBOL]
-    df = top_n_by_prev_day_volume(df, n=top_n)
+    df = df[df["stock_id"].isin(set(load_tick_universe()))]
     df = add_atr5(df)
     return df[["stock_id", "day_date", "date", "close", "atr5"]]
 
@@ -209,7 +215,7 @@ def run_flat_only(percentiles: list[int] | None = None, use_cache: bool = True):
     return df
 
 
-def run_absolute_uniform(percentiles: list[int] | None = None, top_n: int = TOP_N):
+def run_absolute_uniform(percentiles: list[int] | None = None):
     """
     「絕對門檻＋三類都篩」——可以上線用的版本（2026-07-23討論）。
 
@@ -239,7 +245,7 @@ def run_absolute_uniform(percentiles: list[int] | None = None, top_n: int = TOP_
         percentiles = [10, 25, 50, 75, 90]
 
     print("對完整一天重算atr5（保留暖機期的分鐘連續性）...")
-    atr5_df = _atr5_full_day(top_n=top_n)
+    atr5_df = _atr5_full_day()
     atr5_df["target"] = make_barrier_labels_3class(atr5_df)
 
     print("時段過濾：9:11~9:30（跟_prepare_data()一致，ATR5過濾前）...")

@@ -6,7 +6,9 @@ import os
 import torch
 
 # ── VWAP band 設定（參照 vwap_ml/config.py） ─────────────────────────────────
-STD_MULT = 2.0
+# 2026-08-04 從 2.0 調降到 1.5：候選觸發門檻放寬，換取更多候選事件；跟
+# vwap_ml/config.py 的 STD_MULT 是各自獨立的常數，改這裡不影響 vwap_ml。
+STD_MULT = 1.5
 LABEL_HORIZON_MINUTES = 30
 
 # 即時交易信心度門檻
@@ -49,6 +51,10 @@ CNN_EMBED_DIM = 32
 #   一度改成24，_add_std_bar_shape() 函式還留著沒刪，供之後想重試時直接
 #   重用），但離線指標變好、實際回測（10筆/80%勝率/+1.20% → 4筆/50%勝率/
 #   -0.13%）反而變差，改回不用，GRU_INPUT_DIM 改回 18。
+#   2026-08-04 也曾加 m1_engulfing（M1吞噬型態，見
+#   strategy/vwap_dl/dataset.py::_add_engulfing()，函式還在，之後想重試
+#   可以直接重用）——搭配STD_MULT=1.5一起測，30天/90天回測都比基準差，
+#   改回不用，GRU_INPUT_DIM 改回 18（STD_MULT保留1.5）。
 GRU_INPUT_DIM = 18
 GRU_HIDDEN_DIM = 64
 GRU_N_LAYERS = 2

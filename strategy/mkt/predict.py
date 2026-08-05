@@ -16,9 +16,9 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import pandas as pd
 
 from data.query import load_day, load_m1_live
-from data.raw_query import load_m1
 from data.resample import compute_m3, compute_m3_std, compute_m5, compute_m5_std
-from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, MODEL_TYPE, TOP_N
+from finmind.tick_universe import load_tick_universe
+from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, MODEL_TYPE
 from strategy.mkt.features import (
     FEATURES,
     add_atr5,
@@ -27,7 +27,6 @@ from strategy.mkt.features import (
     add_m3_m5_features,
     add_m3_m5_std_features,
     add_ret_vs_idx,
-    top_n_stock_ids_by_latest_volume,
 )
 from strategy.mkt.train import _prepare_data, load_model_by_type
 
@@ -94,32 +93,32 @@ def predict(model=None, test_days: int = 30, test_only: bool = True, use_cache: 
     return df_proba
 
 
-def build_prewarm_cache(top_n: int = TOP_N, day_trade_stocks: set | None = None) -> dict:
+def build_prewarm_cache(day_trade_stocks: set | None = None) -> dict:
     """
     盤前預算快取 — 給 strategy/prewarm.py 統一呼叫的介面，比照
     strategy/orb/predict.py、strategy/rally/predict.py 的 build_prewarm_cache()。
 
-    top_n_stock_ids：今天的流動性名單（前一交易日全天量前 top_n 名），開盤
-    前算一次、整天沿用，不要讓 predict_live() 每分鐘都重算一次
-    top_n_stock_ids_by_latest_volume(load_m1())（load_m1() 讀全部歷史分K，
-    很慢）。
+    2026-07-25討論：不再用「前一日量前N名」動態排名（TOP_N，見
+    strategy/mkt/config.py股票母體那段說明）——改成固定讀
+    db/tickers/tick_universe.parquet的400支，是靜態清單，不用像以前那樣
+    現算load_m1()均量排名（load_m1()讀全部歷史很慢），這裡也不再需要。
 
     day_trade_stocks：strategy/prewarm.py 統一傳入的當沖候選清單，這裡不用
-    ——mkt 自己就是要「依均量排名重新選出 top_n」，用途跟 day_trade_stocks
-    那份候選清單不同，收下只是為了跟其他策略維持同一組介面，不要拿去篩資料
-    （會變成拿候選清單去篩「用來決定候選清單的原始資料」，邏輯本末倒置）。
+    ——mkt 自己的候選池就是tick_universe這400支，用途跟day_trade_stocks
+    那份候選清單不同，收下只是為了跟其他策略維持同一組介面，不要拿去篩
+    資料（會變成拿候選清單去篩「用來決定候選清單的原始資料」，邏輯本末
+    倒置）。
 
     回傳的 dict key 要跟 predict_live() 接受的參數名一致，因為
     main/live_trader.py 會直接 **cache 展開傳進 predict_live()。
     """
-    top_n_stock_ids = top_n_stock_ids_by_latest_volume(load_m1(start_date=_recent_start_date()), n=top_n)
-    return {"top_n_stock_ids": top_n_stock_ids}
+    return {"universe_stock_ids": set(load_tick_universe())}
 
 
 def predict_live(
     minute_str: str,
     day: pd.DataFrame | None = None,
-    top_n_stock_ids: set | None = None,
+    universe_stock_ids: set | None = None,
     model=None,
     threshold: float = 0.6,
     day_trade_stocks: set | None = None,
@@ -138,11 +137,11 @@ def predict_live(
     用不到也要保留在同一個位置。2026-07-23起 idx_gap_pct（0050開盤跳空
     缺口）需要用到它，不再是純粹為了介面相容才收下、不使用。
 
-    top_n_stock_ids: 今天的流動性名單，見 build_prewarm_cache()。留空則內部
-        自己現算 top_n_stock_ids_by_latest_volume(load_m1())（對全歷史 db/m1/
-        算，比較慢；production 環境應該開盤前算一次傳進來，不要每分鐘重算）。
+    universe_stock_ids: 股票母體（tick_universe固定400支），見
+        build_prewarm_cache()。留空則內部自己呼叫load_tick_universe()（很快，
+        是靜態清單，不用像以前top_n設計那樣載入m1算均量排名）。
     day_trade_stocks: 當沖標的 set，若提供則只推論這些股票（跟
-        top_n_stock_ids 是「且」的關係，兩邊都要通過才會納入候選）。
+        universe_stock_ids 是「且」的關係，兩邊都要通過才會納入候選）。
     m1_live: 已載入的今日即時分K，傳入可避免每次呼叫都重讀 db/m1_live/
         （live_trader.py 應該自己維護一份、每分鐘更新後傳進來）。留空則沿用
         舊行為，內部自己 load_m1_live()。
@@ -151,7 +150,7 @@ def predict_live(
     篩掉 m1_live，這裡不能這麼做——ret_vs_idx 要用 0050 自己的分K資料當基準
     （見 features.py::add_ret_vs_idx()），如果 0050 不在當沖名單裡就會被
     先篩掉，之後就沒有基準可以算。所以這裡先對完整 m1_live 算完 ret_vs_idx，
-    才排除 0050 本身、套用 top_n_stock_ids/day_trade_stocks 篩選。
+    才排除 0050 本身、套用 universe_stock_ids/day_trade_stocks 篩選。
 
     回傳格式：[{"stock_id": ..., "proba": ..., "price": ..., "direction": "up"|"down"}, ...]
     ——同一支股票在同一分鐘理論上只會出現一次（做多機率、做空機率各自比
@@ -206,9 +205,9 @@ def predict_live(
     df = add_idx_gap_pct(df, day)
     df = df[df["stock_id"] != IDX_SYMBOL]
 
-    if top_n_stock_ids is None:
-        top_n_stock_ids = top_n_stock_ids_by_latest_volume(load_m1(start_date=_recent_start_date()))
-    df = df[df["stock_id"].isin(top_n_stock_ids)]
+    if universe_stock_ids is None:
+        universe_stock_ids = set(load_tick_universe())
+    df = df[df["stock_id"].isin(universe_stock_ids)]
     if day_trade_stocks:
         df = df[df["stock_id"].isin(day_trade_stocks)]
     if df.empty:

@@ -10,7 +10,8 @@ XGBoost/LightGBM，三個模型共用同一份 FEATURES/_split_data() 切分邏�
 目前設定（都是前面幾支 experiments/ 腳本驗證出來的結論）：
     FEATURES        見 strategy/mkt/features.py（單一事實來源，這裡
                     不重複列一份，避免兩邊各自維護一份不一致）
-    流動性過濾：前一日量前100名   訊號密度提升最明顯的門檻
+    股票母體：db/tickers/tick_universe.parquet固定400支（2026-07-25起，
+                    不再用「前一日量前N名」動態排名，理由見_prepare_data()）
     時段：9:11~9:30                9:00~9:10被判定為開盤集合競價剛結束的
                     雜訊時段、沒有方向性，已棄用（見 config.py 的說明）
     3分類標籤：漲/平/跌           HOLD_BARS=10、TP_PCT=SL_PCT=3%（見config.py）
@@ -53,7 +54,8 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 
 from data.query import load_day
 from data.raw_query import load_m1, load_m3, load_m3_std, load_m5, load_m5_std
-from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL, TOP_N
+from finmind.tick_universe import load_tick_universe
+from strategy.mkt.config import ATR5_FILTER_THRESHOLD, IDX_SYMBOL
 from strategy.mkt.features import (
     FEATURES,
     add_atr5,
@@ -63,7 +65,6 @@ from strategy.mkt.features import (
     add_m3_m5_std_features,
     add_ret_vs_idx,
     make_barrier_labels_3class,
-    top_n_by_prev_day_volume,
 )
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -88,16 +89,6 @@ def _source_mtime() -> float:
     return max(mtimes) if mtimes else 0
 
 
-def _cache_path_for(top_n: int) -> Path:
-    """top_n=TOP_N（config.py正式設定，2026-07-25起=300）用原本那份共用
-    cache（mkt_prepared.parquet）；其他top_n值各自存獨立檔案（2026-07-22
-    討論）——top_n是在_prepare_data()內部就套用的流動性過濾，不像
-    start_date是事後才篩，如果共用同一份cache，不同top_n會互相覆蓋、
-    讀到錯的資料（例如拿top_n=100算出來的cache，被誤判成新鮮的
-    top_n=300結果直接回傳）。"""
-    return _CACHE_PATH if top_n == TOP_N else _ROOT / f"cache/mkt_prepared_top{top_n}.parquet"
-
-
 def _cache_is_fresh(cache_path: Path) -> bool:
     if not cache_path.exists():
         return False
@@ -105,7 +96,6 @@ def _cache_is_fresh(cache_path: Path) -> bool:
 
 
 def _prepare_data(
-    top_n: int = TOP_N,
     hour: int = 9,
     minute_min: int = 11,
     minute_max: int = 30,
@@ -123,17 +113,13 @@ def _prepare_data(
                 db/m1 今天寫進新的即時資料），就視為過期、重新跑一次完整
                 流程並覆蓋掉舊cache。不用手動清cache、不用設定過期時間。
 
-    top_n 不同值各自有獨立cache，見 _cache_path_for() 的說明。
-
     atr5_threshold（2026-07-25新增）：只給 experiments/ 拿來測試不同ATR5
     門檻用，預設就是正式設定 config.ATR5_FILTER_THRESHOLD。⚠️ 只要傳的值
     跟正式設定不同，就完全跳過cache讀寫（不讀舊cache、也不寫檔案）——
-    cache只用 top_n 當key，不知道atr5_threshold是什麼，如果讓非預設門檻
-    也去讀寫同一份cache，會弄髒正式pipeline在用的cache檔案。這代表用非
-    預設門檻呼叫這支函式每次都會重新跑一次完整流程，比較慢，但只有
-    experiments/ 會這樣用，不影響正式train/predict。
+    這代表用非預設門檻呼叫這支函式每次都會重新跑一次完整流程，比較慢，
+    但只有 experiments/ 會這樣用，不影響正式train/predict。
     """
-    cache_path = _cache_path_for(top_n)
+    cache_path = _CACHE_PATH
     skip_cache = atr5_threshold != ATR5_FILTER_THRESHOLD
     if not skip_cache:
         if use_cache and cache_path.exists():
@@ -146,8 +132,29 @@ def _prepare_data(
     print("載入分K...")
     m1 = load_m1()
     m1["date"] = pd.to_datetime(m1["date"])
-    m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
     m1["day_date"] = m1["date"].dt.date
+
+    print("股票母體過濾：tick_universe固定400支...")
+    # 2026-07-25討論：不再用「前一日量前N名」動態排名（TOP_N）——db/m1的
+    # 股票覆蓋範圍歷史上一直在變（見config.py股票母體那段說明），用動態
+    # 排名選出來的候選池在不同期間實際上大小不一樣，會汙染跨時間的
+    # 比較。改成固定用db/tickers/tick_universe.parquet這400支（跟
+    # data/m1_data_loader.py 2026-08-01起db/m1只收錄的股票母體一致），
+    # train/predict用同一份，不隨日期/成交量變動。
+    #
+    # ⚠️ 一定要在 load_m1() 之後、算任何特徵之前就篩掉不需要的股票——
+    # 早期歷史月份 db/m1 曾經涵蓋到2000~2700支股票（全市場），沒先篩會對
+    # 用不到的股票也跑一次 add_ret_vs_idx()/add_idx_gap_pct() 這些逐列
+    # 運算，2026-08-05曾經因為這樣把記憶體吃到55GB、process卡死
+    # （幾年歷史 x 2000多支股票 x 分鐘級資料，量體差了5~7倍）。
+    # add_ret_vs_idx()/add_idx_gap_pct() 都是逐股票算、只額外依賴0050
+    # 自己那份資料（見兩支函式docstring），篩到只剩tick_universe+0050
+    # 不影響算出來的結果，只是不用陪著全市場一起算。
+    before = m1["stock_id"].nunique()
+    universe = set(load_tick_universe()) | {IDX_SYMBOL}
+    m1 = m1[m1["stock_id"].isin(universe)]
+    print(f"  股票數: {before} → {m1['stock_id'].nunique()}（含0050，下面算完特徵才排除）")
+    m1 = m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
     print("算 ret_vs_idx...")
     # 0050 自己要留著算完才能排除，理由見 features.py::add_ret_vs_idx() 的說明
@@ -157,11 +164,6 @@ def _prepare_data(
     # 同樣要在排除0050之前算，理由見 features.py::add_idx_gap_pct() 的說明
     df = add_idx_gap_pct(df, load_day())
     df = df[df["stock_id"] != IDX_SYMBOL]
-
-    print(f"流動性過濾：前一日量前{top_n}名...")
-    before = df["stock_id"].nunique()
-    df = top_n_by_prev_day_volume(df, n=top_n)
-    print(f"  股票數: {before} → {df['stock_id'].nunique()}（依日期各自篩選）")
 
     print("算當根K棒量能/波動特徵...")
     df = add_bar_features(df)
