@@ -411,7 +411,7 @@ if __name__ == "__main__":
     start_date = "2024-01-01"
     end_date = ""
     use_cache = True  # False 時 mode=train 不管每個月分區新不新鮮，目標範圍內全部強制重算（見 main() use_cache 說明，正常訓練用 True 就好，True 本來就會用新鮮的 cache、只重算過期的月份）
-    model_type = "xgb"  # rfc / lgbm / xgb，只有 mode=train 用得到
+    model_type = "rfc"  # rfc / lgbm / xgb，只有 mode=train 用得到
 
     main(
         mode=mode,

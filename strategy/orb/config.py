@@ -20,7 +20,7 @@
 # predict_live() 一律明確傳 threshold=0（見該檔案），這個預設值從來沒被
 # 用到過，run_backtest.py 也已經改成直接傳 model_type 參數（不再讀
 # ORB_MODEL_TYPE），確認完全沒有消費者後拿掉。
-THRESHOLD_BY_MODEL = {"rfc": 0.60, "lgbm": 0.65, "xgb": 0.65}
+THRESHOLD_BY_MODEL = {"rfc": 0.60, "lgbm": 0.85, "xgb": 0.8}
 
 # ── Triple Barrier 參數（標籤怎麼定義，沿用 rally 的定義） ──────────────────
 # 2026-07-11 測過改成 2%：test_days=10 AUC 幾乎沒變（0.4925→0.4916），
@@ -58,7 +58,7 @@ SEARCH_WINDOW_END = "09:30"  # 突破搜尋窗口結束時間（09:10~09:30 內�
 
 
 def _hhmm_to_minutes(hhmm: str, base: str = MARKET_OPEN) -> int:
-    """"HH:MM" 轉成距離 base（預設開盤時間）幾分鐘——features.py 的
+    """ "HH:MM" 轉成距離 base（預設開盤時間）幾分鐘——features.py 的
     minutes_since_open 是逐分鐘算出來的整數，要用同單位才能比較。"""
     h, m = (int(x) for x in hhmm.split(":"))
     bh, bm = (int(x) for x in base.split(":"))
@@ -66,7 +66,7 @@ def _hhmm_to_minutes(hhmm: str, base: str = MARKET_OPEN) -> int:
 
 
 def _hhmm_to_tuple(hhmm: str) -> tuple[int, int]:
-    """"HH:MM" 轉成 (hour, minute) tuple——main/strategy_loader.py 規定
+    """ "HH:MM" 轉成 (hour, minute) tuple——main/strategy_loader.py 規定
     SESSION_START/SESSION_END 這組跨策略共用介面吃的是 tuple（main/state.py
     存起來、main/live_trader.py 拿去跟 (h, m) 比大小），不是字串，這裡只
     負責轉型，不要把 main/ 那邊共用介面的型別也一起改掉。"""

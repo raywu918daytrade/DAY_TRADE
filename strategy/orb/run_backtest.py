@@ -70,7 +70,7 @@ def run(
         hold_bars=HOLD_BARS,
         first_entry_time=first_entry_time,
         last_entry_time=last_entry_time,
-        min_vol_threshold=500,
+        min_vol_threshold=0,
         vol_window=10,
     )
     print()
@@ -81,5 +81,6 @@ def run(
 if __name__ == "__main__":
     run(
         test_days=DEFAULT_TEST_DAYS,
-        threshold=0.7,
+        threshold=0.85,
+        model_type="lgbm",
     )
