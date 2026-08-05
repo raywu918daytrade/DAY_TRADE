@@ -186,14 +186,10 @@ def find_day_candidates(
                     "pattern_score": float(res.score),
                     "resistance_price": float(res.details["resistance_price"]),
                     "matched_poc": (
-                        float(res.details["matched_poc"])
-                        if res.details.get("matched_poc") is not None
-                        else np.nan
+                        float(res.details["matched_poc"]) if res.details.get("matched_poc") is not None else np.nan
                     ),
                     "poc_diff_pct": (
-                        float(res.details["poc_diff_pct"])
-                        if res.details.get("poc_diff_pct") is not None
-                        else np.nan
+                        float(res.details["poc_diff_pct"]) if res.details.get("poc_diff_pct") is not None else np.nan
                     ),
                     "poc_confluence": poc_ok,
                 }
@@ -244,12 +240,8 @@ def detect_candidate_asof(
         "candidate_date": str(res.date)[:10],
         "pattern_score": float(res.score),
         "resistance_price": float(res.details["resistance_price"]),
-        "matched_poc": (
-            float(res.details["matched_poc"]) if res.details.get("matched_poc") is not None else np.nan
-        ),
-        "poc_diff_pct": (
-            float(res.details["poc_diff_pct"]) if res.details.get("poc_diff_pct") is not None else np.nan
-        ),
+        "matched_poc": (float(res.details["matched_poc"]) if res.details.get("matched_poc") is not None else np.nan),
+        "poc_diff_pct": (float(res.details["poc_diff_pct"]) if res.details.get("poc_diff_pct") is not None else np.nan),
         "poc_confluence": bool(res.details.get("poc_confluence")),
     }
 
@@ -318,8 +310,7 @@ def _tick_features_at(ticks: pd.DataFrame, trigger_ts: pd.Timestamp) -> dict:
 def _triple_barrier_label(m1_day: pd.DataFrame, trigger_ts: pd.Timestamp, entry: float) -> float:
     """+1 先觸 TP、-1 先觸 SL、0 時間牆內都沒碰到。視窗不足 → NaN。"""
     fut = m1_day[
-        (m1_day["date"] > trigger_ts)
-        & (m1_day["date"] <= trigger_ts + pd.Timedelta(minutes=LABEL_HORIZON_MINUTES))
+        (m1_day["date"] > trigger_ts) & (m1_day["date"] <= trigger_ts + pd.Timedelta(minutes=LABEL_HORIZON_MINUTES))
     ]
     if fut.empty or entry <= 0:
         return np.nan
@@ -427,11 +418,7 @@ def filter_trigger_tick_hard(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = df[df["tick_large_buy_ratio"] >= MIN_TICK_LARGE_BUY_RATIO]
     if REQUIRE_LARGE_BUY_GT_SELL:
-        sell = (
-            out["tick_large_sell_ratio"]
-            if "tick_large_sell_ratio" in out.columns
-            else 0.0
-        )
+        sell = out["tick_large_sell_ratio"] if "tick_large_sell_ratio" in out.columns else 0.0
         out = out[out["tick_large_buy_ratio"] > sell]
     if REQUIRE_CVD_POSITIVE:
         out = out[out["cvd_30s_delta"] > 0]
@@ -530,8 +517,7 @@ def build_event_dataset(
                 "tick_large_sell_ratio": trigger.get("tick_large_sell_ratio", 0.0),
                 "tick_large_net_ratio": trigger.get(
                     "tick_large_net_ratio",
-                    float(trigger["tick_large_buy_ratio"])
-                    - float(trigger.get("tick_large_sell_ratio", 0.0) or 0.0),
+                    float(trigger["tick_large_buy_ratio"]) - float(trigger.get("tick_large_sell_ratio", 0.0) or 0.0),
                 ),
                 "cvd_30s_delta": trigger["cvd_30s_delta"],
                 "target": target,
@@ -662,9 +648,7 @@ def make_features(
             poc_df = load_pattern_poc(start_date=start_date)
             if not poc_df.empty:
                 poc_df = poc_df[poc_df["stock_id"].isin(stock_ids)]
-            candidates = find_day_candidates(
-                day_df, poc_df, stock_ids=stock_ids, day_step=day_step, require_poc=False
-            )
+            candidates = find_day_candidates(day_df, poc_df, stock_ids=stock_ids, day_step=day_step, require_poc=False)
 
     print(f"[breakout_retest_ml] 候選日數: {len(candidates)}", flush=True)
     if candidates.empty:

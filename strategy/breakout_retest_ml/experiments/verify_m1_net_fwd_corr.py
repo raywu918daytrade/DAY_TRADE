@@ -90,7 +90,7 @@ def _print_corr_block(title: str, sub: pd.DataFrame) -> None:
             if g.empty:
                 continue
             ret_s = "".join(
-                f"{100*g[f'ret_{h}'].mean():>9.3f}%" if np.isfinite(g[f'ret_{h}'].mean()) else f"{'nan':>10}"
+                f"{100*g[f'ret_{h}'].mean():>9.3f}%" if np.isfinite(g[f"ret_{h}"].mean()) else f"{'nan':>10}"
                 for h in HORIZONS
             )
             print(
@@ -102,7 +102,7 @@ def _print_corr_block(title: str, sub: pd.DataFrame) -> None:
     for qi in sorted(q.dropna().unique()):
         g = sub[q == qi]
         ret_s = "".join(
-            f"{100*g[f'ret_{h}'].mean():>9.3f}%" if np.isfinite(g[f'ret_{h}'].mean()) else f"{'nan':>10}"
+            f"{100*g[f'ret_{h}'].mean():>9.3f}%" if np.isfinite(g[f"ret_{h}"].mean()) else f"{'nan':>10}"
             for h in HORIZONS
         )
         print(

@@ -97,10 +97,7 @@ def build(
         if not existing.empty:
             done = set(zip(existing["stock_id"].astype(str), existing["candidate_date"].astype(str)))
             before = len(cands)
-            mask = [
-                (str(r.stock_id), str(r.candidate_date)[:10]) not in done
-                for r in cands.itertuples(index=False)
-            ]
+            mask = [(str(r.stock_id), str(r.candidate_date)[:10]) not in done for r in cands.itertuples(index=False)]
             cands = cands.loc[mask].reset_index(drop=True)
             print(f"增量：略過已存在 {before - len(cands)}，待處理 {len(cands)}", flush=True)
             if cands.empty:

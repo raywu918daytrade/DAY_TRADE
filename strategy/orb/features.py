@@ -33,6 +33,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 from data.query import load_day
 from data.raw_query import load_m1, load_m3, load_m5
 from data.resample import compute_m3, compute_m5
+from finmind.tick_universe import load_tick_universe
 from strategy.orb.config import (
     BREAKOUT_SEARCH_MINUTES,
     HOLD_BARS,
@@ -46,7 +47,13 @@ _ROOT = Path(__file__).parent.parent.parent
 _M1_DIR = _ROOT / "db/m1"
 _M3_DIR = _ROOT / "db/m3"
 _M5_DIR = _ROOT / "db/m5"
-_DAY_DIR = _ROOT / "db/d1"  # 原始日K，2026-08-03 從 db/fugle_day 改名而來（維持這支訓練管線用原始資料的既有行為）
+_DAY_DIR = _ROOT / "db/d1"  # 原始日K，2026-08-03 從 db/fugle_day 改名而來——只在
+# _month_is_fresh() 拿來比對 mtime，實際讀取改用 data.query.load_day()（還原拆股/
+# 合股版），見 _compute_month_features() 的說明，不要直接用 _read_month_parquet(_DAY_DIR,...)
+_ADJUST_FACTOR_DIR = _ROOT / "db/tick_adjust_factor"  # 還原拆股/合股用的係數表（見
+# data/build_tick_adjust_factor.py），_month_is_fresh() 也要比對這個目錄的 mtime——
+# 係數之後被回頭修正的話，現有 cache 分區要能被判定過期重算，不然會一直沿用還原
+# 前算出來的舊特徵值
 _CACHE_DIR = _ROOT / "cache/m1_orb_features"
 _META_COLS = ["stock_id", "date", "hour", "target", "vol_ma20"]
 
@@ -115,7 +122,7 @@ def _m1_available_months() -> list[tuple[int, int]]:
 
 def _month_is_fresh(year: int, month: int) -> bool:
     """檢查某個月份的 cache 分區是否比對應的 db/m1、db/m3、db/m5、（含回看範圍
-    內的）db/m1、db/fugle_day 都新。"""
+    內的）db/m1、db/d1、db/tick_adjust_factor 都新。"""
     partition = _month_file(_CACHE_DIR, year, month)
     if not partition.exists():
         return False
@@ -131,6 +138,8 @@ def _month_is_fresh(year: int, month: int) -> bool:
             return False
     for dy, dm in _lookback_months(year, month, _DAY_LOOKBACK_CALENDAR_DAYS):
         if partition_mtime < _file_mtime(_month_file(_DAY_DIR, dy, dm)):
+            return False
+        if partition_mtime < _file_mtime(_month_file(_ADJUST_FACTOR_DIR, dy, dm)):
             return False
     return True
 
@@ -148,17 +157,34 @@ def _read_month_parquet(dir_path: Path, year: int, month: int) -> pd.DataFrame:
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def _compute_month_features(year: int, month: int) -> pd.DataFrame:
-    """對單一月份重算特徵，回傳只含 FEATURES + _META_COLS 的 DataFrame。"""
+def _compute_month_features(year: int, month: int, universe: set) -> pd.DataFrame:
+    """對單一月份重算特徵，回傳只含 FEATURES + _META_COLS 的 DataFrame。
+
+    universe: 固定 400 支 tick_universe（見 finmind/tick_universe.py），
+    load_features() 只算一次往下傳，不要在這裡每個月各自呼叫一次
+    load_tick_universe()。2026-08-01 前 db/m1 的舊月份分檔還是全市場~2700支
+    （data/m1_data_loader.py 寫入端限制不會回頭清理既有檔案），這裡要在算
+    任何特徵之前先篩，比照 strategy/mkt/train.py 的教訓（篩太晚在算完跨股票
+    的特徵之後才篩，2026-08-05撞過55GB記憶體爆炸；orb沒有那種跨股票特徵，
+    早篩主要是效能考量，能少處理好幾倍的無關資料列）。
+    """
     month_start = pd.Timestamp(year=year, month=month, day=1)
     month_end = month_start + pd.DateOffset(months=1)
 
     m1 = _read_month_parquet(_M1_DIR, year, month)
+    m1 = m1[m1["stock_id"].isin(universe)]
     m3 = _read_month_parquet(_M3_DIR, year, month)
     m5 = _read_month_parquet(_M5_DIR, year, month)
 
-    day_frames = [_read_month_parquet(_DAY_DIR, dy, dm) for dy, dm in _lookback_months(year, month, _DAY_LOOKBACK_CALENDAR_DAYS)]
-    day = pd.concat(day_frames, ignore_index=True) if day_frames else pd.DataFrame()
+    # day K 改用 data.query.load_day()（還原拆股/合股版），不要用
+    # _read_month_parquet(_DAY_DIR, ...) 讀原始 db/d1——predict_live()
+    # （strategy/orb/predict.py）算日K背景特徵時用的就是這支還原版，兩邊
+    # 不一致會在遇到拆股/合股事件時產生 training-serving skew。日K一個月
+    # 才幾百~幾千列，load_day(start_date=...) 就算讀到比這裡的回看窗口更寬
+    # 的範圍（底層依月份篩檔案，不是整個資料夾全讀），成本也可忽略，不會
+    # 重演 m1 的記憶體問題，不需要另外寫一個「只讀單月又要還原」的版本。
+    day_cutoff = (month_start - pd.Timedelta(days=_DAY_LOOKBACK_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+    day = load_day(start_date=day_cutoff)
     if not day.empty:
         day = day[day["date"] < month_end].reset_index(drop=True)
 
@@ -169,6 +195,7 @@ def _compute_month_features(year: int, month: int) -> pd.DataFrame:
     buffer_frames = [_read_month_parquet(_M1_DIR, by, bm) for by, bm in buffer_months]
     m1_buffer = pd.concat(buffer_frames, ignore_index=True) if buffer_frames else pd.DataFrame()
     if not m1_buffer.empty:
+        m1_buffer = m1_buffer[m1_buffer["stock_id"].isin(universe)]
         open_vol_history, hourly_tr_history = build_history_tables(m1_buffer)
     else:
         open_vol_history, hourly_tr_history = None, None
@@ -197,9 +224,9 @@ def load_features(start_date: str = "", use_cache: bool = True) -> pd.DataFrame:
     不相關的舊月份完全不會被讀取或比對新鮮度。
 
     use_cache=True（預設）：逐月檢查該月分區是否比對應的 db/m1、db/m3、
-    db/m5、（含回看範圍內的）db/fugle_day 都新，新鮮就沿用、不新鮮才重算
-    「那一個月」——不會因為某個月有更新就牽動其他月份重算。db/m1 平常只有
-    「當月」那個檔案會變動，所以多數情況下只有當月分區需要重算。
+    db/m5、（含回看範圍內的）db/d1、db/tick_adjust_factor 都新，新鮮就沿用、
+    不新鮮才重算「那一個月」——不會因為某個月有更新就牽動其他月份重算。
+    db/m1 平常只有「當月」那個檔案會變動，所以多數情況下只有當月分區需要重算。
     use_cache=False：不管每個月分區現在是什麼狀態，目標範圍內全部月份都重算。
     """
     available = _m1_available_months()
@@ -233,11 +260,12 @@ def load_features(start_date: str = "", use_cache: bool = True) -> pd.DataFrame:
                     force_all = True
                 break
 
+    universe = set(load_tick_universe())  # 固定400支，見 _compute_month_features() 的說明
     for year, month in target_months:
         if use_cache and not force_all and _month_is_fresh(year, month):
             continue
         print(f"  重新計算特徵：{_month_str(year, month)}...")
-        month_df = _compute_month_features(year, month)
+        month_df = _compute_month_features(year, month, universe)
         month_df.to_parquet(_month_file(_CACHE_DIR, year, month))
         print(f"    {_month_str(year, month)} 分區已存（{len(month_df):,} 筆）")
 
@@ -683,14 +711,14 @@ def make_features(
     m1["m3_open_lag2"] = g_m3["m3_open"].shift(6)
     m1["m3_high_lag2"] = g_m3["m3_high"].shift(6)
     m1["m3_low_lag2"] = g_m3["m3_low"].shift(6)
-    m1["m3_ret"] = g_m3["m3_close"].pct_change(3)
+    m1["m3_ret"] = g_m3["m3_close"].pct_change(3, fill_method=None)
 
     g_m5 = m1.groupby(["stock_id", "day_date"], group_keys=False)
     m1["m5_open_lag1"] = g_m5["m5_open"].shift(5)
     m1["m5_high_lag1"] = g_m5["m5_high"].shift(5)
     m1["m5_low_lag1"] = g_m5["m5_low"].shift(5)
     m1["m5_close_lag1"] = g_m5["m5_close"].shift(5)
-    m1["m5_ret"] = g_m5["m5_close"].pct_change(5)
+    m1["m5_ret"] = g_m5["m5_close"].pct_change(5, fill_method=None)
 
     m1 = m1.drop(columns=["m3_open", "m5_close"])
 
@@ -724,7 +752,7 @@ def make_features(
     day["day_date"] = day["date"].dt.date
 
     dg = day.groupby("stock_id")
-    day["_ret1"] = dg["close"].pct_change(1)
+    day["_ret1"] = dg["close"].pct_change(1, fill_method=None)
     dg2 = day.groupby("stock_id", group_keys=False)
     day_ret_cols = []
     for lag in range(1, 6):
@@ -809,7 +837,7 @@ def make_features(
     idx_day = day[day["stock_id"] == "0050"].copy()
     if not idx_day.empty:
         idx_dg = idx_day.groupby("stock_id")
-        idx_day["_idx_ret1"] = idx_dg["close"].pct_change(1)
+        idx_day["_idx_ret1"] = idx_dg["close"].pct_change(1, fill_method=None)
         idx_dg2 = idx_day.groupby("stock_id", group_keys=False)
         idx_day_ret_cols = []
         for lag in range(1, 6):
@@ -841,7 +869,7 @@ def make_features(
     if not idx_m1.empty:
         idx_g_day = idx_m1.groupby("day_date", group_keys=False)
         idx_day_open = idx_g_day["open"].transform("first").replace(0, np.nan)
-        idx_ret_1 = idx_g_day["close"].pct_change(1)
+        idx_ret_1 = idx_g_day["close"].pct_change(1, fill_method=None)
         m1.loc[idx_m1.index, "idx_ret_1"] = idx_ret_1.values
         m1.loc[idx_m1.index, "idx_vs_open"] = (idx_m1["close"] / idx_day_open).values
         m1.loc[idx_m1.index, "idx_up"] = (idx_m1["close"] > idx_day_open).astype(int).values

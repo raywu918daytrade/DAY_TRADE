@@ -1,7 +1,29 @@
 """
-模型訓練 — RandomForest / LightGBM / XGBoost（只用 ORB 特徵，三個模型互相比較用）
+模型訓練 — RandomForest / LightGBM / XGBoost（只用 ORB 特徵，三個模型互相比較用）+ CLI 進入點
+
+2026-08-06 拿掉獨立的 entry.py：orb 是 strategy/ 底下唯一還留著 entry.py 的模組，
+比照 strategy/mkt/train.py（這個「train.py 自帶 CLI」設計的發源地，之後
+vwap_ml/vwap_dl/cnn/limitup_fade_ml* /breakout_retest_ml 都照抄同一套做法）把
+CLI 分派邏輯（main()/__main__）直接搬進這支檔案，不用再另外維護一個只做轉發
+的 entry.py。validate.py 的報表函式沒有搬進來（比 mkt 的驗證邏輯豐富很多，
+merge 進來會讓這支檔案肥大），main() 一樣用 import 呼叫。
+
+實際邏輯拆到同資料夾底下：
+    config.py     交易相關設定（TP/SL/HOLD_BARS、開盤區間分鐘數）
+    features.py   ORB 特徵工程、triple barrier 標籤、FEATURES 清單、load_features() cache
+    train.py      本檔——RandomForest / LightGBM / XGBoost 訓練與模型載入 + CLI 進入點
+    validate.py   信心度分析、召回率分析、分鐘區間交叉報表、特徵重要性、RFC vs LGBM vs XGB 比較
+    predict.py    predict()（批次機率矩陣，回測用）、predict_live()（即時推論入口）
+
+== Main 模式 ==
+
+train      訓練模型（依 --model_type / model_type 參數決定 rfc/lgbm/xgb）
+validate   信心度分析 + 召回率分析 + 突破後分鐘區間交叉報表 + 特徵重要性（RFC、LGBM、XGB 已訓練的都跑）
+compare    RFC vs LGBM vs XGB 同一份測試集 Accuracy/AUC 對照（三個模型都要先訓練過）
+predict    印批次機率矩陣（predict()）的形狀跟最後一個時間點的排行榜，用來肉眼檢查
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -15,6 +37,11 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 from strategy.orb.config import DEFAULT_TEST_DAYS, MIN_VOL_MA20
 from strategy.orb.features import FEATURES, apply_liquidity_filter, load_features, to_model_input
+
+# predict.py/validate.py 都會 import 這支檔案（load_model_lgbm() 等），main()
+# 需要的東西改成函式內延遲 import，不要搬到檔案最上面——不然會變成
+# train.py → predict.py/validate.py → train.py 的 circular import，
+# train.py 還沒執行到定義 load_model_lgbm() 那幾行就被回頭 import，直接炸掉。
 
 _ROOT = Path(__file__).parent.parent.parent
 _MODEL_PATH_RFC = _ROOT / "models/m1_orb_rfc.pkl"
@@ -239,3 +266,158 @@ def load_model_by_type(model_type: str):
     if model_type not in _MODEL_LOADERS:
         raise ValueError(f"未知 model_type: {model_type!r}，可用: {list(_MODEL_LOADERS)}")
     return _MODEL_LOADERS[model_type]()
+
+
+_TRAIN_BY_TYPE = {
+    "rfc": train_rfc,
+    "lgbm": train_lgbm,
+    "xgb": train_xgb,
+}
+
+
+def main(
+    mode: str = "",
+    test_days: int = DEFAULT_TEST_DAYS,
+    start_date: str = "",
+    end_date: str = "",
+    use_cache: bool = True,
+    model_type: str = "lgbm",
+):
+    """
+    當沖策略 ORB 主程式（CLI 進入點，2026-08-06 從 entry.py 搬過來）。
+
+    支援兩種用法：
+      1. 直接傳參數：main(mode="train", model_type="lgbm")
+      2. CLI 執行：python -m strategy.orb.train train --model_type lgbm
+
+    model_type: 只影響 mode="train"，決定訓練哪個演算法（"rfc"/"lgbm"/"xgb"）
+    ——比照 run_backtest.py 的 model_type 參數風格，不再用 train_rfc/
+    train_lgbm/train_xgb 三個獨立 mode 字串。
+
+    use_cache: 只影響 mode="train"，見 _prepare_train_test() 的說明——預設
+    True，逐月檢查 cache 新鮮度，新鮮的月份直接沿用、過期的月份才重算，這
+    就是「有用到 cache」的正常訓練流程；False 時不管每個月分區現在是什麼
+    狀態，目標範圍內全部月份都強制重算，只在你明確懷疑 cache 壞掉、或改了
+    FEATURES 想強制全部重新計算時才用。
+    """
+    from strategy.orb.predict import predict as predict_batch
+    from strategy.orb.validate import (
+        available_models,
+        compare_report,
+        confidence_report,
+        confusion_matrix_report,
+        coverage_report,
+        feature_importance,
+        minute_confidence_report,
+    )
+
+    # 只有終端機真的帶了CLI參數才用argparse覆蓋；F5/直接執行（sys.argv只有
+    # 腳本路徑本身，長度=1）就尊重呼叫端傳進來的 mode/test_days/model_type，
+    # 不要看mode是不是空字串來判斷（比照 strategy/mkt/train.py 踩過的坑——
+    # 那樣寫的話 F5 執行時只要 mode 沒填就會誤觸發 argparse，去讀根本不存在
+    # 的 CLI 參數而出錯）。
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser(
+            description="當沖策略 — ORB 特徵 + RandomForest / LightGBM / XGBoost",
+        )
+        parser.add_argument(
+            "mode",
+            nargs="?",
+            default="train",
+            choices=["train", "validate", "compare", "predict"],
+            help="執行模式（預設train）",
+        )
+        parser.add_argument("--test_days", type=int, default=DEFAULT_TEST_DAYS, help="測試集天數")
+        parser.add_argument("--start_date", type=str, default="", help="資料起日 YYYY-MM-DD")
+        parser.add_argument("--end_date", type=str, default="", help="資料迄日 YYYY-MM-DD")
+        parser.add_argument(
+            "--use_cache",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="mode=train 專用：是否用按月分區的特徵 cache（預設 True）；"
+            "--no-use_cache 不管每個月分區新不新鮮，目標範圍內全部強制重算",
+        )
+        parser.add_argument(
+            "--model_type",
+            type=str,
+            default="lgbm",
+            choices=["rfc", "lgbm", "xgb"],
+            help="mode=train 專用：訓練哪個演算法（預設lgbm）",
+        )
+        args = parser.parse_args()
+        mode = args.mode
+        test_days = args.test_days
+        start_date = args.start_date
+        end_date = args.end_date
+        use_cache = args.use_cache
+        model_type = args.model_type
+    elif not mode:
+        mode = "train"  # F5執行、__main__也沒寫mode時的保底預設
+
+    if mode == "train":
+        _TRAIN_BY_TYPE[model_type](test_days=test_days, start_date=start_date, end_date=end_date, use_cache=use_cache)
+
+    elif mode == "validate":
+        for name, model in available_models().items():
+            print(f"\n══════════ {name} ══════════")
+            confidence_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
+            print()
+            coverage_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
+            print()
+            confusion_matrix_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
+            print()
+            minute_confidence_report(model=model, test_days=test_days, start_date=start_date, end_date=end_date)
+            print()
+            feature_importance(model=model)
+
+    elif mode == "compare":
+        compare_report(test_days=test_days, start_date=start_date, end_date=end_date)
+
+    elif mode == "predict":
+        proba = predict_batch(test_days=test_days)
+        print(f"  機率矩陣形狀: {proba.shape}（{proba.shape[0]} 個時間點 × {proba.shape[1]} 支股票）")
+        print(f"  時間區間: {proba.index.min()} ~ {proba.index.max()}")
+        last_ts = proba.index.max()
+        top = proba.loc[last_ts].dropna().sort_values(ascending=False).head(10)
+        print(f"\n  -- {last_ts} 機率排行榜（前10） --")
+        for stock_id, p in top.items():
+            print(f"    {stock_id:>8s}  {p:.4f}")
+
+    else:
+        print(f"未知模式: {mode}，可用: train / validate / compare / predict")
+
+
+if __name__ == "__main__":
+    """
+    兩種執行方式都支援（main() 會依 sys.argv 長度自動判斷要用哪一種）：
+
+    1. VS Code按F5（開發時常用）：直接改下面這幾行變數，不用打字。
+    2. 終端機帶參數（會覆蓋掉下面寫死的值）：
+        python -m strategy.orb.train train
+        python -m strategy.orb.train train --model_type xgb
+        python -m strategy.orb.train train --model_type xgb --start_date 2025-01-01
+        python -m strategy.orb.train validate
+        python -m strategy.orb.train compare
+        python -m strategy.orb.train predict
+
+    == Main 模式 ==
+    train      訓練模型（依 model_type 決定 rfc/lgbm/xgb）
+    validate   信心度分析 + 召回率分析 + 突破後分鐘區間交叉報表 + 特徵重要性（RFC、LGBM、XGB 已訓練的都跑）
+    compare    RFC vs LGBM vs XGB 同一份測試集 Accuracy/AUC 對照（三個模型都要先訓練過）
+    predict    印批次機率矩陣（predict()）的形狀跟最後一個時間點的排行榜，用來肉眼檢查
+    """
+    mode = "train"  # train,validate,compare,predict
+    test_days = DEFAULT_TEST_DAYS  # 統一用 config.py 的預設值，不要在這裡另外寫死數字
+    start_date = "2024-01-01"
+    end_date = ""
+    use_cache = True  # False 時 mode=train 不管每個月分區新不新鮮，目標範圍內全部強制重算（見 main() use_cache 說明，正常訓練用 True 就好，True 本來就會用新鮮的 cache、只重算過期的月份）
+    model_type = "xgb"  # rfc / lgbm / xgb，只有 mode=train 用得到
+
+    main(
+        mode=mode,
+        test_days=test_days,
+        start_date=start_date,
+        end_date=end_date,
+        use_cache=use_cache,
+        model_type=model_type,
+    )

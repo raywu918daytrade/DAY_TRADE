@@ -1,10 +1,10 @@
 """
 模型驗證報表 — 信心度分析、召回率分析、時段交叉報表、特徵重要性、RFC vs LGBM vs XGB 比較
 
-比照 strategy/rally/validate.py 的做法。confidence_report/coverage_report/
-hour_confidence_report/feature_importance 都是單一模型的報表（model=None 時
-預設 LGBM），entry.py 的 validate 模式用 available_models() 對每個已訓練好
-的模型各跑一輪；compare_report() 是三個模型在同一份測試集上的 Accuracy/AUC
+confidence_report/coverage_report/hour_confidence_report/feature_importance
+都是單一模型的報表（model=None 時預設 LGBM），train.py 的 validate 模式
+（2026-08-06 從 entry.py 搬過來）用 available_models() 對每個已訓練好的
+模型各跑一輪；compare_report() 是三個模型在同一份測試集上的 Accuracy/AUC
 對照表。
 """
 

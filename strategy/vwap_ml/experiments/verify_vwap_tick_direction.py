@@ -75,8 +75,7 @@ def _stats(sub: pd.DataFrame) -> dict:
 
 def _print_stats(label: str, st: dict) -> None:
     print(
-        f"{label:>16} {st['n']:>8} {st['n_rev']:>7} {st['n_cont']:>7} {st['n_flat']:>7} "
-        f"{st['rev_dec']:>7.1f}%",
+        f"{label:>16} {st['n']:>8} {st['n_rev']:>7} {st['n_cont']:>7} {st['n_flat']:>7} " f"{st['rev_dec']:>7.1f}%",
         flush=True,
     )
 
@@ -98,8 +97,7 @@ def _print_block(sub: pd.DataFrame, title: str) -> None:
     print(f"{'合計':>8} {n:>8}", flush=True)
     if st["n_rev"] + st["n_cont"]:
         print(
-            f"  決勝負: 回歸 {st['rev_dec']:.1f}% / "
-            f"延續 {100.0 - st['rev_dec']:.1f}%",
+            f"  決勝負: 回歸 {st['rev_dec']:.1f}% / " f"延續 {100.0 - st['rev_dec']:.1f}%",
             flush=True,
         )
 
@@ -116,8 +114,7 @@ def run(
     atr_floor = min(atr_levels)
 
     print(
-        f"VWAP+大單驗證 | tick400 | std_mult={std_mult} | "
-        f"ATR={list(atr_levels)} | {start_date}~{end_date}",
+        f"VWAP+大單驗證 | tick400 | std_mult={std_mult} | " f"ATR={list(atr_levels)} | {start_date}~{end_date}",
         flush=True,
     )
     print(f"載入 m1（start={load_start}）...", flush=True)

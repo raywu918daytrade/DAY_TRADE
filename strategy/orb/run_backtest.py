@@ -13,7 +13,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backtest.intraday_platform import print_trades, run_backtest
-from strategy.orb.config import DEFAULT_TEST_DAYS, HOLD_BARS, SL_PCT, TP_PCT
+from strategy.orb.config import DEFAULT_TEST_DAYS, HOLD_BARS, OPENING_RANGE_END, SEARCH_WINDOW_END, SL_PCT, TP_PCT
 from strategy.orb.predict import predict
 from strategy.orb.train import load_model_by_type
 
@@ -23,8 +23,8 @@ def run(
     threshold: float = 0.70,
     top_n: int = 999,
     max_positions: int = 99,
-    first_entry_time: str = "09:10",
-    last_entry_time: str = "09:20",
+    first_entry_time: str = OPENING_RANGE_END,
+    last_entry_time: str = SEARCH_WINDOW_END,
     model_type: str = "lgbm",
 ):
     """
@@ -37,11 +37,13 @@ def run(
     threshold: 信心度門檻，只有 proba >= threshold 的候選才會進場。
     top_n: 同一分鐘最多取幾支（999 等於不限制，因為候選本來就稀疏，見
         strategy/orb/features.py 的候選篩選邏輯）。
-    first_entry_time/last_entry_time: 實際交易時段——跟 config.py 的
-        OPENING_RANGE_MINUTES/BREAKOUT_SEARCH_MINUTES（9:00~9:10 建區間、
-        9:10~9:30 內找突破事件）不是同一件事，那是「模型能學到/評分哪些
-        候選」的範圍，這裡是「這些候選裡，實際只交易哪個時間窗口」的執行層
-        設定，兩者分開，不要混在一起改。
+    first_entry_time/last_entry_time: 實際交易時段——預設直接等於 config.py
+        的 OPENING_RANGE_END/SEARCH_WINDOW_END（訓練/推論用的突破搜尋窗口，
+        09:10~09:30），train/backtest/live 三邊統一讀同一份設定，不用再各自
+        寫死時間、也不會再兜不起來（2026-08-06 之前這裡曾經預設09:20、
+        __main__ 卻寫死09:30，兩邊對不上）。如果之後真的想測試「候選裡
+        只交易某個子區間」，還是可以在呼叫端明確傳這兩個參數覆蓋，不影響
+        訓練/推論那邊的候選產生範圍。
     max_positions: 同時最多持倉幾檔。回測發現候選會集中在特定日子（例如
         2026-07-03 單日9:10~9:20內就有54筆proba>=0.7的候選），max_positions
         太小（原本共用引擎預設10）會讓大部分候選連進場機會都沒有就被卡住，
@@ -80,6 +82,4 @@ if __name__ == "__main__":
     run(
         test_days=DEFAULT_TEST_DAYS,
         threshold=0.7,
-        first_entry_time="09:10",
-        last_entry_time="09:30",
     )

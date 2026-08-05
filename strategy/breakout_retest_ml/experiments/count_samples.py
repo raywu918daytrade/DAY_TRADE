@@ -179,16 +179,20 @@ def _print_report(cands: pd.DataFrame, events: pd.DataFrame, stats: dict) -> Non
     print("\n" + "=" * 60)
     print("POC 共振 + M1實體K + Tick大量買進 — 樣本／進場漏斗")
     print("=" * 60)
-    print(f"session          {SESSION_START[0]:02d}:{SESSION_START[1]:02d} ~ "
-          f"{SESSION_END[0]:02d}:{SESSION_END[1]:02d}")
+    print(
+        f"session          {SESSION_START[0]:02d}:{SESSION_START[1]:02d} ~ "
+        f"{SESSION_END[0]:02d}:{SESSION_END[1]:02d}"
+    )
     print(f"M1 body          >= {MIN_BODY_RATIO:.0%}  upper_shadow <= {MAX_UPPER_SHADOW_RATIO:.0%}")
     print(f"tick large buy   >= {MIN_TICK_LARGE_BUY_RATIO:.0%}  CVD>0={REQUIRE_CVD_POSITIVE}")
     print(f"barrier          TP={TP_PCT:.0%} / SL={SL_PCT:.0%}")
     print()
     print(f"1) POC 候選（streak 壓扁）     {stats['n_candidates']:>6,}")
     if len(cands):
-        print(f"   stocks / date range         {cands['stock_id'].nunique()} 檔  "
-              f"{cands['candidate_date'].min()} ~ {cands['candidate_date'].max()}")
+        print(
+            f"   stocks / date range         {cands['stock_id'].nunique()} 檔  "
+            f"{cands['candidate_date'].min()} ~ {cands['candidate_date'].max()}"
+        )
     print(f"   └ 無下一交易日              {stats['n_no_trade_day']:>6,}")
     print(f"   └ 當日無/過短 M1            {stats['n_no_m1']:>6,}")
     print(f"   └ 未通過 M1實體+Tick大單    {stats['n_no_trigger']:>6,}")

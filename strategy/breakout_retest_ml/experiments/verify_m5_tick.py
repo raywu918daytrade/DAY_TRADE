@@ -151,11 +151,7 @@ def _first_rolling_solid_m5(m1_day: pd.DataFrame) -> dict | None:
     """09:10～10:00 內，第一個「連續 5 根 M1 合成實體陽線」視窗。"""
     if m1_day is None or m1_day.empty:
         return None
-    m1 = (
-        m1_day.dropna(subset=["open", "high", "low", "close"])
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    m1 = m1_day.dropna(subset=["open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
     if len(m1) < ROLL_MINUTES:
         return None
 
@@ -217,8 +213,7 @@ def _label_stats(targets: list[int]) -> dict:
 def _print_outcome_row(label: str, st: dict) -> None:
     """進場總數 / 勝 / 敗 / 持平 / 勝率（勝÷進場總數）。"""
     print(
-        f"{label:>10} {st['n']:>8} {st['n_tp']:>6} {st['n_sl']:>6} {st['n_flat']:>6} "
-        f"{st['win_all']:>7.1f}%",
+        f"{label:>10} {st['n']:>8} {st['n_tp']:>6} {st['n_sl']:>6} {st['n_flat']:>6} " f"{st['win_all']:>7.1f}%",
         flush=True,
     )
 
@@ -281,8 +276,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
     t0 = time.time()
     print("滾動 5 分鐘實體陽線 + 窗內 tick 方向性驗證", flush=True)
     print(
-        f"合成門檻: 連續 {ROLL_MINUTES} 根 M1、body≥{MIN_BODY_RATIO:.0%}、"
-        f"上影≤{MAX_UPPER_SHADOW_RATIO:.0%}",
+        f"合成門檻: 連續 {ROLL_MINUTES} 根 M1、body≥{MIN_BODY_RATIO:.0%}、" f"上影≤{MAX_UPPER_SHADOW_RATIO:.0%}",
         flush=True,
     )
     print(
@@ -360,8 +354,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
 
     ev = pd.DataFrame(rows)
     print(
-        f"\n支撐線候選→區間進場日: {n_cand}；有滾動實體5分: {n_hit}；"
-        f"ATR5剔除: {n_atr_drop}；標籤完整: {len(ev)}",
+        f"\n支撐線候選→區間進場日: {n_cand}；有滾動實體5分: {n_hit}；" f"ATR5剔除: {n_atr_drop}；標籤完整: {len(ev)}",
         flush=True,
     )
     if ev.empty:
@@ -372,11 +365,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
     print(sample.to_string(index=False), flush=True)
 
     # ATR 門檻對照 + 各 ATR 下的大單買比表
-    atr_levels = (
-        (0.0, 0.006, 0.008, 0.010)
-        if min_atr5 <= 0
-        else (min_atr5,)
-    )
+    atr_levels = (0.0, 0.006, 0.008, 0.010) if min_atr5 <= 0 else (min_atr5,)
     print("\n" + "=" * 64)
     print("ATR5 門檻對照（尚未加大單條件）")
     print("=" * 64)
@@ -398,8 +387,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
         )
 
     print(
-        f"\n說明: 勝率=勝/進場總數；勝=TP、敗=SL、持平=時間牆；"
-        f"標籤 ±{TP_PCT:.0%}/{LABEL_HORIZON_MINUTES}分。",
+        f"\n說明: 勝率=勝/進場總數；勝=TP、敗=SL、持平=時間牆；" f"標籤 ±{TP_PCT:.0%}/{LABEL_HORIZON_MINUTES}分。",
         flush=True,
     )
     print(f"耗時 {time.time()-t0:.1f}s", flush=True)

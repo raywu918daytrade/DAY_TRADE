@@ -50,11 +50,7 @@ def _first_solid_m1(m1_day: pd.DataFrame) -> dict | None:
     """09:05～10:00 內第一根實體陽線 M1。"""
     if m1_day is None or m1_day.empty:
         return None
-    m1 = (
-        m1_day.dropna(subset=["open", "high", "low", "close"])
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    m1 = m1_day.dropna(subset=["open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
     t0 = dtime(*SESSION_START)
     t1 = dtime(*SESSION_END)
     for _, row in m1.iterrows():
@@ -115,8 +111,7 @@ def run(start_date: str, end_date: str, min_atr5: float = 0.01) -> pd.DataFrame:
         flush=True,
     )
     print(
-        f"淨大單: 該分鐘 (大買/總量 − 大賣/總量)，單筆>{TICK_LARGE_LOT}張；"
-        f"大量門檻 net≥{NET_LARGE_THR:.0%}",
+        f"淨大單: 該分鐘 (大買/總量 − 大賣/總量)，單筆>{TICK_LARGE_LOT}張；" f"大量門檻 net≥{NET_LARGE_THR:.0%}",
         flush=True,
     )
     print(f"標籤 ±{TP_PCT:.0%}/{LABEL_HORIZON_MINUTES}分；區間 {start_date} ~ {end_date}\n", flush=True)
@@ -185,8 +180,11 @@ def run(start_date: str, end_date: str, min_atr5: float = 0.01) -> pd.DataFrame:
     print("\n" + "=" * 72)
     print("有淨大單 vs 無淨大單")
     print("=" * 72)
-    print(f"net 分布: mean={net.mean():.3f} p50={net.median():.3f} "
-          f"p75={net.quantile(0.75):.3f} %>0={(net>0).mean()*100:.1f}%", flush=True)
+    print(
+        f"net 分布: mean={net.mean():.3f} p50={net.median():.3f} "
+        f"p75={net.quantile(0.75):.3f} %>0={(net>0).mean()*100:.1f}%",
+        flush=True,
+    )
 
     hdr = f"{'條件':>22} {'進場總數':>8} {'勝':>6} {'敗':>6} {'持平':>6} {'勝率':>8} {'騙線%':>8}"
     print(hdr, flush=True)
@@ -202,8 +200,7 @@ def run(start_date: str, end_date: str, min_atr5: float = 0.01) -> pd.DataFrame:
     _print_row("非大買>大賣", _row_stats(ev[~buy_gt]))
 
     print(
-        f"\n解讀: 若「有／大量淨大單」勝率明顯高於「無／非大量」，才值得當過濾。"
-        f" 耗時 {time.time()-t0:.1f}s",
+        f"\n解讀: 若「有／大量淨大單」勝率明顯高於「無／非大量」，才值得當過濾。" f" 耗時 {time.time()-t0:.1f}s",
         flush=True,
     )
     return ev

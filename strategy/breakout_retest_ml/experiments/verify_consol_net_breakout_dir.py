@@ -42,11 +42,7 @@ def _first_consol(
     """決策窗內最早一個 15 分盤整窗。"""
     if m1_day is None or m1_day.empty:
         return None
-    m1 = (
-        m1_day.dropna(subset=["open", "high", "low", "close"])
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    m1 = m1_day.dropna(subset=["open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
     if len(m1) < CONSOL_BARS:
         return None
 
@@ -97,10 +93,7 @@ def _breakout_label(
     range_low: float,
 ) -> int:
     """+1 先觸上、-1 先觸下、0 未突破、nan 資料不足。"""
-    fut = m1_day[
-        (m1_day["date"] >= win_end)
-        & (m1_day["date"] < win_end + pd.Timedelta(minutes=FWD_MINUTES))
-    ]
+    fut = m1_day[(m1_day["date"] >= win_end) & (m1_day["date"] < win_end + pd.Timedelta(minutes=FWD_MINUTES))]
     if fut.empty:
         return 0
     # 需要足夠未來棒才算「未突破」，否則仍標 0（未突破）以簡化
@@ -240,8 +233,7 @@ def run(
     print("=" * 64)
     st = _hit_stats(ev)
     print(
-        f"全體(net≠0且有突破): n={st['n']}  命中率={st['hit']:.1f}%  "
-        f"(標籤上={st['n_up']} 下={st['n_dn']})",
+        f"全體(net≠0且有突破): n={st['n']}  命中率={st['hit']:.1f}%  " f"(標籤上={st['n_up']} 下={st['n_dn']})",
         flush=True,
     )
     n0 = int(((ev["net"] == 0) & (ev["brk"] != 0)).sum())
@@ -274,8 +266,7 @@ def run(
         if n == 0:
             continue
         print(
-            f"  {label}: n={n}  →上={100*(g['brk']==1).mean():.1f}%  "
-            f"→下={100*(g['brk']==-1).mean():.1f}%",
+            f"  {label}: n={n}  →上={100*(g['brk']==1).mean():.1f}%  " f"→下={100*(g['brk']==-1).mean():.1f}%",
             flush=True,
         )
 

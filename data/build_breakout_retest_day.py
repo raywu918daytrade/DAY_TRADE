@@ -79,8 +79,7 @@ def build(force: bool = False, start_date: str = _DEFAULT_START) -> pd.DataFrame
     stock_ids = load_tick_universe()
     hist_start = (pd.Timestamp(start_date) - pd.Timedelta(days=_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     print(
-        f"掃描 breakout_retest_day：universe={len(stock_ids)} "
-        f"hist_start={hist_start} keep_from={start_date}",
+        f"掃描 breakout_retest_day：universe={len(stock_ids)} " f"hist_start={hist_start} keep_from={start_date}",
         flush=True,
     )
 

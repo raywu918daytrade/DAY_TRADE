@@ -156,8 +156,7 @@ def predict_live(
                 "tick_large_sell_ratio": trigger.get("tick_large_sell_ratio", 0.0),
                 "tick_large_net_ratio": trigger.get(
                     "tick_large_net_ratio",
-                    float(trigger["tick_large_buy_ratio"])
-                    - float(trigger.get("tick_large_sell_ratio", 0.0) or 0.0),
+                    float(trigger["tick_large_buy_ratio"]) - float(trigger.get("tick_large_sell_ratio", 0.0) or 0.0),
                 ),
                 "cvd_30s_delta": trigger["cvd_30s_delta"],
                 "close": trigger["entry_price"],

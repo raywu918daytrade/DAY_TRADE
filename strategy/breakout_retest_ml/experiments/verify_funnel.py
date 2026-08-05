@@ -263,9 +263,7 @@ def run(
         n3 = n4 = n5 = 0
         entry = triggers
     else:
-        cand_keys = set(
-            zip(day_support["stock_id"].astype(str), day_support["candidate_date"].astype(str).str[:10])
-        )
+        cand_keys = set(zip(day_support["stock_id"].astype(str), day_support["candidate_date"].astype(str).str[:10]))
         trig_keys = set(zip(triggers["stock_id"].astype(str), triggers["candidate_date"].astype(str).str[:10]))
         body_keys = trig_keys & cand_keys
         n3 = n2

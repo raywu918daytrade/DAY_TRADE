@@ -53,8 +53,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
     print("tick400 無支撐：滾動5分實體 + ATR5 + 大買>大賣", flush=True)
     print(f"母體: tick_universe {len(stock_ids)} 檔（無 breakout／支撐硬過濾）", flush=True)
     print(
-        f"合成門檻: 連續 {ROLL_MINUTES} 根 M1、body≥{MIN_BODY_RATIO:.0%}、"
-        f"上影≤{MAX_UPPER_SHADOW_RATIO:.0%}",
+        f"合成門檻: 連續 {ROLL_MINUTES} 根 M1、body≥{MIN_BODY_RATIO:.0%}、" f"上影≤{MAX_UPPER_SHADOW_RATIO:.0%}",
         flush=True,
     )
     print(
@@ -95,8 +94,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
         if trig is None:
             if i % 2000 == 0:
                 print(
-                    f"  [m5] {i}/{n_pairs} hit={n_hit} labeled={len(rows)} "
-                    f"elapsed={time.time()-t0:.0f}s",
+                    f"  [m5] {i}/{n_pairs} hit={n_hit} labeled={len(rows)} " f"elapsed={time.time()-t0:.0f}s",
                     flush=True,
                 )
             continue
@@ -127,8 +125,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
         )
         if i % 2000 == 0 or len(rows) % 500 == 0:
             print(
-                f"  [m5] {i}/{n_pairs} hit={n_hit} labeled={len(rows)} "
-                f"elapsed={time.time()-t0:.0f}s",
+                f"  [m5] {i}/{n_pairs} hit={n_hit} labeled={len(rows)} " f"elapsed={time.time()-t0:.0f}s",
                 flush=True,
             )
 
@@ -182,10 +179,7 @@ def run(start_date: str, end_date: str, min_atr5: float = DEFAULT_MIN_ATR5) -> p
         base = need_tick[need_tick["atr5"] >= atr_thr].copy()
         dom = base[base["bar_large_buy_ratio"] > base["bar_large_sell_ratio"]]
         print("\n" + "=" * 64)
-        print(
-            f"大買>大賣 總覽（ATR5>={atr_thr:.5f}；"
-            f"M5 n={len(base)} → 買>賣 n={len(dom)}）"
-        )
+        print(f"大買>大賣 總覽（ATR5>={atr_thr:.5f}；" f"M5 n={len(base)} → 買>賣 n={len(dom)}）")
         print("=" * 64)
         hdr = f"{'條件':>10} {'進場總數':>8} {'勝':>6} {'敗':>6} {'持平':>6} {'勝率':>8}"
         print(hdr, flush=True)

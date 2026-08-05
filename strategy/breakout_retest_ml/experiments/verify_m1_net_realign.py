@@ -166,10 +166,7 @@ def run(start_date: str, end_date: str, max_rows: int = 4000) -> pd.DataFrame:
 
     opp = out[out["grp"] == "opp"]
     print("\n【主表】t0 反向 → 各 H", flush=True)
-    hdr = (
-        f"{'H':>4} {'n':>5} {'對齊%':>8} {'仍反向%':>8} {'無訊號%':>8} "
-        f"{'淨大單→M1':>12} {'M1→淨大單':>12}"
-    )
+    hdr = f"{'H':>4} {'n':>5} {'對齊%':>8} {'仍反向%':>8} {'無訊號%':>8} " f"{'淨大單→M1':>12} {'M1→淨大單':>12}"
     print(hdr, flush=True)
     print("-" * len(hdr), flush=True)
     for h in HORIZONS:
