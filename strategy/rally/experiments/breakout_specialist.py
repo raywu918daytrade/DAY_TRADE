@@ -134,7 +134,7 @@ def compare(test_days: int = 10):
     if _MODEL_PATH_XGB.exists():
         models["通用 XGB    "] = load_model_xgb()
     else:
-        print("  （跳過 通用 XGB：模型不存在，請先跑 strategy/rally/entry.py train_xgb）")
+        print("  （跳過 通用 XGB：模型不存在，請先跑 python -m strategy.rally.train train_xgb）")
     if _MODEL_PATH_XGB_BREAKOUT_ONLY.exists():
         models["破底翻專門 XGB"] = load_model_breakout_only()
     else:

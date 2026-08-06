@@ -620,9 +620,9 @@ def main(
     use_cache: bool = False,
     start_date: str | None = None,
 ):
-    """CLI進入點，比照 strategy/rally/entry.py 的 mode 切換方式（mkt
-    目前只有 train.py，還沒有 predict.py/live.py/entry.py，等那些補齊了
-    再考慮要不要拆成獨立的 entry.py）。可用模式見檔頭的「== Main 模式 ==」。
+    """CLI進入點，比照 strategy/rally/train.py 的 mode 切換方式（rally
+    2026-08-06 把原本獨立的 entry.py 併回 train.py，這裡跟 orb 一樣本來就
+    沒有分開的 entry.py）。可用模式見檔頭的「== Main 模式 ==」。
 
     model_type：train 用哪個演算法（rfc/xgb/lgbm，預設rfc）；importance/
     evaluate/confidence 則是讀哪個演算法已經訓練好的模型來評估（2026-07-21

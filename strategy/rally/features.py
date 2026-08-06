@@ -25,6 +25,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 from data.query import load_day, load_m3, load_m5
 from data.resample import compute_m3, compute_m5
+from finmind.tick_universe import load_tick_universe
 from strategy.rally.config import HOLD_BARS, SL_PCT, TP_PCT
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -33,10 +34,15 @@ load_dotenv(_ROOT / ".env", override=True)
 _M1_DIR = _ROOT / "db/m1"
 _M3_DIR = _ROOT / "db/m3"
 _M5_DIR = _ROOT / "db/m5"
-_DAY_DIR = _ROOT / "db/fugle_day"
+_DAY_DIR = _ROOT / "db/d1"  # 2026-08-03 從 db/fugle_day 改名而來，這裡只拿來檢查新鮮度用
+# （實際讀取日K走 data.query.load_day()，見 _compute_month_features() 的說明）
+_ADJUST_FACTOR_DIR = _ROOT / "db/tick_adjust_factor"  # 還原拆股/合股用的係數表
+# （data/build_tick_adjust_factor.py），_month_is_fresh() 也要比對這個目錄的
+# mtime——係數之後被回頭修正的話，現有 cache 分區要能被判定過期重算，不然會
+# 一直沿用還原前算出來的舊特徵值（比照 strategy/orb/features.py 的做法）
 _CACHE_DIR = _ROOT / "cache/m1_rally_features"
 
-# 日K特徵最長回看窗口（pos_20d 用 rolling(20)），算某個月份的特徵時 db/fugle_day
+# 日K特徵最長回看窗口（pos_20d 用 rolling(20)），算某個月份的特徵時 db/d1
 # 要多抓這麼多天當緩衝，不然那個月前面幾天會因為算不出 day_ret_10/pos_20d/
 # day_atr 而被 dropna 丟掉，等於變相把可用起日往後推。
 _DAY_LOOKBACK_CALENDAR_DAYS = 45
@@ -95,8 +101,8 @@ def _m1_available_months() -> list[tuple[int, int]]:
 
 
 def _month_is_fresh(year: int, month: int) -> bool:
-    """檢查某個月份的 cache 分區是否比對應的 db/m1、db/fugle_day（含回看範圍
-    內的月份）都新。"""
+    """檢查某個月份的 cache 分區是否比對應的 db/m1、db/d1、db/tick_adjust_factor
+    （含回看範圍內的月份）都新。"""
     partition = _month_file(_CACHE_DIR, year, month)
     if not partition.exists():
         return False
@@ -105,6 +111,8 @@ def _month_is_fresh(year: int, month: int) -> bool:
         return False
     for dy, dm in _day_lookback_months(year, month):
         if partition_mtime < _file_mtime(_month_file(_DAY_DIR, dy, dm)):
+            return False
+        if partition_mtime < _file_mtime(_month_file(_ADJUST_FACTOR_DIR, dy, dm)):
             return False
     return True
 
@@ -122,20 +130,37 @@ def _read_month_parquet(dir_path: Path, year: int, month: int) -> pd.DataFrame:
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def _compute_month_features(year: int, month: int) -> pd.DataFrame:
-    """對單一月份重算特徵，回傳只含 FEATURES + meta_cols 的 DataFrame。"""
+def _compute_month_features(year: int, month: int, universe: set) -> pd.DataFrame:
+    """對單一月份重算特徵，回傳只含 FEATURES + meta_cols 的 DataFrame。
+
+    universe: 固定 400 支 tick_universe（見 finmind/tick_universe.py），
+    load_features() 只算一次往下傳，不要在這裡每個月各自呼叫一次
+    load_tick_universe()。2026-08-01 前 db/m1 的舊月份分檔還是全市場~2700支
+    （data/m1_data_loader.py 寫入端限制不會回頭清理既有檔案），這裡要在算
+    任何特徵之前先篩，比照 strategy/mkt/train.py 的教訓（篩太晚在算完跨股票
+    的特徵之後才篩，2026-08-05撞過55GB記憶體爆炸）跟 strategy/orb/features.py
+    的做法。0050 已經在 tick_universe 裡強制包含（見 finmind/tick_universe.py
+    的 _FORCE_INCLUDE），不用另外處理。"""
     month_start = pd.Timestamp(year=year, month=month, day=1)
     month_end = month_start + pd.DateOffset(months=1)
 
     m1 = _read_month_parquet(_M1_DIR, year, month)
+    m1 = m1[m1["stock_id"].isin(universe)]
 
     m3_frames = [_read_month_parquet(_M3_DIR, year, month)]
     m5_frames = [_read_month_parquet(_M5_DIR, year, month)]
     m3 = m3_frames[0]
     m5 = m5_frames[0]
 
-    day_frames = [_read_month_parquet(_DAY_DIR, dy, dm) for dy, dm in _day_lookback_months(year, month)]
-    day = pd.concat(day_frames, ignore_index=True) if day_frames else pd.DataFrame()
+    # day K 改用 data.query.load_day()（還原拆股/合股版），不要用
+    # _read_month_parquet(_DAY_DIR, ...) 讀原始 db/d1——predict_live()
+    # （strategy/rally/predict.py）算日K背景特徵時用的就是這支還原版，兩邊
+    # 不一致會在遇到拆股/合股事件時產生 training-serving skew（比照
+    # strategy/orb/features.py 的做法）。日K一個月才幾百~幾千列，
+    # load_day(start_date=...) 就算讀到比這裡的回看窗口更寬的範圍（底層依
+    # 月份篩檔案，不是整個資料夾全讀），成本也可忽略。
+    day_cutoff = (month_start - pd.Timedelta(days=_DAY_LOOKBACK_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+    day = load_day(start_date=day_cutoff)
     if not day.empty:
         day = day[day["date"] < month_end].reset_index(drop=True)
 
@@ -189,11 +214,12 @@ def load_features(use_cache: bool = True, start_date: str = "") -> pd.DataFrame:
                     force_all = True
                 break
 
+    universe = set(load_tick_universe())  # 固定400支，見 _compute_month_features() 的說明
     for year, month in target_months:
         if use_cache and not force_all and _month_is_fresh(year, month):
             continue
         print(f"  重新計算特徵：{_month_str(year, month)}...")
-        month_df = _compute_month_features(year, month)
+        month_df = _compute_month_features(year, month, universe)
         month_df.to_parquet(_month_file(_CACHE_DIR, year, month))
         print(f"    {_month_str(year, month)} 分區已存（{len(month_df):,} 筆）")
 
