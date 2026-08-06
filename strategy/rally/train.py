@@ -29,7 +29,7 @@ _compute_month_features() 說明），不再用全市場~2700支，篩選在 fea
 _prepare_train_test() 切分全天訓練/測試集，方便公平比較。
 
 實際邏輯拆到同資料夾底下：
-    config.py     交易相關設定（TP/SL/HOLD_BARS、SESSION、BREAKOUT_TRADE 時段）
+    config.py     交易相關設定（TP/SL/HOLD_BARS、SESSION 時段、ATR_FILTER_THRESHOLD）
     features.py   特徵工程、triple barrier 標籤、FEATURES 清單、load_features() cache
     validate.py   信心度/召回率/模型×時段×信心度交叉報表、特徵重要性
     predict.py    批次與即時推論（predict_live 是正式對外入口）
@@ -75,8 +75,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 from data.build_m3_m5_rolling import build as build_m3_m5
 from strategy.rally.config import (  # noqa: F401  (re-export：交易參數一眼看到全部)
-    BREAKOUT_TRADE_END,
-    BREAKOUT_TRADE_START,
+    ATR_FILTER_THRESHOLD,
     HOLD_BARS,
     SESSION_END,
     SESSION_START,
@@ -124,6 +123,13 @@ def train(
     df = df.dropna(subset=FEATURES + ["target"])
     print(f"  使用特徵: {FEATURES}")
     print(f"  全天有效樣本: {len(df):,} 筆")
+
+    # ATR 平盤過濾（見 config.py::ATR_FILTER_THRESHOLD 的說明）：篩掉波動太小、
+    # 幾乎注定不會觸發 triple barrier 停利/停損的樣本，train/predict/
+    # predict_live 三邊要用同一個門檻，不能只改這裡。
+    before_atr = len(df)
+    df = df[df["m1_atr"] >= ATR_FILTER_THRESHOLD]
+    print(f"  ATR過濾（m1_atr>={ATR_FILTER_THRESHOLD}）: {before_atr:,} → {len(df):,} 筆")
 
     # 日期過濾
     if start_date:
@@ -226,6 +232,11 @@ def _prepare_train_test(
     df = df.dropna(subset=FEATURES + ["target"])
     print(f"  使用特徵數: {len(FEATURES)}")
     print(f"  全天有效樣本: {len(df):,} 筆")
+
+    # ATR 平盤過濾，見 train() 裡同樣邏輯的說明。
+    before_atr = len(df)
+    df = df[df["m1_atr"] >= ATR_FILTER_THRESHOLD]
+    print(f"  ATR過濾（m1_atr>={ATR_FILTER_THRESHOLD}）: {before_atr:,} → {len(df):,} 筆")
 
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()

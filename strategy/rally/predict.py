@@ -14,6 +14,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 import pandas as pd
 
 from data.query import load_day, load_m1_live
+from strategy.rally.config import ATR_FILTER_THRESHOLD
 from strategy.rally.features import FEATURES, compute_m3, compute_m5, load_features, make_features
 from strategy.rally.train import load_model
 
@@ -46,12 +47,20 @@ def predict(
 
     breakout_filter=True 時，只保留 breakout_signal=True 的樣本
     （強過濾：先跌後漲破底翻才納入預測）。
+
+    2026-08-06 修復：load_features() 改帶 start_date（只抓 test_days + 45天
+    緩衝），不再吃全部歷史——原本沒帶 start_date，每次呼叫都會從 db/m1/
+    最早的月份開始算，除了浪費（backtest 只需要最近 test_days 天），還會
+    撞到 db/m1（回溯到2020_01）比 db/m3/db/m5（批次預算，只到2020_03）
+    涵蓋範圍更廣的資料缺口，m3/m5 讀到空的月份直接崩潰。
     """
     if model is None:
         model = load_model()
 
-    df = load_features()
+    start_date = (pd.Timestamp.now() - pd.Timedelta(days=test_days + 45)).strftime("%Y-%m-%d")
+    df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES)
+    df = df[df["m1_atr"] >= ATR_FILTER_THRESHOLD]
 
     if breakout_filter:
         df = df[df["breakout_signal"]]
@@ -91,8 +100,9 @@ def predict_live(
     若要開回去，設 use_breakout_filter=True，只有 breakout_signal=True 的
     樣本才會進入模型預測。
 
-    交易時段限制交給呼叫端（跟 SESSION_START/END 比對），這裡不再額外用
-    BREAKOUT_TRADE_START/END 鎖死 9:14~9:30 黃金窗口。
+    交易時段限制交給呼叫端（跟 SESSION_START/END 比對），這裡不再額外鎖死
+    9:14~9:30 黃金窗口（那組常數已搬到 experiments/breakout_filter_eval.py，
+    不是 config.py 的正式設定了）。
 
     回傳格式：[{"stock_id": ..., "proba": ..., "price": ..., "breakout": ...}, ...]
     """
@@ -166,6 +176,10 @@ def predict_live(
         return []
 
     valid = current.dropna(subset=FEATURES)
+    if valid.empty:
+        return []
+
+    valid = valid[valid["m1_atr"] >= ATR_FILTER_THRESHOLD]
     if valid.empty:
         return []
 

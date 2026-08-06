@@ -9,14 +9,29 @@ import threading
 import pandas as pd
 
 
+def _parse_hhmm(value) -> tuple[int, int]:
+    """策略模組的 SESSION_START/SESSION_END 統一轉成 (h, m) int tuple 給
+    live_trader.py 用（(h, m) < s.session_start 比較、s.session_start[0]
+    索引）。同時接受兩種格式：
+      - tuple/list，例如 (9, 0)（orb/mkt/cnn/vwap_ml/vwap_dl 目前的寫法）
+      - "H:MM"/"HH:MM" 字串，例如 "9:00"（strategy/rally/config.py
+        2026-08-06 起改用字串，比較好讀，見該檔案的說明）
+    只在這裡轉一次，其他地方（main/live_trader.py 的比較/索引邏輯）完全
+    不用跟著改，策略模組要用哪種格式都可以。"""
+    if isinstance(value, str):
+        h, m = value.split(":")
+        return int(h), int(m)
+    return int(value[0]), int(value[1])
+
+
 class StrategyState:
     """單一策略模組的執行期狀態（可同時存在多個，見 AppState.strategies）。"""
 
     def __init__(self, name: str, module):
         self.name = name
         self.module = module
-        self.session_start = module.SESSION_START
-        self.session_end = module.SESSION_END
+        self.session_start = _parse_hhmm(module.SESSION_START)
+        self.session_end = _parse_hhmm(module.SESSION_END)
         self.load_model = module.load_model
         self.predict_live = module.predict_live
         # 各策略自己的信心度門檻預設值（module.THRESHOLD，見各策略 config.py 的

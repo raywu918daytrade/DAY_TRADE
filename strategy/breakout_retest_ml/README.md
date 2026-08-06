@@ -57,3 +57,47 @@ Live：`.env` 加 `strategy.breakout_retest_ml.up.live`（需即時 tick；尚�
 | `tick_large_buy/sell/net_ratio` / `cvd_30s_delta` | 大單買賣對抗 + CVD |
 
 標籤與 prepared cache 仍在 `cache/`（訓練產物，不進 `db/`）。
+
+## 策略驗證紀錄
+
+慣例：每個驗證一個資料夾 `strategy_test/<name>/`；此處只記 plan／小樣結論。
+
+### 2026-08-06 — prev_bear_m5_short（做空，鎖定）
+
+路徑：`strategy_test/prev_bear_m5_short/`
+
+**鎖定**：昨陰≥5% + 今開高≥2% + 0050 開低 + 首 m5@09:05 跌；做空 TB ±3%/30 分；**不用 atr5**。
+
+| 區間 | n | 止盈 | 震盪 | 止損 | mean |
+|--|--|--|--|--|--|
+| 2026-06～07（小樣最佳） | 19 | 47.4% | 42.1% | 10.5% | +1.21% |
+| 2024-01～2026-07 | 48 | 29.2% | 47.9% | 22.9% | +0.41% |
+
+```bash
+python -m strategy_test.prev_bear_m5_short.verify \
+    --start_date 2026-06-01 --end_date 2026-07-31
+```
+
+### 2026-08-06 — prev_bear_m5_long（同濾網做多對照）
+
+路徑：`strategy_test/prev_bear_m5_long/`
+
+濾網同 short，進場改做多。小樣 / 放大 mean 分別為 **−1.21% / −0.41%**（約為 short 的符號翻轉）→ 支持 short 方向性。
+
+### 2026-08-06 — prev_bear_m5_orb_short（ORB 跌破，未優於 short）
+
+路徑：`strategy_test/prev_bear_m5_orb_short/`
+
+日線同 short；首 m5@09:05 當 OR（不管陰陽）；之後 ≤09:30 第一根 `close < OR.low` 做空；TB ±3%/30 分。主看勝率。
+
+| 區間 | n | 勝率 | 震盪 | 止損 | mean |
+|--|--|--|--|--|--|
+| 2026-06～07 | 18 | 38.9% | 38.9% | 22.2% | +0.42% |
+| 2024-01～2026-07 | 49 | 16.3% | 63.3% | 20.4% | +0.14% |
+
+對照 short 勝率 47.4% / 29.2% → ORB 跌破較差，維持首 m5 陰線進場。
+
+```bash
+python -m strategy_test.prev_bear_m5_orb_short.verify \
+    --start_date 2026-06-01 --end_date 2026-07-31
+```

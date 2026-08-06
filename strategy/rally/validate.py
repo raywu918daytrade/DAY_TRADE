@@ -14,6 +14,7 @@ if str(Path(__file__).parent.parent.parent) not in sys.path:
 
 import pandas as pd
 
+from strategy.rally.config import ATR_FILTER_THRESHOLD
 from strategy.rally.features import FEATURES, load_features
 from strategy.rally.train import (
     _MODEL_PATH,
@@ -106,6 +107,7 @@ def model_hour_confidence_report(
 
     df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
+    df = df[df["m1_atr"] >= ATR_FILTER_THRESHOLD]
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()
     if end_date:
@@ -177,6 +179,7 @@ def hour_signal_report(
 
     df = load_features(start_date=start_date)
     df = df.dropna(subset=FEATURES + ["target"])
+    df = df[df["m1_atr"] >= ATR_FILTER_THRESHOLD]
     if start_date:
         df = df[df["date"] >= pd.Timestamp(start_date)].copy()
     if end_date:

@@ -37,9 +37,14 @@ if str(Path(__file__).parent.parent.parent.parent) not in sys.path:
 
 import pandas as pd
 
-from strategy.rally.config import BREAKOUT_TRADE_END, BREAKOUT_TRADE_START
 from strategy.rally.features import FEATURES, load_features
 from strategy.rally.train import load_model
+
+# 破底翻硬過濾的「黃金窗口」，只有這支實驗腳本還在用（2026-08-06 從
+# config.py 搬過來——breakout_signal 硬過濾本身已經被驗證會拉低勝率，
+# 不是上線設定，放在 config.py 容易讓人誤以為還在生效）。
+_BREAKOUT_TRADE_START = "9:14"
+_BREAKOUT_TRADE_END = "9:30"
 
 
 def breakout_filter_report(
@@ -113,7 +118,7 @@ def breakout_minute_report(
     強過濾破底翻：只看 breakout_signal=True 的樣本，
     逐分鐘顯示：推論數、平均信心度、勝率。
 
-    交易時段限制為黃金窗口 9:14~9:30（BREAKOUT_TRADE_START ~ BREAKOUT_TRADE_END），
+    交易時段限制為黃金窗口 9:14~9:30（_BREAKOUT_TRADE_START ~ _BREAKOUT_TRADE_END），
     這段破底翻勝率明顯高於 9:30 之後。
 
     9:14 是 breakout_signal 第一個有效分鐘（需 9:01→9:06 與 9:06→9:11 兩根 M5）。
@@ -140,8 +145,8 @@ def breakout_minute_report(
     test_df = test_df[test_df["breakout_signal"]]
 
     # ── 黃金窗口 9:14 ~ 9:30 ─────────────────────────────────────
-    sh, sm = BREAKOUT_TRADE_START
-    eh, em = BREAKOUT_TRADE_END
+    sh, sm = (int(x) for x in _BREAKOUT_TRADE_START.split(":"))
+    eh, em = (int(x) for x in _BREAKOUT_TRADE_END.split(":"))
     mask = (test_df["hour"] == sh) & (test_df["minute"] >= sm) & (test_df["hour"] == eh) & (test_df["minute"] <= em)
     test_df = test_df[mask].copy()
 

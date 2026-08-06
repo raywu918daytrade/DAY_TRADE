@@ -41,26 +41,35 @@ import joblib
 import pandas as pd
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from strategy.rally.config import BREAKOUT_TRADE_END, BREAKOUT_TRADE_START
 from strategy.rally.features import FEATURES, load_features
 from strategy.rally.train import _MODEL_PATH_XGB, load_model_xgb
 
 _ROOT = Path(__file__).parent.parent.parent.parent
 _MODEL_PATH_XGB_BREAKOUT_ONLY = _ROOT / "models/experiments/m1_xgb_breakout_only.pkl"
 
+# 破底翻硬過濾的「黃金窗口」，只有這支跟 breakout_filter_eval.py 兩支實驗
+# 腳本還在用（2026-08-06 從 config.py 搬過來，理由同 breakout_filter_eval.py
+# 檔頭的說明）。
+_BREAKOUT_TRADE_START = "9:14"
+_BREAKOUT_TRADE_END = "9:30"
+
 
 def _prepare_breakout_train_test(
     test_days: int = 10,
-    hhmm_range: tuple[tuple[int, int], tuple[int, int]] | None = (BREAKOUT_TRADE_START, BREAKOUT_TRADE_END),
+    hhmm_range: tuple[str, str] | None = (_BREAKOUT_TRADE_START, _BREAKOUT_TRADE_END),
 ):
-    """只保留 breakout_signal=True（預設再限制在黃金窗口）的訓練/測試集。"""
+    """只保留 breakout_signal=True（預設再限制在黃金窗口）的訓練/測試集。
+
+    hhmm_range：一對 "H:MM" 字串（見本檔頭的 _BREAKOUT_TRADE_START/END 說明）。"""
     print("特徵工程...")
     df = load_features()
     df = df.dropna(subset=FEATURES + ["target"])
     df = df[df["breakout_signal"]]
     print(f"  只保留 breakout_signal=True 樣本")
     if hhmm_range is not None:
-        (sh, sm), (eh, em) = hhmm_range
+        start_str, end_str = hhmm_range
+        sh, sm = (int(x) for x in start_str.split(":"))
+        eh, em = (int(x) for x in end_str.split(":"))
         hhmm = df["hour"] * 100 + df["minute"]
         df = df[(hhmm >= sh * 100 + sm) & (hhmm <= eh * 100 + em)]
         print(f"  只保留 {sh}:{sm:02d}~{eh}:{em:02d} 樣本")
@@ -80,7 +89,7 @@ def _prepare_breakout_train_test(
 
 def train_breakout_only(
     test_days: int = 10,
-    hhmm_range: tuple[tuple[int, int], tuple[int, int]] | None = (BREAKOUT_TRADE_START, BREAKOUT_TRADE_END),
+    hhmm_range: tuple[str, str] | None = (_BREAKOUT_TRADE_START, _BREAKOUT_TRADE_END),
 ):
     """
     訓練「只用破底翻樣本」的專門 XGBoost 模型，跟 train.py::train_xgb() 用
@@ -151,8 +160,8 @@ def compare(test_days: int = 10):
 
     # 限制在跟專門模型訓練時同一個子集：breakout_signal=True + 黃金窗口
     test_df = test_df[test_df["breakout_signal"]]
-    sh, sm = BREAKOUT_TRADE_START
-    eh, em = BREAKOUT_TRADE_END
+    sh, sm = (int(x) for x in _BREAKOUT_TRADE_START.split(":"))
+    eh, em = (int(x) for x in _BREAKOUT_TRADE_END.split(":"))
     mask = (test_df["hour"] == sh) & (test_df["minute"] >= sm) & (test_df["hour"] == eh) & (test_df["minute"] <= em)
     test_df = test_df[mask].copy()
 
