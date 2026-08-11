@@ -137,7 +137,13 @@ def get_stock_candles(
             dataset = ds.dataset(str(std_dir), format="parquet")
             filt = ds.field("stock_id") == stock_id
             if date:
-                filt = filt & (ds.field("date") <= f"{date} 23:59:59")
+                # db/m3_std／db/m5_std 的 date 欄位是原生 timestamp 型別
+                # （不像 db/m1 是字串），用字串比較會直接噴
+                # ArrowNotImplementedError（'less_equal' has no kernel
+                # matching input types (timestamp[ns], string)）——用
+                # pd.Timestamp() 轉成 pyarrow 看得懂的型別再比較。
+                # 2026-08-11 發現：股票清單欄選日期+5分週期查不到資料。
+                filt = filt & (ds.field("date") <= pd.Timestamp(f"{date} 23:59:59"))
             table = dataset.to_table(filter=filt)
             if table.num_rows > 0:
                 df = table.to_pandas()
@@ -224,8 +230,20 @@ def get_all_stocks_candles(
         # 預先算好、涵蓋多年歷史的資料，只好整個 fallback 到別的資料源）。
         std_dir = _ROOT / f"db/m{timeframe[:-1]}_std"
         if std_dir.exists():
+            # 要有「date 所在月份」以前的檔案才撈得到往回推 limit 根的歷史
+            # ——原本寫成 f.stem >= cutoff_file 方向反了：只挑 date 當月
+            # 之後（含）的檔案，但下面又只留 date 之前的資料列，date 剛好
+            # 落在該月很早期（或非交易日，例如週末）時，選到的檔案裡完全
+            # 沒有任何一列通得過 <= date 的篩選，整批股票變成空清單。
+            # 2026-08-11 發現：型態掃描選日期+3分/5分週期掃描不到任何股票。
+            # 只取最近4個月（不是撈整個多年歷史），避免全部股票一次性讀進
+            # 記憶體——型態掃描的K線根數上限是500（見#pattern-limit），
+            # 4個月的5分K絕對夠用。
             cutoff_file = date[:7].replace("-", "_") if date else ""
-            files = sorted(f for f in std_dir.iterdir() if f.suffix == ".parquet" and (not cutoff_file or f.stem >= cutoff_file))
+            if cutoff_file:
+                files = sorted(f for f in std_dir.iterdir() if f.suffix == ".parquet" and f.stem <= cutoff_file)[-4:]
+            else:
+                files = sorted(f for f in std_dir.iterdir() if f.suffix == ".parquet")
             if not files:
                 files = sorted(f for f in std_dir.iterdir() if f.suffix == ".parquet")[-1:]
             if files:
