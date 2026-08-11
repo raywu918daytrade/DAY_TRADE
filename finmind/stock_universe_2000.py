@@ -56,6 +56,19 @@ def load_stock_universe_2000() -> list[str]:
     return pd.read_parquet(path, columns=["stock_id"])["stock_id"].tolist()
 
 
+def load_stock_universe_2000_with_0050() -> list[str]:
+    """load_stock_universe_2000() 額外強制併入 0050——那份清單的篩選規則排除
+    所有 ETF（含0050），但0050是系統裡的大盤參考指標（idx_gap_pct等特徵、
+    live_trader.py/data_manager.py都依賴它），需要持續下載/更新。比照
+    finmind/tick_universe.py::_FORCE_INCLUDE 的做法（2026-08-08加），統一供
+    data/day_data_loader.py、data/m1_data_loader.py、fubon/tick_api.py
+    共用，不要各自複製這段邏輯。"""
+    stocks = load_stock_universe_2000()
+    if "0050" not in stocks:
+        stocks = stocks + ["0050"]
+    return stocks
+
+
 if __name__ == "__main__":
     universe = build_stock_universe_2000()
     path = _universe_file_path()

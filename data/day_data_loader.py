@@ -20,6 +20,12 @@
 被兩種不同需求依賴（原始資料源 + pattern專用還原源），拆開之後 db/fugle_day
 整個目錄改名成 db/adjustment_day，原始下載改成新的 db/d1。
 
+⚠️ 2026-08-08 改：股票母體從 400支（依成交量排名的 tick_universe）擴大成
+1877支（db/tickers/stock_universe_2000.parquet，見
+finmind/stock_universe_2000.py——全市場4碼一般個股、不排名、只排除ETF），
+理由：finmind 分K回補已經先擴大到這份清單，日K母體要跟著擴大，避免大量
+股票「有分K沒日K」，跨資料源特徵（例如idx_gap_pct）算不出來。見 _all_stocks()。
+
 Fugle + 富邦同時下載：
     待下載清單拆一半，Fugle 那一半沿用原本的 ThreadPoolExecutor（多執行緒併發，
     429 交給 Retry-After 被動重試）；富邦那一半用單一執行緒依序下載（比照
@@ -72,6 +78,32 @@ _ADJUSTMENT_DAY_FLAG_PATH = _ROOT / "db/adjustment_day_flags/day_flag.parquet"
 # 用鎖序列化。
 _save_lock = threading.Lock()
 _flag_lock = threading.Lock()
+
+# 2026-08-08：三路併發（Fugle/Fugle-DT/富邦）依實際節流速率分配股票數，見
+# _split_by_rate()。富邦 intraday 家族官方限制 300次/分鐘，Fugle 60次/分鐘，
+# 富邦節流值同 fubon/tick_api.py::_REQUEST_INTERVAL（已驗證安全）。
+_FUGLE_INTERVAL = 1.05  # 秒/次，60次/分鐘留緩衝
+_FUBON_INTERVAL = 0.25  # 秒/次，300次/分鐘留緩衝
+
+
+def _split_by_rate(stocks: list, n_fugle_accounts: int = 2) -> tuple:
+    """依照 Fugle（n_fugle_accounts 組帳號，各自獨立 rate limit）跟富邦
+    實際節流速率的比例切股票清單，讓幾條平行執行緒理論上同時做完，不要
+    再無腦均分（那樣會讓步調較快的富邦做完閒置、拖累整體時間的還是最慢
+    的那條）。回傳 (fugle帳號1清單, fugle帳號2清單, ..., 富邦清單)，
+    data/m1_data_loader.py::update_m1() 也共用這支，不要各自複製一份。"""
+    fugle_rate = 1 / _FUGLE_INTERVAL
+    fubon_rate = 1 / _FUBON_INTERVAL
+    total_rate = fugle_rate * n_fugle_accounts + fubon_rate
+    n = len(stocks)
+    fugle_each = round(n * fugle_rate / total_rate)
+    groups = []
+    idx = 0
+    for _ in range(n_fugle_accounts):
+        groups.append(stocks[idx : idx + fugle_each])
+        idx += fugle_each
+    groups.append(stocks[idx:])  # 富邦拿剩下的（含四捨五入誤差，不用另外處理）
+    return tuple(groups)
 
 
 def _day_file_path(date: str, base_dir: str = _D1_DIR) -> Path:
@@ -190,7 +222,7 @@ def _download_day_fubon(sdk, stock_id: str, start_date: str, end_date: str | Non
             chunks.append(df)
         cur = chunk_end + timedelta(days=1)
         if cur <= end:
-            time.sleep(1.05)  # 2026-07-15：跟 _update_day_fubon() 既有的請求間隔一致，維持 60 req/min 以內
+            time.sleep(_FUBON_INTERVAL)  # 2026-08-08：跟 _update_day_fubon() 一致，見該常數說明（300次/分鐘留緩衝）
     return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
@@ -234,13 +266,18 @@ def _update_flag(stock_id: str, date_str: str, flag_path: Path = _D1_FLAG_PATH):
 
 
 def _all_stocks() -> list:
-    """股票母體（2026-08-01改）：讀 db/tickers/tick_universe.parquet 固定的
-    399支排名+0050強制併入共400支（見 finmind/tick_universe.py），不再讀
-    db/tickers/tickers.parquet 的全市場~2700支。說明同
-    data/m1_data_loader.py::_all_stocks()。"""
-    from finmind.tick_universe import load_tick_universe
+    """股票母體（2026-08-08改，2026-08-08再改共用helper）：讀
+    finmind.stock_universe_2000.load_stock_universe_2000_with_0050()
+    （1877支全市場一般個股+強制併入0050，共1878支，見該函式說明），取代
+    原本400支依成交量排名的tick_universe——理由見檔頭說明。
 
-    return load_tick_universe()
+    注意：這是 data/day_data_loader.py 自己的 _all_stocks()，跟
+    data/m1_data_loader.py::_all_stocks() 是兩個不同函式，但2026-08-08
+    起兩者統一讀同一份 stock_universe_2000_with_0050 清單（理由對稱：
+    日K/分K母體要一致，避免大量股票「有日K沒分K」或反過來）。"""
+    from finmind.stock_universe_2000 import load_stock_universe_2000_with_0050
+
+    return load_stock_universe_2000_with_0050()
 
 
 def _get_done_stocks(date_str: str, flag_path: Path = _D1_FLAG_PATH) -> set:
@@ -350,8 +387,9 @@ def _update_day_fubon(
     base_dir: str = _D1_DIR,
     flag_path: Path = _D1_FLAG_PATH,
 ):
-    """富邦那一半：單一執行緒依序下載，1.05秒/支，維持在 60 req/min 以內留緩衝
-    （比照 data/m1_data_loader.py 的作法）。
+    """富邦那一半：單一執行緒依序下載，0.25秒/支（2026-08-08從1.05秒加速，
+    見 _FUBON_INTERVAL 說明，300次/分鐘留緩衝，比照 fubon/tick_api.py 已驗證
+    安全的節流值）。
 
     stock_start_dates/空結果不標記完成：說明同 _update_day_fugle()。
     adjusted/base_dir/flag_path：說明同 _update_day_fugle()。"""
@@ -368,7 +406,7 @@ def _update_day_fubon(
                 print(f"  [富邦 {i}/{len(stocks)}] 進度更新")
         except Exception as e:
             print(f"  [富邦 {i}/{len(stocks)}] {stock_id} 失敗: {e}")
-        time.sleep(1.05)
+        time.sleep(_FUBON_INTERVAL)
 
 
 def _update_day_generic(
@@ -404,10 +442,7 @@ def _update_day_generic(
         behind = sorted(set(stock_start_dates.values()))
         start_date_desc = f"逐支查詢（{len(behind)} 種不同起始日期，最舊 {behind[0] if behind else '無'}）"
 
-    third = len(wait_stocks) // 3
-    fugle_half1 = wait_stocks[:third]
-    fugle_half2 = wait_stocks[third : 2 * third]
-    fubon_half = wait_stocks[2 * third :]
+    fugle_half1, fugle_half2, fubon_half = _split_by_rate(wait_stocks)
     print(
         f"[{base_dir}] start_date={start_date_desc}，Fugle {len(fugle_half1)} 支、"
         f"Fugle(daytrade) {len(fugle_half2)} 支（各 {workers} 並發）、"

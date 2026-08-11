@@ -167,15 +167,16 @@ def _download_m1_fubon(sdk, stock_id: str) -> pd.DataFrame:
 
 
 def _all_stocks() -> list:
-    """股票母體（2026-08-01改）：讀 db/tickers/tick_universe.parquet 固定的
-    399支排名+0050強制併入共400支（見 finmind/tick_universe.py），不再讀
-    db/tickers/tickers.parquet 的全市場~2700支。訓練用的 db/m1 母體跟推論/
-    交易（fubon/subscribe_list.py）統一成同一批，減少訓練雜訊、也大幅減少
-    每天下載的API用量。母體來源改了不影響下載邏輯本身，Fugle/富邦兩邊還是
-    各自下載一半。"""
-    from finmind.tick_universe import load_tick_universe
+    """股票母體（2026-08-08改）：讀
+    finmind.stock_universe_2000.load_stock_universe_2000_with_0050()
+    （1877支全市場一般個股+強制併入0050，共1878支），取代原本400支
+    tick_universe——跟 data/day_data_loader.py::_all_stocks() 統一成同一份
+    清單（理由對稱：日K母體已經先擴大，分K母體要跟著擴大，避免大量股票
+    「有日K沒分K」，跨資料源特徵算不出來）。母體來源改了不影響下載邏輯
+    本身，Fugle/富邦還是各自下載三分之一。"""
+    from finmind.stock_universe_2000 import load_stock_universe_2000_with_0050
 
-    return load_tick_universe()
+    return load_stock_universe_2000_with_0050()
 
 
 def _get_done_stocks(date_str: str) -> set:
@@ -230,8 +231,9 @@ def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str 
 
 
 def _update_m1_fubon(stocks: list, date_str: str, sdk):
-    """富邦那一半：historical/candles 一次就含今天，1.05秒/支（1次API），
-    維持在 60 req/min 以內留緩衝。
+    """富邦那一半：historical/candles 一次就含今天，0.25秒/支（1次API，
+    2026-08-08從1.05秒加速，比照 fubon/tick_api.py 已驗證安全的節流值，
+    300次/分鐘留緩衝，見 data.day_data_loader._FUBON_INTERVAL 說明）。
 
     空結果不標記完成：說明同 _update_m1_fugle()。"""
     for stock_id in stocks:
@@ -248,13 +250,14 @@ def _update_m1_fubon(stocks: list, date_str: str, sdk):
                 print(f"[富邦] {stock_id} 無資料")
         except Exception as e:
             print(f"[富邦] {stock_id} 失敗: {e}")
-        time.sleep(1.05)
+        time.sleep(0.25)
 
 
 def update_m1(stocks: list = None):
-    """1分鐘K線，flag避免同日重複下載。待下載清單拆三份，Fugle 兩組帳號
-    （FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦一份同時下載，
-    約可把時間壓到單一資料源的三分之一。"""
+    """1分鐘K線，flag避免同日重複下載。待下載清單依實際節流速率分三份
+    （見 data.day_data_loader._split_by_rate()，2026-08-08從無腦均分三等份
+    改成依速率比例分配，富邦節流也同步加速，理由見該函式說明）：Fugle 兩組
+    帳號（FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦一份同時下載。"""
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
     if not fugle_api.TOKEN_DAYTRADE:
@@ -269,10 +272,9 @@ def update_m1(stocks: list = None):
     wait_stocks = [s for s in candidates if s not in done]
     print("還有", len(wait_stocks), "個股票未更新（已排除今日已下載 flag）")
 
-    third = len(wait_stocks) // 3
-    fugle_half1 = wait_stocks[:third]
-    fugle_half2 = wait_stocks[third : 2 * third]
-    fubon_half = wait_stocks[2 * third :]
+    from data.day_data_loader import _split_by_rate
+
+    fugle_half1, fugle_half2, fubon_half = _split_by_rate(wait_stocks)
     print(
         f"Fugle {len(fugle_half1)} 支、Fugle(daytrade) {len(fugle_half2)} 支、"
         f"富邦 {len(fubon_half)} 支，同時下載..."

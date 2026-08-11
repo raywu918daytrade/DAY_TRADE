@@ -17,11 +17,12 @@ isNormal 清單裡，後來才開始出現）永遠不會自動往前回補，�
 開始累積。實測 0050 這種大型ETF，db/d1 只有近期的資料，2016~更早完全沒有，
 要用這支腳本手動回補。
 
-候選清單預設用 data/day_data_loader.py::_all_stocks()（目前的400支
-tick_universe），所以只會抓「現在還在候選清單裡、但缺更早歷史」的股票——
-已經下市、不在候選清單裡的股票不在處理範圍內（這批通常在最早的一次性歷史
-匯入時就已經補過，現在只是找「新進榜但沒補到位」的漏網之魚，不是要重建
-整個歷史母體）。
+候選清單預設用 data/day_data_loader.py::_all_stocks()（2026-08-08起是
+db/tickers/stock_universe_2000.parquet 固定的1877支，不再是400支
+tick_universe，見該函式說明），所以只會抓「現在還在候選清單裡、但缺更早
+歷史」的股票——已經下市、不在候選清單裡的股票不在處理範圍內（這批通常在
+最早的一次性歷史匯入時就已經補過，現在只是找「新進榜但沒補到位」的漏網
+之魚，不是要重建整個歷史母體）。
 
 核心下載/存檔邏輯沿用 data/day_data_loader.py 的 _download_day()/
 _download_day_fubon()/_save_day()，不重寫一份。
@@ -142,7 +143,7 @@ def _backfill_fubon(targets: list, sdk):
                 print(f"  [富邦 {i}/{len(targets)}] 進度更新（{sid}：新增 {len(df)} 筆）")
         except Exception as e:
             print(f"  [富邦 {i}/{len(targets)}] {sid} 失敗: {e}")
-        time.sleep(1.05)  # 維持 60 req/min 以內留緩衝，比照 _update_day_fubon()
+        time.sleep(0.25)  # 2026-08-08從1.05秒加速，維持 300次/分鐘留緩衝，比照 _update_day_fubon()
 
 
 def backfill_day_history(

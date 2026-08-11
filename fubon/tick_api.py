@@ -26,7 +26,7 @@ Rate limit：intraday 家族端點官方文件是300次/分鐘，沿用
 fubon/subscribe_list.py:158 同樣的節流方式（0.25秒/次，留緩衝抓~240次/分鐘）。
 
 用法：
-    python -m fubon.tick_api   # 更新今天固定清單（tick_universe，400檔+0050）的tick到db/tick
+    python -m fubon.tick_api   # 更新今天固定清單（stock_universe_2000+0050，1878檔）的tick到db/tick
 """
 
 import time
@@ -39,7 +39,7 @@ import pandas as pd
 # monkey-patch 過全域 print（加時間戳記+強制flush，見該檔說明），這裡不用
 # 重複做一次——重複patch會把時間戳記包兩層，變成 "[HH:MM:SS] [HH:MM:SS] ..."。
 from finmind.tick_api import save_tick
-from finmind.tick_universe import load_tick_universe
+from finmind.stock_universe_2000 import load_stock_universe_2000_with_0050
 
 _TW = timezone(timedelta(hours=8))
 _REQUEST_INTERVAL = 0.25  # 300次/分鐘上限，留緩衝（同 fubon/subscribe_list.py:158）
@@ -99,12 +99,13 @@ def update_tick_today(stocks: list[str] | None = None):
     """登入一次，逐檔抓今天的tick，累積緩衝、每 _FLUSH_EVERY 檔寫一次
     db/tick/{year}_{month}.parquet（呼叫 finmind.tick_api.save_tick()，
     同一個merge+dedupe+atomic write邏輯）。stocks=None 時讀
-    finmind.tick_universe.load_tick_universe() 的固定清單（沿用同一份
-    名單，不另外維護）。"""
+    finmind.stock_universe_2000.load_stock_universe_2000_with_0050()
+    的固定清單（2026-08-08改，1877支全市場一般個股+強制併入0050，共1878支，
+    跟 data/day_data_loader.py／data/m1_data_loader.py 的股票母體統一）。"""
     from fubon import fubon_api as trade_api
 
     if stocks is None:
-        stocks = load_tick_universe()
+        stocks = load_stock_universe_2000_with_0050()
     today = datetime.now(_TW)
     year, month = today.year, today.month
 

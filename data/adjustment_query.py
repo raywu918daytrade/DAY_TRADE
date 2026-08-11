@@ -68,13 +68,15 @@ def _adjust_volume_only(df: pd.DataFrame, stock_id: str | None, date: str | None
     return df.drop(columns=["day", "factor"])
 
 
-def load_pattern_day(start_date: str | None = None) -> pd.DataFrame:
+def load_pattern_day(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """載入 db/adjustment_day/ 日K（完整還原，pattern 專用，按月分檔）。
     下載時已經帶 adjusted="true"，open/high/low/close 不用另外換算；volume
     另外處理，見 _adjust_volume_only()。
 
-    start_date：同 data.raw_query.load_m1() 的說明，預設 None = 讀全部。"""
-    paths = raw_query._dataset_paths(_ROOT / "db/adjustment_day", start_date)
+    start_date／end_date：同 data.raw_query.load_m1() 的說明，預設 None = 讀全部。"""
+    paths = raw_query._dataset_paths(_ROOT / "db/adjustment_day", start_date, end_date)
     if not paths:
         return pd.DataFrame()
 
@@ -106,7 +108,12 @@ def load_pattern_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
     return df.sort_values("date").reset_index(drop=True)
 
 
-def _load_adjustment_factor(stock_id: str | None, date: str | None, start_date: str | None) -> pd.DataFrame:
+def _load_adjustment_factor(
+    stock_id: str | None,
+    date: str | None,
+    start_date: str | None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
     """載入 db/adjustment_factor/（見 data/build_adjustment_factor.py），內部
     helper，給這支檔案裡的還原版函式共用。跟 data/query.py::_load_adjust_factor()
     是兩張不同的表，不要混用。"""
@@ -118,7 +125,7 @@ def _load_adjustment_factor(stock_id: str | None, date: str | None, start_date: 
     if date is not None and (eff_start is None or date < eff_start):
         eff_start = date
 
-    paths = raw_query._dataset_paths(path, eff_start)
+    paths = raw_query._dataset_paths(path, eff_start, end_date)
     if not paths:
         return pd.DataFrame(columns=["stock_id", "date", "factor"])
 
@@ -135,7 +142,9 @@ def _load_adjustment_factor(stock_id: str | None, date: str | None, start_date: 
     return table.to_pandas()
 
 
-def _adjust_ohlc(df: pd.DataFrame, start_date: str | None) -> pd.DataFrame:
+def _adjust_ohlc(
+    df: pd.DataFrame, start_date: str | None, end_date: str | None = None
+) -> pd.DataFrame:
     """共用邏輯：load_pattern_m1()/m3()/m5()/m3_std()/m5_std() 都是「完整時間戳
     識別、OHLC乘上當日完整還原係數」模式，抽成共用函式。照抄
     data/query.py::_adjust_ohlc() 的 pattern，只是換成呼叫
@@ -153,7 +162,7 @@ def _adjust_ohlc(df: pd.DataFrame, start_date: str | None) -> pd.DataFrame:
         return df
     df = df.copy()
     df["day"] = df["date"].dt.strftime("%Y-%m-%d")
-    factor_df = _load_adjustment_factor(None, None, start_date)
+    factor_df = _load_adjustment_factor(None, None, start_date, end_date)
     df = df.merge(
         factor_df[["stock_id", "date", "factor"]].rename(columns={"date": "day"}),
         on=["stock_id", "day"],
@@ -166,10 +175,16 @@ def _adjust_ohlc(df: pd.DataFrame, start_date: str | None) -> pd.DataFrame:
     return df.drop(columns=["day", "factor"]).sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_pattern_m1(start_date: str | None = None) -> pd.DataFrame:
+def load_pattern_m1(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """load_m1() 的「pattern 專用完整還原」版本（data.raw_query.load_m1()
     是原始版本）。說明同檔頭。"""
-    return _adjust_ohlc(raw_query.load_m1(start_date=start_date), start_date)
+    return _adjust_ohlc(
+        raw_query.load_m1(start_date=start_date, end_date=end_date),
+        start_date,
+        end_date,
+    )
 
 
 def load_pattern_m3(start_date: str | None = None) -> pd.DataFrame:
@@ -187,9 +202,15 @@ def load_pattern_m3_std(start_date: str | None = None) -> pd.DataFrame:
     return _adjust_ohlc(raw_query.load_m3_std(start_date=start_date), start_date)
 
 
-def load_pattern_m5_std(start_date: str | None = None) -> pd.DataFrame:
+def load_pattern_m5_std(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """load_m5_std() 的「pattern 專用完整還原」版本。"""
-    return _adjust_ohlc(raw_query.load_m5_std(start_date=start_date), start_date)
+    return _adjust_ohlc(
+        raw_query.load_m5_std(start_date=start_date, end_date=end_date),
+        start_date,
+        end_date,
+    )
 
 
 def load_pattern_volume_profile(

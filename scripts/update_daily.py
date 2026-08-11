@@ -25,6 +25,7 @@ db/adjustment_day vs db/d1，重算 db/adjustment_factor（pattern 專用完整�
 db/tick/{year}_{month}.parquet，同時處理同一個月可能互相覆蓋遺失資料，
 見 finmind/backfill_tick_history.py 的相關說明）。
 """
+
 import os
 import sys
 

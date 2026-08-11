@@ -88,9 +88,16 @@ def get_stock_candles(
         return df
 
     elif timeframe == "1m":
-        # 先試 db/m1_live
-        if date:
-            live_path = _ROOT / f"db/m1_live/{date}.parquet"
+        # 先試 db/m1_live：沒帶 date（呼叫端要「最新」）視為今天，理當去查
+        # db/m1_live；帶了明確的過去日期才不用查（db/m1_live 本來就只有
+        # 當天資料，查過去日期一定查不到）。2026-08-11 修：原本用「呼叫端
+        # 有沒有帶 date」判斷要不要查 db/m1_live，導致沒帶 date 時永遠只吃
+        # db/m1（隔夜批次更新，沒有當天資料），股票清單欄選 1分K 盤中查
+        # 不到當天資料、圖表空白。
+        today_str = pd.Timestamp.now(tz="Asia/Taipei").strftime("%Y-%m-%d")
+        effective_date = date or today_str
+        if effective_date == today_str:
+            live_path = _ROOT / f"db/m1_live/{effective_date}.parquet"
             if live_path.exists():
                 df_live = pd.read_parquet(live_path)
                 df_live = df_live[df_live["stock_id"] == stock_id]
@@ -121,7 +128,11 @@ def get_stock_candles(
         return df
 
     elif timeframe in ("3m", "5m"):
-        std_dir = _ROOT / f"db/{timeframe}_std"
+        # 目錄命名是 db/m3_std、db/m5_std（m 開頭），不是 db/3m_std／db/5m_std
+        # ——原本寫成 f"db/{timeframe}_std" 順序反了，永遠找不到目錄
+        # （2026-08-11 發現：股票清單欄選 5m 只看得到今天，因為找不到這份
+        # 預先算好、涵蓋多年歷史的資料，只好整個 fallback 到別的資料源）。
+        std_dir = _ROOT / f"db/m{timeframe[:-1]}_std"
         if std_dir.exists():
             dataset = ds.dataset(str(std_dir), format="parquet")
             filt = ds.field("stock_id") == stock_id
@@ -207,7 +218,11 @@ def get_all_stocks_candles(
             df = _apply_pattern_adjust_factor(df)
 
     elif timeframe in ("3m", "5m"):
-        std_dir = _ROOT / f"db/{timeframe}_std"
+        # 目錄命名是 db/m3_std、db/m5_std（m 開頭），不是 db/3m_std／db/5m_std
+        # ——原本寫成 f"db/{timeframe}_std" 順序反了，永遠找不到目錄
+        # （2026-08-11 發現：股票清單欄選 5m 只看得到今天，因為找不到這份
+        # 預先算好、涵蓋多年歷史的資料，只好整個 fallback 到別的資料源）。
+        std_dir = _ROOT / f"db/m{timeframe[:-1]}_std"
         if std_dir.exists():
             cutoff_file = date[:7].replace("-", "_") if date else ""
             files = sorted(f for f in std_dir.iterdir() if f.suffix == ".parquet" and (not cutoff_file or f.stem >= cutoff_file))

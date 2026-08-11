@@ -2,6 +2,7 @@
 Pattern Recognition API Endpoints (FastAPI Router)
 
 端點：
+- GET  /api/pattern/stocks            股票清單（tick=~400當沖候選、full=~1900全市場，含中文名稱）
 - GET  /api/pattern/types             取得可用的技術型態選單清單 (含中文名稱)
 - GET  /api/pattern/scan             過濾篩選特定型態與時區的符合股票清單（支援快取）
 - GET  /api/pattern/{stock_id}/detail  取得單一股票的 K 線與型態擬合細節（含轉折點與趨勢線座標，支援快取）
@@ -59,6 +60,28 @@ except Exception:
     TICK_UNIVERSE_SET = set()
     STOCK_NAME_MAP = {}
 
+# 全市場股票清單（db/tickers/stock_universe_2000.parquet，~1900檔，含中文
+# 名稱），供前端「股票清單」欄的 universe=full 選項用（見 GET /stocks）。
+# 跟上面 tick_universe 那份是不同來源、不同數量的股票池，分開載入。
+try:
+    _full_uni_df = pd.read_parquet(
+        Path(__file__).parent.parent / "db/tickers/stock_universe_2000.parquet",
+        columns=["stock_id", "name"],
+    )
+    FULL_UNIVERSE_LIST = [
+        {"stock_id": str(sid), "name": str(name).strip()}
+        for sid, name in zip(_full_uni_df["stock_id"], _full_uni_df["name"])
+        if pd.notna(name) and str(name).strip()
+    ]
+except Exception:
+    FULL_UNIVERSE_LIST = []
+
+# 欄位名故意跟 FULL_UNIVERSE_LIST 一致用 stock_id（不是 id）：前端
+# navMonitoring() 鍵盤上下切換清單統一用 item.stock_id 找目前選到的股票
+# （見 dashboard.html 其他清單，例如 _patternList/_conList 都是這個欄位名），
+# 股票清單欄的清單要跟這個慣例一致，不能自己另外取名。
+TICK_UNIVERSE_LIST = [{"stock_id": sid, "name": name} for sid, name in STOCK_NAME_MAP.items()]
+
 # 記憶體快取 (In-Memory Cache)
 _SCAN_CACHE: Dict[tuple, Dict[str, Any]] = {}
 _DETAIL_CACHE: Dict[tuple, Dict[str, Any]] = {}
@@ -75,6 +98,15 @@ def clear_pattern_cache() -> Dict[str, Any]:
         "ok": True,
         "message": f"已清空快取 (scan 快取: {scan_count} 筆, detail 快取: {detail_count} 筆)",
     }
+
+
+@router.get("/stocks", summary="股票清單（供前端股票清單欄選擇用）")
+def get_stock_list(
+    universe: str = Query("tick", description="tick=當沖候選(~400檔)、full=全市場(~1900檔)"),
+) -> Dict[str, Any]:
+    """回傳指定股票池的代號＋中文名稱清單，供前端「股票清單」欄渲染。"""
+    stocks = FULL_UNIVERSE_LIST if universe == "full" else TICK_UNIVERSE_LIST
+    return {"universe": universe, "stocks": stocks}
 
 
 @router.get("/types", summary="取得可用的技術型態選單清單")

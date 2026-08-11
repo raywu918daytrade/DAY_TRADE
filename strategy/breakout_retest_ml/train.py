@@ -342,7 +342,7 @@ if __name__ == "__main__":
     threshold = None
     model_type = "lgbm"
     use_cache = False
-    start_date = "2025-07-01"
+    start_date = "2024-01-01"
     main(
         mode=mode,
         test_days=test_days,

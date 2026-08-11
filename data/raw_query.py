@@ -24,50 +24,44 @@ import pyarrow.dataset as ds
 _ROOT = Path(__file__).parent.parent
 
 
-def _dataset_paths(dir_path: Path, start_date: str | None) -> str | list[str]:
-    """依 start_date 決定要讀哪些月份分檔的 parquet（2026-07-25討論）：這些
-    db/m1、db/fugle_day 等資料夾都是按月分檔（檔名格式 YYYY_MM.parquet），
-    即時推論通常只需要最近幾十天的資料算 rolling 特徵，不需要每次都把
-    資料庫存在以來的全部歷史（可能好幾年）都讀進記憶體——2026-07-25 實測
-    live_trader.py 因為這樣吃了快 6GB RSS。
-
-    start_date=None（預設）：回傳整個資料夾路徑，pyarrow 讀全部檔案，行為
-    跟改之前完全一樣，訓練/回測腳本不用改就不受影響。
-    start_date="YYYY-MM-DD"：只回傳「start_date 所在月份」到「最新月份」
-    這段範圍的檔案路徑（按月份粒度篩選，不逐筆篩到剛好那一天——多讀到
-    月初那幾天不影響 rolling 特徵計算，換取不用逐檔讀取後再篩選的複雜度）。
-    """
-    if start_date is None:
+def _dataset_paths(
+    dir_path: Path, start_date: str | None = None, end_date: str | None = None
+) -> str | list[str]:
+    """依 start_date 與 end_date 決定要讀哪些月份分檔的 parquet。"""
+    if start_date is None and end_date is None:
         return str(dir_path)
-    cutoff = pd.Timestamp(start_date).strftime("%Y_%m")
+    cutoff_start = pd.Timestamp(start_date).strftime("%Y_%m") if start_date else "0000_00"
+    cutoff_end = pd.Timestamp(end_date).strftime("%Y_%m") if end_date else "9999_99"
     files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")
-    return [str(f) for f in files if f.stem >= cutoff]
+    return [str(f) for f in files if cutoff_start <= f.stem <= cutoff_end]
 
 
-def _month_file_list(dir_path: Path, start_date: str | None) -> list[str]:
-    """跟 _dataset_paths() 一樣依 start_date 篩月份檔案，但一律回傳**檔案
+def _month_file_list(
+    dir_path: Path, start_date: str | None = None, end_date: str | None = None
+) -> list[str]:
+    """跟 _dataset_paths() 一樣依 start/end 篩月份檔案，但一律回傳**檔案
     路徑清單**（不會像 _dataset_paths() 在 start_date=None 時偷懶回傳整個
     資料夾字串），iter_m1_months() 等逐月yield的函式需要真的逐檔迭代，不能
     把一個目錄字串直接丟給 ds.dataset() 當「單一檔案」處理。"""
     if not dir_path.exists():
         return []
-    if start_date is None:
-        return sorted(str(f) for f in dir_path.iterdir() if f.suffix == ".parquet")
-    cutoff = pd.Timestamp(start_date).strftime("%Y_%m")
-    files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")
-    return [str(f) for f in files if f.stem >= cutoff]
+    paths = _dataset_paths(dir_path, start_date, end_date)
+    if isinstance(paths, str):
+        return sorted(str(f) for f in Path(paths).iterdir() if f.suffix == ".parquet")
+    return list(paths)
 
 
-def load_m1(start_date: str | None = None) -> pd.DataFrame:
+def load_m1(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """載入 db/m1/ 分K（原始價格，未還原權息，訓練資料，~2787 支，按月分檔）。
 
     一般情況請用 data/query.py::load_m1()（還原權息後版本），不要直接呼叫
     這支，除非明確需要原始價格。
 
-    start_date：選填 "YYYY-MM-DD"，只讀該月到最新月份的檔案，不重複載入
-    整個歷史（見 _dataset_paths() 的說明）；預設 None = 讀全部（訓練/回測
-    既有行為不變）。"""
-    paths = _dataset_paths(_ROOT / "db/m1", start_date)
+    start_date：選填 "YYYY-MM-DD"，只讀該月到最新月份的檔案。
+    end_date：選填 "YYYY-MM-DD"，只讀至該月止。"""
+    paths = _dataset_paths(_ROOT / "db/m1", start_date, end_date)
     if not paths:
         return pd.DataFrame()
     df = ds.dataset(paths, format="parquet").to_table().to_pandas()
@@ -136,7 +130,9 @@ def iter_m5_std_months(start_date: str | None = None):
         yield df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_m3(start_date: str | None = None) -> pd.DataFrame:
+def load_m3(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """載入 db/m3/ 3 分鐘K（原始價格），rolling 版本，每分鐘一列（由
     build_m3_m5_rolling.py 預先聚合）。一般情況請用
     data/query.py::load_m3()（還原權息後版本）。
@@ -145,7 +141,7 @@ def load_m3(start_date: str | None = None) -> pd.DataFrame:
     path = _ROOT / "db/m3"
     if not path.exists():
         return pd.DataFrame()
-    paths = _dataset_paths(path, start_date)
+    paths = _dataset_paths(path, start_date, end_date)
     if not paths:
         return pd.DataFrame()
     df = ds.dataset(paths, format="parquet").to_table().to_pandas()
@@ -153,7 +149,9 @@ def load_m3(start_date: str | None = None) -> pd.DataFrame:
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_m5(start_date: str | None = None) -> pd.DataFrame:
+def load_m5(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """載入 db/m5/ 5 分鐘K（原始價格），rolling 版本，每分鐘一列（由
     build_m3_m5_rolling.py 預先聚合）。一般情況請用
     data/query.py::load_m5()（還原權息後版本）。
@@ -162,7 +160,7 @@ def load_m5(start_date: str | None = None) -> pd.DataFrame:
     path = _ROOT / "db/m5"
     if not path.exists():
         return pd.DataFrame()
-    paths = _dataset_paths(path, start_date)
+    paths = _dataset_paths(path, start_date, end_date)
     if not paths:
         return pd.DataFrame()
     df = ds.dataset(paths, format="parquet").to_table().to_pandas()
@@ -170,7 +168,9 @@ def load_m5(start_date: str | None = None) -> pd.DataFrame:
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_m3_std(start_date: str | None = None) -> pd.DataFrame:
+def load_m3_std(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """載入 db/m3_std/ 標準獨立 3 分K棒（原始價格），一根K棒一列（由
     build_m3_m5_std.py 預先聚合）。一般情況請用
     data/query.py::load_m3_std()（還原權息後版本）。
@@ -179,7 +179,7 @@ def load_m3_std(start_date: str | None = None) -> pd.DataFrame:
     path = _ROOT / "db/m3_std"
     if not path.exists():
         return pd.DataFrame()
-    paths = _dataset_paths(path, start_date)
+    paths = _dataset_paths(path, start_date, end_date)
     if not paths:
         return pd.DataFrame()
     df = ds.dataset(paths, format="parquet").to_table().to_pandas()
@@ -187,7 +187,9 @@ def load_m3_std(start_date: str | None = None) -> pd.DataFrame:
     return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_m5_std(start_date: str | None = None) -> pd.DataFrame:
+def load_m5_std(
+    start_date: str | None = None, end_date: str | None = None
+) -> pd.DataFrame:
     """載入 db/m5_std/ 標準獨立 5 分K棒（原始價格），一根K棒一列（由
     build_m3_m5_std.py 預先聚合）。一般情況請用
     data/query.py::load_m5_std()（還原權息後版本）。
@@ -196,7 +198,7 @@ def load_m5_std(start_date: str | None = None) -> pd.DataFrame:
     path = _ROOT / "db/m5_std"
     if not path.exists():
         return pd.DataFrame()
-    paths = _dataset_paths(path, start_date)
+    paths = _dataset_paths(path, start_date, end_date)
     if not paths:
         return pd.DataFrame()
     df = ds.dataset(paths, format="parquet").to_table().to_pandas()
