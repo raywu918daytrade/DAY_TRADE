@@ -175,8 +175,17 @@ def get_all_stocks_candles(
     date: Optional[str] = None,
     limit: int = 120,
     start_date: Optional[str] = None,
+    stock_ids: Optional[set] = None,
 ) -> Dict[str, pd.DataFrame]:
     """批次載入全市場所有股票在指定時間週期的最近 N 根 K 線。
+
+    stock_ids：選填，只載入這個集合裡的股票（用 pyarrow filter pushdown
+    在讀檔當下就篩掉，不是讀完全部股票再丟棄）。2026-08-11加：
+    scan_patterns() 實際上只會拿 TICK_UNIVERSE_SET（~400檔）裡的股票去跑
+    型態偵測（見 pattern_api.py 的說明），但這支函式原本沒地方讓呼叫端先
+    講清楚「只需要這些股票」，導致 intraday（3m/5m）掃描要多讀 5~7 倍的
+    股票資料（db/m*_std 是全市場~2900檔），是「全部型態掃描會逾時/斷線」
+    的主因之一。
 
     Returns:
         Dict[stock_id, pd.DataFrame]
@@ -186,12 +195,15 @@ def get_all_stocks_candles(
             limit = int(limit)
         except Exception:
             limit = 120
+    stock_filter = ds.field("stock_id").isin(stock_ids) if stock_ids else None
     if timeframe == "day":
         ref_date = date if (date and isinstance(date, str)) else "today"
         cutoff = start_date or (pd.Timestamp(ref_date) - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
         df = load_pattern_day(start_date=cutoff)
         if df.empty:
             return {}
+        if stock_ids:
+            df = df[df["stock_id"].isin(stock_ids)]
         if date and isinstance(date, str):
             df = df[df["date"] <= f"{date} 23:59:59"]
 
@@ -202,6 +214,8 @@ def get_all_stocks_candles(
             if live_path.exists():
                 df = pd.read_parquet(live_path)
                 df["date"] = pd.to_datetime(df["date"])
+                if stock_ids:
+                    df = df[df["stock_id"].isin(stock_ids)]
             else:
                 dir_path = _ROOT / "db/m1"
                 cutoff = date[:7].replace("-", "_")
@@ -210,7 +224,7 @@ def get_all_stocks_candles(
                     files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")[-1:]
                 if not files:
                     return {}
-                df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
+                df = ds.dataset([str(f) for f in files], format="parquet").to_table(filter=stock_filter).to_pandas()
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 df = df[df["date"] <= f"{date} 23:59:59"]
                 df = _apply_pattern_adjust_factor(df)
@@ -219,7 +233,7 @@ def get_all_stocks_candles(
             files = sorted(f for f in dir_path.iterdir() if f.suffix == ".parquet")[-1:]
             if not files:
                 return {}
-            df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
+            df = ds.dataset([str(f) for f in files], format="parquet").to_table(filter=stock_filter).to_pandas()
             df["date"] = pd.to_datetime(df["date"], format="mixed")
             df = _apply_pattern_adjust_factor(df)
 
@@ -247,13 +261,13 @@ def get_all_stocks_candles(
             if not files:
                 files = sorted(f for f in std_dir.iterdir() if f.suffix == ".parquet")[-1:]
             if files:
-                df = ds.dataset([str(f) for f in files], format="parquet").to_table().to_pandas()
+                df = ds.dataset([str(f) for f in files], format="parquet").to_table(filter=stock_filter).to_pandas()
                 df["date"] = pd.to_datetime(df["date"], format="mixed")
                 if date:
                     df = df[df["date"] <= f"{date} 23:59:59"]
                 df = _apply_pattern_adjust_factor(df)
             else:
-                m1_candles = get_all_stocks_candles("1m", date=date, limit=limit * 5)
+                m1_candles = get_all_stocks_candles("1m", date=date, limit=limit * 5, stock_ids=stock_ids)
                 res = {}
                 for sid, m1_df in m1_candles.items():
                     res_df = compute_m3_std(m1_df) if timeframe == "3m" else compute_m5_std(m1_df)
@@ -261,7 +275,7 @@ def get_all_stocks_candles(
                         res[sid] = res_df.iloc[-limit:].reset_index(drop=True)
                 return res
         else:
-            m1_candles = get_all_stocks_candles("1m", date=date, limit=limit * 5)
+            m1_candles = get_all_stocks_candles("1m", date=date, limit=limit * 5, stock_ids=stock_ids)
             res = {}
             for sid, m1_df in m1_candles.items():
                 res_df = compute_m3_std(m1_df) if timeframe == "3m" else compute_m5_std(m1_df)

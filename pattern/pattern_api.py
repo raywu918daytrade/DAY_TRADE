@@ -182,8 +182,13 @@ def scan_patterns(
     if cache_key in _SCAN_CACHE:
         return _SCAN_CACHE[cache_key]
 
-    # 3. 讀取 K 線後，只掃 tick_universe 母體
-    all_candles = get_all_stocks_candles(timeframe=timeframe, date=date, limit=limit)
+    # 3. 只讀 tick_universe 母體（~400檔）的 K 線，不要整個市場（~2900檔）
+    # 都讀進來才在下面的迴圈丟掉——這支函式本來就只會對 TICK_UNIVERSE_SET
+    # 裡的股票跑型態偵測，intraday（3m/5m）資料量大，先用 stock_ids
+    # 篩掉不需要的股票，實測全型態掃描才不會因為讀太多用不到的資料逾時/
+    # 斷線（2026-08-11 使用者提出：已經用成交量篩過候選池了，應該先篩
+    # 再抓K線，不要抓完K線才篩）。
+    all_candles = get_all_stocks_candles(timeframe=timeframe, date=date, limit=limit, stock_ids=TICK_UNIVERSE_SET)
     avg_vol_map = get_stocks_10d_avg_vol_lots(date=date)
 
     active_detectors = [(pt, DETECTORS[pt]) for pt in selected_types]
