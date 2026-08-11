@@ -4,11 +4,17 @@ Pattern Recognition API Endpoints (FastAPI Router)
 端點：
 - GET  /api/pattern/stocks            股票清單（tick=~400當沖候選、full=~1900全市場，含中文名稱）
 - GET  /api/pattern/types             取得可用的技術型態選單清單 (含中文名稱)
-- GET  /api/pattern/scan             過濾篩選特定型態與時區的符合股票清單（支援快取）
+- GET  /api/pattern/scan             過濾篩選特定型態與時區的符合股票清單（同步版本，支援快取）
+- GET  /api/pattern/scan/submit      非同步版本：立刻回傳 job_id，掃描完成後透過 SSE
+                                       （type: pattern_scan_done）推播結果，見 _run_scan_job()
+                                       的說明——2026-08-11加，避免掃描（純Python迴圈跑型態
+                                       偵測，長時間佔用GIL）卡住 /stream 導致前端SSE斷線。
 - GET  /api/pattern/{stock_id}/detail  取得單一股票的 K 線與型態擬合細節（含轉折點與趨勢線座標，支援快取）
 - POST /api/pattern/cache/clear      手動清空快取
 """
 
+import asyncio
+import uuid
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
@@ -237,6 +243,154 @@ def scan_patterns(
 
     _SCAN_CACHE[cache_key] = result
     return result
+
+
+# ── 非同步版本（2026-08-11加）─────────────────────────────────────────────
+# 型態偵測是純 Python 巢狀迴圈（見各 detector 的 detect()），跑起來會連續
+# 占用 GIL 45~70秒以上，即使 FastAPI 把同步路由丟到執行緒池跑，同一個
+# process 裡的 asyncio event loop 執行緒一樣要搶 GIL，會導致 /stream
+# （SSE）長時間排不到執行時間，前端看起來像斷線（見檔頭說明）。這裡改成
+# 「submit 立刻回傳 job_id，掃描在背景 async task 跑、每處理一批股票就
+# await asyncio.sleep(0) 讓出 event loop，完成後用既有的 SSE _broadcast()
+# 推播結果」，不做輪詢。scan_patterns()（同步版本）保留不動，供直接
+# import 呼叫的場合使用，行為完全不變。
+_scan_jobs: Dict[str, Dict[str, Any]] = {}
+_SCAN_YIELD_EVERY = 20  # 每處理這麼多檔股票就讓出 event loop 一次
+
+
+async def _scan_stocks_async(
+    all_candles: Dict[str, pd.DataFrame],
+    avg_vol_map: Dict[str, float],
+    active_detectors: list,
+    timeframe: str,
+    min_score: float,
+    min_vol_lots: Optional[float],
+) -> list:
+    """邏輯跟 scan_patterns() 內的迴圈完全一樣，差別只在定期
+    await asyncio.sleep(0)，讓任何一段連續佔用 GIL 的時間都壓在很短
+    （幾百毫秒等級），SSE heartbeat／健康檢查才擠得進去。"""
+    matches = []
+    for i, stock_id in enumerate(TICK_UNIVERSE_SET):
+        if i % _SCAN_YIELD_EVERY == 0:
+            await asyncio.sleep(0)
+        df_candles = all_candles.get(stock_id)
+        if df_candles is None or df_candles.empty or len(df_candles) < 20:
+            continue
+
+        str_stock_id = str(stock_id)
+        avg_vol_lots = avg_vol_map.get(str_stock_id, 0.0)
+        if min_vol_lots and min_vol_lots > 0 and avg_vol_lots < min_vol_lots:
+            continue
+
+        for pt_key, detector in active_detectors:
+            try:
+                res = detector.detect(df_candles, stock_id=stock_id, timeframe=timeframe)
+                if res and res.score >= min_score:
+                    stock_name = STOCK_NAME_MAP.get(str_stock_id, str_stock_id)
+                    res_dict = res.to_dict()
+                    res_dict["pattern_name"] = detector.display_name
+                    res_dict["stock_name"] = stock_name
+                    res_dict["name"] = stock_name
+                    res_dict["in_tick_universe"] = True
+                    res_dict["details"]["avg_vol_10d_lots"] = avg_vol_lots
+                    matches.append(res_dict)
+            except Exception:
+                continue
+
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    return matches
+
+
+async def _run_scan_job(
+    job_id: str,
+    pattern_type: str,
+    timeframe: str,
+    date: Optional[str],
+    min_score: float,
+    min_vol_lots: Optional[float],
+    limit: int,
+) -> None:
+    from api import _broadcast
+
+    try:
+        raw_types = [t.strip() for t in pattern_type.split(",") if t.strip()]
+        if "all" in raw_types:
+            selected_types = list(DETECTORS.keys())
+        else:
+            selected_types = []
+            for p in raw_types:
+                if p in DETECTORS and p not in selected_types:
+                    selected_types.append(p)
+
+        if not selected_types:
+            _scan_jobs[job_id] = {"status": "error", "error": "未指定有效的型態"}
+            _broadcast({"type": "pattern_scan_done", "job_id": job_id, "error": "未指定有效的型態"})
+            return
+
+        # 讀K線資料（get_all_stocks_candles/get_stocks_10d_avg_vol_lots）本來
+        # 以為只是「一次性成本、不是這次問題的主因」，但實測（2026-08-11）
+        # 光是這段就會擋住 event loop 快30秒，跟型態偵測迴圈一樣嚴重——
+        # 丟進預設執行緒池跑（loop.run_in_executor），這些底層是
+        # pyarrow/pandas 的 I/O／C-level 運算，會釋放 GIL，才能真的讓
+        # event loop 在這段期間繼續處理 SSE／健康檢查。
+        loop = asyncio.get_event_loop()
+        latest_ts = await loop.run_in_executor(
+            None, lambda: get_latest_candle_timestamp(timeframe=timeframe, date=date)
+        )
+        normalized_pattern_key = ",".join(sorted(selected_types))
+        cache_key = (normalized_pattern_key, timeframe, date or "latest", min_score, min_vol_lots, limit, latest_ts)
+
+        if cache_key in _SCAN_CACHE:
+            result = _SCAN_CACHE[cache_key]
+        else:
+            all_candles = await loop.run_in_executor(
+                None,
+                lambda: get_all_stocks_candles(
+                    timeframe=timeframe, date=date, limit=limit, stock_ids=TICK_UNIVERSE_SET
+                ),
+            )
+            avg_vol_map = await loop.run_in_executor(None, lambda: get_stocks_10d_avg_vol_lots(date=date))
+            active_detectors = [(pt, DETECTORS[pt]) for pt in selected_types]
+            matches = await _scan_stocks_async(
+                all_candles, avg_vol_map, active_detectors, timeframe, min_score, min_vol_lots
+            )
+            result = {
+                "pattern_type": pattern_type,
+                "pattern_types": selected_types,
+                "timeframe": timeframe,
+                "date": date or (matches[0]["date"] if matches else None),
+                "min_vol_lots": min_vol_lots,
+                "total_matches": len(matches),
+                "results": matches,
+            }
+            _SCAN_CACHE[cache_key] = result
+
+        _scan_jobs[job_id] = {"status": "done"}
+        _broadcast({"type": "pattern_scan_done", "job_id": job_id, "data": result})
+    except Exception as e:
+        _scan_jobs[job_id] = {"status": "error", "error": str(e)}
+        _broadcast({"type": "pattern_scan_done", "job_id": job_id, "error": str(e)})
+
+
+@router.get("/scan/submit", summary="非同步版本：立刻回傳job_id，掃描完成後透過SSE推播結果")
+async def submit_scan(
+    pattern_type: str = Query("triangle", description="同 /scan 的說明"),
+    timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
+    date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)，預設為最新交易日"),
+    min_score: float = Query(60.0, description="最小信心度分數 (0~100)"),
+    min_vol_lots: Optional[float] = Query(1000.0, description="日 K 10 日均量過濾門檻 (張)"),
+    limit: int = Query(120, description="K 線視窗根數，預設 120 根"),
+) -> Dict[str, Any]:
+    """立刻回傳 job_id，不等掃描完成——一定要宣告成 async def 才能在這裡
+    呼叫 asyncio.create_task()（同步 def 路由會被 FastAPI 丟到背景執行緒
+    跑，那個執行緒沒有 running event loop，呼叫 create_task 會直接出錯）。
+    """
+    job_id = str(uuid.uuid4())
+    _scan_jobs[job_id] = {"status": "pending"}
+    asyncio.create_task(
+        _run_scan_job(job_id, pattern_type, timeframe, date, min_score, min_vol_lots, limit)
+    )
+    return {"job_id": job_id}
 
 
 @router.get("/{stock_id}/detail", summary="單一股票 K 線與型態繪圖細節")
