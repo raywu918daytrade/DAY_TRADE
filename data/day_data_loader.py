@@ -80,10 +80,16 @@ _save_lock = threading.Lock()
 _flag_lock = threading.Lock()
 
 # 2026-08-08：三路併發（Fugle/Fugle-DT/富邦）依實際節流速率分配股票數，見
-# _split_by_rate()。富邦 intraday 家族官方限制 300次/分鐘，Fugle 60次/分鐘，
-# 富邦節流值同 fubon/tick_api.py::_REQUEST_INTERVAL（已驗證安全）。
+# _split_by_rate()。
+# ⚠️ 2026-08-11 修正：這裡的富邦指 fubon/fubon_api.py::historical_candles()
+# （日K/分K歷史，跟 Fugle 同一套底層 fugle_marketdata 元件），該函式自己的
+# docstring 明載官方限制是 60次/分鐘，跟 Fugle 一樣——不是 300次/分鐘。
+# 300次/分鐘是 fubon/tick_api.py 用的 intraday/trades（抓當天tick）另一個
+# 端點家族的限制，兩者不能混為一談，之前誤用同一個常數導致實際跑
+# scripts/update_daily.py 時打出 429 Rate limit exceeded。三路現在都是
+# 60次/分鐘，_split_by_rate() 在這個常數設定下會自動退化成均分三等份。
 _FUGLE_INTERVAL = 1.05  # 秒/次，60次/分鐘留緩衝
-_FUBON_INTERVAL = 0.25  # 秒/次，300次/分鐘留緩衝
+_FUBON_INTERVAL = 1.05  # 秒/次，60次/分鐘留緩衝（historical_candles，不是intraday/trades）
 
 
 def _split_by_rate(stocks: list, n_fugle_accounts: int = 2) -> tuple:
@@ -222,7 +228,7 @@ def _download_day_fubon(sdk, stock_id: str, start_date: str, end_date: str | Non
             chunks.append(df)
         cur = chunk_end + timedelta(days=1)
         if cur <= end:
-            time.sleep(_FUBON_INTERVAL)  # 2026-08-08：跟 _update_day_fubon() 一致，見該常數說明（300次/分鐘留緩衝）
+            time.sleep(_FUBON_INTERVAL)  # 跟 _update_day_fubon() 一致，見該常數說明（60次/分鐘留緩衝）
     return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
 
@@ -387,9 +393,9 @@ def _update_day_fubon(
     base_dir: str = _D1_DIR,
     flag_path: Path = _D1_FLAG_PATH,
 ):
-    """富邦那一半：單一執行緒依序下載，0.25秒/支（2026-08-08從1.05秒加速，
-    見 _FUBON_INTERVAL 說明，300次/分鐘留緩衝，比照 fubon/tick_api.py 已驗證
-    安全的節流值）。
+    """富邦那一半：單一執行緒依序下載，1.05秒/支（`historical_candles()`
+    官方限制60次/分鐘留緩衝，見 _FUBON_INTERVAL 說明——2026-08-11修正：
+    不是300次/分鐘，那是另一個端點家族的限制）。
 
     stock_start_dates/空結果不標記完成：說明同 _update_day_fugle()。
     adjusted/base_dir/flag_path：說明同 _update_day_fugle()。"""

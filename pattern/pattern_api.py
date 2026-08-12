@@ -29,6 +29,8 @@ from pattern.data_loader import get_all_stocks_candles, get_latest_candle_timest
 from pattern.head_shoulders_bottom.detector import HeadShouldersBottomDetector
 from pattern.head_shoulders_top.detector import HeadShouldersTopDetector
 from pattern.m_top.detector import MTopDetector
+from pattern.macd_hist_bear.detector import MacdHistBearDetector
+from pattern.macd_hist_bull.detector import MacdHistBullDetector
 from pattern.triangle.detector import TriangleDetector
 from pattern.w_bottom.detector import WBottomDetector
 from data.adjustment_query import load_pattern_volume_profile
@@ -48,6 +50,8 @@ DETECTORS = {
     "cup_handle": CupHandleDetector(),
     "breakout_retest": BreakoutRetestDetector(),
     "breakdown_retest": BreakdownRetestDetector(),
+    "macd_hist_bull": MacdHistBullDetector(),
+    "macd_hist_bear": MacdHistBearDetector(),
 }
 
 # 從 db/tickers/tick_universe.parquet 一次載入股票集合與名稱對照
@@ -131,7 +135,7 @@ def get_pattern_types() -> Dict[str, Any]:
 
 @router.get("/scan", summary="過濾篩選符合特定型態與時區的股票清單")
 def scan_patterns(
-    pattern_type: str = Query("triangle", description="型態種類: 可帶單一型態(triangle)、逗號分隔多型態(triangle,w_bottom)、或全型態(all)。可用型態: triangle, abcd_bull, abcd_bear, w_bottom, m_top, head_shoulders_bottom, head_shoulders_top, cup_handle, breakout_retest, breakdown_retest, all"),
+    pattern_type: str = Query("triangle", description="型態種類: 可帶單一型態(triangle)、逗號分隔多型態(triangle,w_bottom)、或全型態(all)。可用型態: triangle, abcd_bull, abcd_bear, w_bottom, m_top, head_shoulders_bottom, head_shoulders_top, cup_handle, breakout_retest, breakdown_retest, macd_hist_bull, macd_hist_bear, all"),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)，預設為最新交易日"),
     min_score: float = Query(60.0, description="最小信心度分數 (0~100)"),
@@ -396,7 +400,7 @@ async def submit_scan(
 @router.get("/{stock_id}/detail", summary="單一股票 K 線與型態繪圖細節")
 def get_pattern_detail(
     stock_id: str,
-    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle"),
+    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle, macd_hist_bull, macd_hist_bear"),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)"),
     limit: int = Query(120, description="K 線視窗根數，預設 120 根"),

@@ -499,7 +499,7 @@ if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     #  在這裡直接改 mode，不用每次打 CLI
     # ══════════════════════════════════════════════════════════════════════
-    mode = "train_xgb"  # build_m3_m5,train_xgb,validate
+    mode = "validate"  # build_m3_m5,train_xgb,validate
     test_days = 30
     start_date = "2021-01-01"
     end_date = ""

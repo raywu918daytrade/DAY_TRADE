@@ -143,7 +143,7 @@ def _backfill_fubon(targets: list, sdk):
                 print(f"  [富邦 {i}/{len(targets)}] 進度更新（{sid}：新增 {len(df)} 筆）")
         except Exception as e:
             print(f"  [富邦 {i}/{len(targets)}] {sid} 失敗: {e}")
-        time.sleep(0.25)  # 2026-08-08從1.05秒加速，維持 300次/分鐘留緩衝，比照 _update_day_fubon()
+        time.sleep(1.05)  # 維持 60次/分鐘留緩衝，比照 _update_day_fubon()（2026-08-11修正回來，historical_candles不是300次/分鐘）
 
 
 def backfill_day_history(

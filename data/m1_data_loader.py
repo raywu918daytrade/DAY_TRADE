@@ -231,9 +231,12 @@ def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str 
 
 
 def _update_m1_fubon(stocks: list, date_str: str, sdk):
-    """富邦那一半：historical/candles 一次就含今天，0.25秒/支（1次API，
-    2026-08-08從1.05秒加速，比照 fubon/tick_api.py 已驗證安全的節流值，
-    300次/分鐘留緩衝，見 data.day_data_loader._FUBON_INTERVAL 說明）。
+    """富邦那一半：historical/candles 一次就含今天，1.05秒/支（1次API，
+    `historical_candles()` 官方限制60次/分鐘留緩衝——2026-08-11修正：
+    2026-08-08一度誤改成0.25秒/300次分鐘，是跟 fubon/tick_api.py 的
+    intraday/trades 端點搞混，那是另一個限流更寬鬆的端點家族，
+    historical_candles 實際上跟 Fugle 一樣是60次/分鐘，見
+    data.day_data_loader._FUBON_INTERVAL 說明）。
 
     空結果不標記完成：說明同 _update_m1_fugle()。"""
     for stock_id in stocks:
@@ -250,14 +253,16 @@ def _update_m1_fubon(stocks: list, date_str: str, sdk):
                 print(f"[富邦] {stock_id} 無資料")
         except Exception as e:
             print(f"[富邦] {stock_id} 失敗: {e}")
-        time.sleep(0.25)
+        time.sleep(1.05)
 
 
 def update_m1(stocks: list = None):
     """1分鐘K線，flag避免同日重複下載。待下載清單依實際節流速率分三份
-    （見 data.day_data_loader._split_by_rate()，2026-08-08從無腦均分三等份
-    改成依速率比例分配，富邦節流也同步加速，理由見該函式說明）：Fugle 兩組
-    帳號（FUGLE、FUGLE_DAYTRADE，各自獨立 rate limit）+ 富邦一份同時下載。"""
+    （見 data.day_data_loader._split_by_rate()）：Fugle 兩組帳號（FUGLE、
+    FUGLE_DAYTRADE）+ 富邦 historical_candles，三者官方限制都是60次/分鐘，
+    目前實際上等同均分三等份（2026-08-11修正：曾誤以為富邦這個端點是
+    300次/分鐘而分配更多股票給它，導致 429，已修正回來，見
+    data.day_data_loader._FUBON_INTERVAL 說明）。"""
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
     if not fugle_api.TOKEN_DAYTRADE:

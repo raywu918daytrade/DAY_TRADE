@@ -290,20 +290,25 @@ python -m strategy_test.open_drive_fade_short.verify \
     --start_date 2020-01-01 --end_date 2022-12-31 --use_2000 --entry_until 13:00
 ```
 
-### 2026-08-10 — ret5_pullback_reversal（做多 TB）
+### 2026-08-10 / 08-11 — ret5_pullback_ml（規則 + AVWAP 事件 ML）
 
-路徑：`strategy/ret5_pullback_reversal/`
+路徑：`strategy/ret5_pullback_ml/`（原 `ret5_pullback_reversal` 已并入）
 
-**規則**：ret5 vs 昨收 ≥3% 且 **m5@09:05 紅K** → **m5** 陰線 low &gt; 首根 m5 low → 下一根 m5 陽線實體（body≥50%）做多；訊號 &lt;09:30、進場 &lt;10:00；atr5≥p99；三分類 TB ±3%／最多 30 分。母體 `stock_universe_2000`。
+**規則**：ret5 vs 昨收 ≥3% 且 m5@09:05 紅K → m5 陰線 low &gt; 首根 m5 low（&lt;09:30）→ 之後 **5 根 m1** 內陽線、量&gt;前1根、且 close &gt; 該 m5 high 即進場；三分類 TB ±3%／最多 30 分。
 
-| 區間 | 日 | n | 止盈 | 持平 | 止損 | mean |
+| 區間／母體 | 日 | n | 止盈 | 持平 | 止損 | mean |
 |--|--|--|--|--|--|--|
-| 2026-01～07（m5 + ret5 紅K） | 92 | 185 | 19.5% | 58.4% | 22.2% | **−0.10%** |
-| 2026-01～07（m5，未要求紅K） | 96 | 205 | 17.6% | 61.5% | 21.0% | −0.16% |
+| 2026-01～07 tick（verify +atr5 p99） | 68 | 124 | 12.1% | 41.1% | 46.8% | **−0.87%** |
+| 2026-01～07 tick（m1帶量，無突破） | 116 | 326 | 17.8% | 47.5% | 34.7% | −0.47% |
+| 2024-01～2026-07 2000（ML 全事件基線） | — | 5.8k | 9.4% | 78.2% | 12.4% | −0.26% |
+| 同上 test 末90日 純規則 | — | 952 | 8.7% | — | 15.8% | −0.47% |
+| 同上 test p_tp≥0.4 | — | 228 | 14.0% | — | 11.8% | −0.41% |
 
-**結論**：純規則期望仍接近 0／略負，不宜直接當主力。
+**結論**：規則期望為負；LGBM 略抬 TP 仍略負。事件／特徵／訓練都在同一套件。
 
 ```bash
-python -m strategy.ret5_pullback_reversal.verify \
-    --start_date 2026-01-01 --end_date 2026-07-31
+python -m strategy.ret5_pullback_ml.verify \
+    --start_date 2026-01-01 --end_date 2026-07-31 --use_tick_universe
+python -m strategy.ret5_pullback_ml.train train \
+    --start_date 2024-01-01 --end_date 2026-07-31 --test_days 90
 ```
