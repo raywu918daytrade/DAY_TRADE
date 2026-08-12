@@ -313,6 +313,7 @@ _signal_detail: dict = {}  # {stock_id: SignalDetail dict}
 _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, minute}}
 _consensus_signals: list = []  # 今日「多個策略的前N名重疊」記錄，見 push_consensus_signals()
 _conflict_signals: list = []  # 今日「多空衝突（反轉）」記錄，見 push_conflict_signals()
+_vwap_breakout_signals: list = []  # 今日「VWAP突破/跌破」記錄，見 push_vwap_breakout()
 _strategies_registry: dict = {"strategies": [], "consensus_top_n": 0}  # 見 set_strategies()
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
@@ -408,7 +409,7 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -424,6 +425,7 @@ def _reset_if_new_day():
         _monitoring.clear()
         _consensus_signals.clear()
         _conflict_signals.clear()
+        _vwap_breakout_signals.clear()
         _summary = dict(_SUMMARY_DEFAULT)
 
 
@@ -661,6 +663,29 @@ def push_conflict_signals(minute_str: str, conflicts: list):
         for c in conflicts:
             _conflict_signals.append({**c, "time": minute_str[11:16]})
         _broadcast({"type": "conflict_signals", "minute": minute_str[11:16], "data": conflicts})
+
+
+def push_vwap_breakout(minute_str: str, breakouts: list):
+    """推入「VWAP突破/跌破」訊號（main/live_trader.py 的 on_minute() 每分鐘偵測，
+    見該函式內的說明）。
+
+    只判斷「剛好跨過那條線」的那一分鐘（跟上一分鐘比，收盤價相對VWAP的
+    位置有沒有變號），不是「目前在VWAP上/下方」這種持續狀態——不然同一支
+    股票只要一直維持在VWAP上方，會每分鐘都被判定成「突破」，訊號就沒有
+    意義了。只涵蓋當沖候選(~400)這個即時收集1分K的股票池（db/m1_live），
+    全市場其他股票盤中沒有即時資料可以判斷，2026-08-12跟使用者確認過
+    不做全市場版本（見股票清單欄「當沖候選/全市場」切換是另一個獨立
+    查詢功能，跟這個逐分鐘自動偵測的機制不一樣）。
+
+    breakouts 每筆結構：{"stock_id", "name", "direction"("up"=突破/"down"=
+    跌破), "price", "vwap"}
+    """
+    print(f"[push_vwap_breakout] {minute_str} 產生 {len(breakouts)} 筆VWAP突破訊號", flush=True)
+    with _lock:
+        _reset_if_new_day()
+        for b in breakouts:
+            _vwap_breakout_signals.append({**b, "time": minute_str[11:16]})
+        _broadcast({"type": "vwap_breakout", "minute": minute_str[11:16], "data": breakouts})
 
 
 def push_candles(stock_id: str, candles: list):
@@ -1003,6 +1028,17 @@ def conflict_today():
     print(f"[GET /conflict/today] 回傳 {len(_conflict_signals)} 筆多空衝突訊號", flush=True)
     with _lock:
         return list(reversed(_conflict_signals))  # 最新在上
+
+
+@app.get(
+    "/vwap_breakout/today",
+    tags=["訊號"],
+    summary="今日「VWAP突破/跌破」訊號列表",
+)
+def vwap_breakout_today():
+    print(f"[GET /vwap_breakout/today] 回傳 {len(_vwap_breakout_signals)} 筆VWAP突破訊號", flush=True)
+    with _lock:
+        return list(reversed(_vwap_breakout_signals))  # 最新在上
 
 
 @app.get(

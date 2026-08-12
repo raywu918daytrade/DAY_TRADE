@@ -403,7 +403,9 @@ def get_pattern_detail(
     pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle, macd_hist_bull, macd_hist_bear"),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)"),
-    limit: int = Query(120, description="K 線視窗根數，預設 120 根"),
+    limit: int = Query(120, description="K 線視窗根數，預設 120 根，full_day=true 時忽略"),
+    full_day: bool = Query(False, description="True 時忽略 limit，改成回傳 date（沒帶則今天）當天完整一天的K線（開盤到現在/收盤），只對 1m/3m/5m 有意義"),
+    force_live: bool = Query(False, description="True 時略過快取，強制重新讀取一次（股票清單欄「即時」按鈕/自動刷新用）。cache_key 是用取樣單一股票2330最新一根K線時間戳當版本號，理論上盤中應該會自動跟著變、不用強制略過，這個參數是給使用者手動要求「現在立刻重抓」時的保險，不用等下一次自然變化"),
 ) -> Dict[str, Any]:
     """回傳 K 線數據（時間已轉為前端所需的 UTC timestamp）以及型態關鍵轉折點與趨勢線線段資訊（支援快取）。"""
     # 處理直接在 Python 內部調用函式時可能傳入 Query 物件的情況
@@ -415,6 +417,10 @@ def get_pattern_detail(
         date = date.default
     if hasattr(limit, "default"):
         limit = limit.default
+    if hasattr(full_day, "default"):
+        full_day = full_day.default
+    if hasattr(force_live, "default"):
+        force_live = force_live.default
 
     if pattern_type not in DETECTORS:
         raise HTTPException(
@@ -424,12 +430,12 @@ def get_pattern_detail(
 
     # 取得最新 K 線時間戳以構造智慧快取 Key
     latest_ts = get_latest_candle_timestamp(timeframe=timeframe, date=date)
-    cache_key = (stock_id, pattern_type, timeframe, date or "latest", limit, latest_ts)
+    cache_key = (stock_id, pattern_type, timeframe, date or "latest", limit, full_day, latest_ts)
 
-    if cache_key in _DETAIL_CACHE:
+    if not force_live and cache_key in _DETAIL_CACHE:
         return _DETAIL_CACHE[cache_key]
 
-    df_candles = get_stock_candles(stock_id=stock_id, timeframe=timeframe, date=date, limit=limit)
+    df_candles = get_stock_candles(stock_id=stock_id, timeframe=timeframe, date=date, limit=limit, full_day=full_day)
     if df_candles.empty:
         raise HTTPException(status_code=404, detail=f"查無 {stock_id} 在 timeframe={timeframe} 的 K 線資料")
 
@@ -451,6 +457,23 @@ def get_pattern_detail(
             "close": float(row["close"]),
             "volume": int(row["volume"]),
         })
+
+    # VWAP（2026-08-12加，供股票清單欄畫圖用）：本質上是「當日盤中」指標，
+    # 每天從0重新累積，日K（timeframe=day）沒有意義，只算 intraday。公式
+    # 沿用 strategy/vwap_ml/features.py::_add_vwap_z() 同一套（依日期分組，
+    # cum(close*volume)/cum(volume)），不要自己另外發明一套算法。
+    vwap_output = []
+    if timeframe in ("1m", "3m", "5m") and not df_candles.empty:
+        vwap_df = df_candles.copy()
+        vwap_df["_day"] = vwap_df["date"].dt.strftime("%Y-%m-%d")
+        vwap_df["_pv"] = vwap_df["close"] * vwap_df["volume"]
+        g = vwap_df.groupby("_day")
+        cum_vol = g["volume"].transform("cumsum")
+        cum_pv = g["_pv"].transform("cumsum")
+        vwap_series = cum_pv / cum_vol.replace(0, float("nan"))
+        for dt, v in zip(vwap_df["date"], vwap_series):
+            if pd.notna(v):
+                vwap_output.append({"time": tw_naive_to_epoch(dt), "value": round(float(v), 2)})
 
     pattern_output = None
     if pattern_res:
@@ -532,6 +555,7 @@ def get_pattern_detail(
         "pattern_type": pattern_type,
         "pattern_name": detector.display_name,
         "candles": candles_output,
+        "vwap": vwap_output,
         "pattern": pattern_output,
         "volume_profile": volume_profile_output,
         "poc_data": poc_data_output,

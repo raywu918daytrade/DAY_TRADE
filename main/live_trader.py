@@ -80,6 +80,7 @@ from api import (
     push_monitoring,
     push_quote,
     push_signals,
+    push_vwap_breakout,
     set_strategies,
     tw_naive_to_epoch,
     update_positions_price,
@@ -332,6 +333,13 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         flush=True,
     )
 
+    # VWAP突破/跌破偵測（2026-08-12加，見前端「VWAP突破」欄）：跟下面
+    # push_candles 共用同一份已經依 stock_id/date 排好序的 m1_live（見
+    # data/query.py::load_m1_live()），不用另外重查。這一批（這一分鐘）
+    # 偵測到的全部股票，等迴圈跑完一次性推送，跟 push_consensus_signals()/
+    # push_conflict_signals() 同一種「這分鐘的結果一次送一批」節奏。
+    vwap_breakouts = []
+
     if not m1_live.empty:
         for sid, g in m1_live.groupby("stock_id"):
             candles = []
@@ -350,12 +358,46 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                 )
             push_candles(str(sid), candles)
 
+            # VWAP公式沿用 strategy/vwap_ml/features.py::_add_vwap_z() 那一套
+            # （當天從0開始累積收盤價*成交量，不是跨日）——m1_live 本來就
+            # 只有「今天」，g 已經是這支股票今天到目前為止的完整分K，
+            # 每次都整段重算，不用額外存前一分鐘的狀態。只看「這一分鐘」
+            # 跟「上一分鐘」收盤價相對VWAP的位置有沒有變號，那才是「剛好
+            # 跨過那條線」的事件，不是「目前在哪一側」的持續狀態。
+            if len(g) >= 2:
+                closes = g["close"].astype(float).to_numpy()
+                vols = g["volume"].astype(float).to_numpy()
+                cum_vol = vols.cumsum()
+                if cum_vol[-2] > 0 and cum_vol[-1] > 0:
+                    cum_pv = (closes * vols).cumsum()
+                    vwap = cum_pv / cum_vol
+                    prev_above = closes[-2] >= vwap[-2]
+                    cur_above = closes[-1] >= vwap[-1]
+                    if prev_above != cur_above:
+                        vwap_breakouts.append(
+                            {
+                                "stock_id": str(sid),
+                                "name": state.tickers.get(str(sid), str(sid)),
+                                "direction": "up" if cur_above else "down",
+                                "price": float(closes[-1]),
+                                "vwap": float(vwap[-1]),
+                            }
+                        )
+
             # 頁首固定追蹤清單（WATCHLIST_QUOTES，如 0050）：跟策略候選股無關，
             # 收到 m1 就先查昨收、算漲跌幅，傳到前端之前先算好（不是前端自己拉
             # candles 再算），見 main/config.py 的說明與 api.py 的 push_quote()。
             if str(sid) in WATCHLIST_QUOTES and candles:
                 prev_close = _watchlist_prev_close(str(sid), date_str)
                 push_quote(str(sid), candles[-1]["close"], prev_close, minute_str)
+
+    if vwap_breakouts:
+        push_vwap_breakout(minute_str, vwap_breakouts)
+        print(
+            f"  [VWAP突破] {len(vwap_breakouts)} 支跨過VWAP: "
+            + " ".join(f"{b['stock_id']}({'突破' if b['direction']=='up' else '跌破'})" for b in vwap_breakouts),
+            flush=True,
+        )
 
     from api import get_setting
 
