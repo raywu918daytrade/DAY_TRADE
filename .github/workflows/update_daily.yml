@@ -35,6 +35,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt huggingface_hub
 
+      # 2026-08-13加：fubon_neo（富邦官方SDK）不在PyPI上，requirements.txt
+      # 不能列它——那份是本機/GHA共用的，本機是macOS的wheel，這裡才需要
+      # Linux版，兩個平台tag不同，混在同一個requirements.txt裝不起來。
+      # wheel本身是富邦官方網站本來就公開提供下載的檔案，直接放進repo的
+      # wheels/ 資料夾、這裡單獨裝，不用另外搞private repo。
+      - name: Install fubon_neo (Linux wheel)
+        run: pip install wheels/fubon_neo-2.2.8-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+
       # 2026-08-13加：GHA runner每次都是全新機器，db/不進版控，這裡checkout
       # 完是空的。update_daily.py 裡大部分增量/快路徑邏輯（_last_stored_dates()、
       # build_tick_adjust_factor.py/build_adjustment_factor.py 的全量重建、

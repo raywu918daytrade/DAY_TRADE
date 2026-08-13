@@ -13,6 +13,7 @@ dist/
 *.pfx
 *.p12
 *.whl
+!wheels/*.whl
 *.zip
 *.egg-info
 db
