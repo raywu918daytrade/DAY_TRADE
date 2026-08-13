@@ -26,11 +26,13 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 _ROOT = Path(__file__).parent.parent
+load_dotenv(_ROOT / ".env", override=True)
 
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
