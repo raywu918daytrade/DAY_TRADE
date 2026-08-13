@@ -8,13 +8,14 @@ name: Update Daily Data (m1/d1/adjustment_day/tick) and Sync to HF
 # 用 scripts/push_db_to_hf.py 把整個 db/ 鏡像同步上 HF Hub，一次到位。
 
 on:
-  schedule:
-    # 每天 15:00 台北時間（= 07:00 UTC，不跨日），週一到週五。收盤13:30後
-    # 留約1.5小時緩衝，避免 Fugle/富邦「今天」資料還沒公佈就搶跑（見
-    # scripts/update_daily.py 執行前的檢查邏輯，即使太早跑也會靠 flag
-    # 機制安全重試，不會漏資料，只是浪費一次執行時間）。
-    - cron: '0 7 * * 1-5'
-  workflow_dispatch:   # 允許手動觸發
+  # 2026-08-14：拿掉 schedule 排程——GitHub Actions 的 cron 觸發時間不保證
+  # 準時，官方文件本來就寫明高負載時段可能延遲甚至被跳過，使用者反映延遲
+  # 太久，改成外部cronjob呼叫 workflow_dispatch（例如
+  # `gh workflow run update_daily.yml -R raywu918daytrade/DAY_TRADE`，或
+  # 直接呼叫 GitHub REST API 的 workflow_dispatch 端點）觸發，時間點更
+  # 可控。原本排程是每天台北15:00（=07:00 UTC，不跨日）週一到週五，外部
+  # cronjob設定時間點可以比照這個邏輯。
+  workflow_dispatch:   # 允許手動/外部觸發
 
 jobs:
   update:
