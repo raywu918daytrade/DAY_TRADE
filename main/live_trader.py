@@ -379,8 +379,8 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                                 "stock_id": str(sid),
                                 "name": state.tickers.get(str(sid), str(sid)),
                                 "direction": "up" if cur_above else "down",
-                                "price": float(closes[-1]),
-                                "vwap": float(vwap[-1]),
+                                "price": round(float(closes[-1]), 2),
+                                "vwap": round(float(vwap[-1]), 2),
                             }
                         )
 

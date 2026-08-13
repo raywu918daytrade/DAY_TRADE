@@ -15,20 +15,27 @@ adjusted 參數——需要還原後價格的地方改用 data/query.py::load_m1
     m1_data_loader.py       → 下載歷史分K（近30日），存 db/m1/，給訓練用，GHA 每日觸發
     fubon/marketdata_ws.py  → 盤中富邦 WebSocket 即時推送，存 db/m1_live/，給當天交易推論用
 
-Fugle + 富邦同時下載：
-    兩邊 historical/candles 各自獨立 rate limit（都是 60次/分鐘，互不影響），
-    待下載股票清單拆一半分別跑，兩條執行緒同時進行，約可把時間壓到一半。
-    兩邊的 historical/candles 都已實測確認本身就含「今天」的資料（2026-07-13
-    20:30 實測，update_m1.yml 排程在台北18:00跑，遠晚於13:30收盤），一支
-    股票各自只需要呼叫一次，不用再另外呼叫 intraday/candles 補今天。
-    富邦 SDK 呼叫都透過 fubon/fubon_api.py，Fugle REST 呼叫都透過
-    fugle/fugle_api.py，這裡不直接碰 fubon_neo 或組 Fugle 的 URL/header。
+Fugle + 富邦同時下載（2026-08-13改成共用queue+兩階段，取代原本事先切固定
+清單）：
+    Fugle 兩組帳號（各自單執行緒序列，60次/分鐘，historical/candles 固定
+    回傳近30天資料，一支只需呼叫一次，不用再另外呼叫 intraday/candles 補
+    今天）+ 富邦，一起從同一個 `queue.Queue` 搶股票下載，誰快就自然多吃，
+    不會出現「份內做完就閒置、拖累整體」的情況（理由見
+    _update_m1_fugle()/_update_m1_fubon_fast() 的 docstring）。
+    **Phase 1**：全部候選股票，富邦用 intraday_candles（併發，只拿
+    「今天」）+ Fugle 正常呼叫（固定近30天）搶共用queue。**Phase 2**：
+    只補 Phase 1 開始前就已經有歷史缺口的股票，富邦改用
+    historical_candles（單執行緒序列，1.05秒/支留在 60次/分鐘以內）。
+    見 update_m1() 的完整說明。富邦 SDK 呼叫都透過 fubon/fubon_api.py，
+    Fugle REST 呼叫都透過 fugle/fugle_api.py，這裡不直接碰 fubon_neo 或
+    組 Fugle 的 URL/header。
 
 主要函式：
     update_m1(stocks)
-        stocks 預設為 fubon.subscribe_list.all_normal_stocks() 完整股票母體，
-        拆一半給 Fugle、一半給富邦下載（母體來源跟下載來源是分開的兩件事）。
+        stocks 預設為 _all_stocks()（見該函式，1878支全市場一般個股+0050）
+        完整股票母體，兩階段從共用queue動態分配給 Fugle x2 + 富邦。
 """
+import queue
 import threading
 from datetime import datetime, timezone, timedelta
 import os
@@ -36,6 +43,7 @@ from pathlib import Path
 import time
 
 import pandas as pd
+import pyarrow.dataset as ds
 import requests
 from dotenv import load_dotenv
 
@@ -133,6 +141,40 @@ def _save_m1(new_df: pd.DataFrame):
             _atomic_to_parquet(group, file_path, index=False, compression="zstd")
 
 
+def _flush_m1_buffer(buffer: list, date_str: str):
+    """把整批下載結果一次性存檔＋標記flag，取代逐支呼叫 _save_m1()/
+    _update_flag()。
+
+    2026-08-13發現：_save_m1() 每次呼叫都要「讀整個月份的parquet檔
+    （2026-08已經150萬列）→ concat → 去重複 → 排序 → 整檔重寫」，這個
+    操作被全域 _save_lock 保護，逐支呼叫的話，不管開幾條併發執行緒
+    （Fugle x2 + 富邦最多10條）全部都要排隊搶同一把鎖，實測單次存檔
+    約0.87秒，即使富邦快路徑本身能逼近300次/分鐘的API吞吐量，全域存檔
+    這個瓶頸會把整體壓到 1/0.87≈70次/分鐘，遠低於API限制，而且檔案只會
+    越存越大、越存越慢。
+
+    改成：worker（_update_m1_fugle()/_update_m1_fubon_fast()/
+    _update_m1_fubon_slow()）下載完不立刻存檔，而是把 (stock_id, df,
+    has_today) 疊加進共用 buffer（append是O(1)，不會卡）；等整個 Phase
+    的執行緒都 join() 完了，呼叫這支函式一次性合併成一個大DataFrame，
+    只呼叫一次 _save_m1()（內部本來就會依月份分組，一次處理完全部月份，
+    不會因為資料量變大而變成多次呼叫）、一次呼叫 _update_flags_batch()。
+
+    ⚠️ 取捨：这样一个 Phase 完成前如果整個程式中途當掉，這個 Phase 已經
+    下載但還沒flush的資料會遺失（原本逐支存檔則是已存檔的部分不會遺失）
+    ——但 Phase 本身耗時通常從幾十分鐘壓縮到幾分鐘，風險窗口大幅縮小，
+    而且本來就有 flag 機制，重跑只是重新下載、不會產生錯誤資料，用這個
+    交換整體速度是值得的。"""
+    if not buffer:
+        return
+    dfs = [df for _, df, _ in buffer]
+    combined = pd.concat(dfs, ignore_index=True)
+    _save_m1(combined)
+    to_flag = [stock_id for stock_id, _, has_today in buffer if has_today]
+    _update_flags_batch(to_flag, date_str)
+    print(f"批次存檔完成：{len(buffer)} 支（{len(combined)} 筆），標記 {len(to_flag)} 支flag")
+
+
 def _update_flag(stock_id: str, date_str: str):
     with _flag_lock:
         new_row = pd.DataFrame([{"stock_id": stock_id, "date": date_str}])
@@ -146,15 +188,60 @@ def _update_flag(stock_id: str, date_str: str):
         _atomic_to_parquet(df, _FLAG_PATH, index=False)
 
 
+def _update_flags_batch(stock_ids: list, date_str: str):
+    """一次幫多支股票標記 flag（一次讀寫），取代逐支呼叫 _update_flag()。
+    2026-08-13加：搭配 _flush_m1_buffer() 使用——見該函式說明。"""
+    if not stock_ids:
+        return
+    with _flag_lock:
+        new_rows = pd.DataFrame({"stock_id": stock_ids, "date": date_str})
+        if os.path.exists(_FLAG_PATH):
+            df = pd.read_parquet(_FLAG_PATH)
+            df = pd.concat([df, new_rows], ignore_index=True)
+            df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
+        else:
+            df = new_rows
+        os.makedirs(os.path.dirname(_FLAG_PATH), exist_ok=True)
+        _atomic_to_parquet(df, _FLAG_PATH, index=False)
+
+
 def _download_m1_fubon(sdk, stock_id: str) -> pd.DataFrame:
     """近30日+今日分K，富邦 historical/candles 一次就含今天，不用另外呼叫
-    intraday/candles。
+    intraday/candles。給「還沒跟上進度」（缺口>1天或全新股票）的股票用，
+    已跟上進度的股票改用更快的 _download_m1_fubon_intraday()（見該函式
+    說明），這支保留給需要補一段範圍的情況，本身就有自動補到近30天缺口
+    的能力，不用額外寫回補邏輯。
 
     不帶 adjusted（2026-08-01 改，故意不還原權息）：說明同 _download_m1()——
     db/m1 現在統一存原始價格，還原交給查詢層的 load_m1_adjusted() 處理。"""
     from fubon import fubon_api as trade_api
 
     bars = trade_api.historical_candles(sdk, stock_id, timeframe=1)
+    if not bars:
+        return pd.DataFrame()
+    df = pd.DataFrame(bars)
+    df["stock_id"] = stock_id
+    date = pd.to_datetime(df["date"])
+    if date.dt.tz is not None:
+        date = date.dt.tz_convert(_TW).dt.tz_localize(None)
+    df["date"] = date.dt.strftime("%Y-%m-%d %H:%M:%S")
+    return df
+
+
+def _download_m1_fubon_intraday(sdk, stock_id: str) -> pd.DataFrame:
+    """2026-08-11加：只抓「今天」的分K（intraday/candles，官方限制
+    300次/分鐘，比 historical_candles() 的60次/分鐘快5倍），給已經跟上
+    進度（db/m1最新資料剛好是「今天理論上該有的上一個交易日」，見
+    data.day_data_loader._expected_prior_trading_day()）的股票用，不用像
+    _download_m1_fubon() 那樣每次都抓一次近30天窗口——只差今天這一根，
+    抓30天是浪費的。回傳欄位/格式對齊 _download_m1_fubon()。
+
+    只有富邦這個端點有這個優勢，Fugle 的 intraday 跟 historical 都是
+    60次/分鐘、沒有差異（見 bugs_and_todos.md 的 rate limit 確認表），
+    所以這支只給 _update_m1_fubon() 用，Fugle 那兩路不變。"""
+    from fubon import fubon_api as trade_api
+
+    bars = trade_api.intraday_candles(sdk, stock_id, timeframe=1)
     if not bars:
         return pd.DataFrame()
     df = pd.DataFrame(bars)
@@ -196,73 +283,237 @@ def _has_today_data(df: pd.DataFrame, date_str: str) -> bool:
     return bool(df["date"].str.startswith(date_str).any())
 
 
-def _update_m1_fugle(stocks: list, date_str: str, token: str = None, label: str = "Fugle"):
-    """Fugle 那一份：historical/candles 一次就含今天（見 _download_m1() 的
-    2026-07-13 實測結果），1.05秒/支（1次API），維持在 60 req/min 以內留緩衝。
+def _last_stored_dates_m1() -> dict:
+    """db/m1 每支股票目前最新的存檔日期（只看最近2個月份檔案，1分K資料量
+    大，不用像 data.day_data_loader._last_stored_dates() 那樣掃全部月份
+    檔案——「最新日期」不可能藏在更早的月份裡）。回傳
+    {stock_id: "YYYY-MM-DD"}（只取日期部分）。股票沒出現在這2個月裡就不在
+    這個 dict 裡，呼叫端視為「落後很多」處理，走慢路徑。"""
+    m1_dir = _ROOT / "db/m1"
+    if not m1_dir.exists():
+        return {}
+    files = sorted(f for f in m1_dir.iterdir() if f.suffix == ".parquet")[-2:]
+    if not files:
+        return {}
+    dataset = ds.dataset([str(f) for f in files], format="parquet")
+    if dataset.count_rows() == 0:
+        return {}
+    df = dataset.to_table(columns=["stock_id", "date"]).to_pandas()
+    df["date"] = df["date"].astype(str).str[:10]
+    return df.groupby("stock_id")["date"].max().to_dict()
+
+
+_INTRADAY_FAST_WORKERS = 10
+_INTRADAY_FAST_INTERVAL = 0.25
+
+
+def _update_m1_fugle(
+    q: "queue.Queue", date_str: str, buffer: list, buffer_lock: threading.Lock, token: str = None, label: str = "Fugle"
+):
+    """Fugle 那一路：從共用queue搶股票下載，直到queue空為止。
+
+    2026-08-13改成queue模式（原本是 update_m1() 事先切好的固定清單）：
+    富邦快路徑併發化之後比 Fugle 快很多，如果還是照事先算好的固定比例
+    分配，富邦提早做完後只能閒置等 Fugle 兩路慢慢跑完，整體 wall time
+    沒有真正縮短。改成 Fugle 兩組帳號＋富邦一起搶同一個 queue，誰快就
+    自然多吃，不會出現「份內做完但整體還沒完成」的情況。
+
+    historical/candles 一次就含今天（見 _download_m1() 的 2026-07-13
+    實測結果），1.05秒/支（1次API），維持在 60 req/min 以內留緩衝——
+    Fugle 分K無法指定 from/to，一律回傳近30日資料，速度沒辦法再優化，
+    所以這支不管在 Phase 1（見 update_m1()）或 Phase 2 都是同一套邏輯，
+    處理過的股票基本上順便就把近30天缺口也補了。
 
     token/label：讓 update_m1() 可以開兩條 Fugle 執行緒各用一組帳號
     （FUGLE / FUGLE_DAYTRADE），互不共用 rate limit。
 
-    2026-07-26 改：查到空結果（含404）不再標記 _update_flag()——比照
+    2026-07-26 改：查到空結果（含404）不再標記 flag——比照
     data/day_data_loader.py 同一次的修正，避免空結果（可能只是暫時性問題）
-    被誤判成「今天已確認處理過」，當天重跑不會再重試。這裡沒有
-    day_data_loader.py 那個「start_date 窗口逐日滑動」的放大效應（每天固定
-    抓近30日，不會滑過缺口），純粹是跟那邊保持一致的寫法。"""
-    for stock_id in stocks:
+    被誤判成「今天已確認處理過」，當天重跑不會再重試。
+
+    ⚠️ 2026-08-13再改：不再逐支呼叫 _save_m1()/_update_flag()，改成把
+    (stock_id, df, has_today) 疊加進 buffer（append是O(1)，buffer_lock
+    只是保護這個很輕量的操作，不會卡）——真正的存檔／標記flag，交給
+    update_m1() 在這個 Phase 全部執行緒 join() 完之後，一次呼叫
+    _flush_m1_buffer()。理由見該函式的 docstring：逐支存檔會被全域
+    _save_lock 卡住，每次呼叫都要整檔重讀重寫，是比API rate limit更嚴重
+    的瓶頸。"""
+    while True:
+        try:
+            stock_id = q.get_nowait()
+        except queue.Empty:
+            return
+        left = q.qsize()
         try:
             df = _download_m1(stock_id, token=token)
             if not df.empty:
-                _save_m1(df)
-                print(f"[{label}] {stock_id} 下載完成 {len(df)} 筆")
-                if _has_today_data(df, date_str):
-                    _update_flag(stock_id, date_str)
+                has_today = _has_today_data(df, date_str)
+                with buffer_lock:
+                    buffer.append((stock_id, df, has_today))
+                if has_today:
+                    print(f"[{label}] {stock_id} 下載完成 {len(df)} 筆，等批次存檔（queue剩餘 {left} 支）")
                 else:
-                    print(f"[{label}] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓）")
+                    print(f"[{label}] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓，queue剩餘 {left} 支）")
             else:
-                print(f"[{label}] {stock_id} 無資料")
+                print(f"[{label}] {stock_id} 無資料（queue剩餘 {left} 支）")
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                print(f"[{label}] {stock_id} 無此股票資料")
+                print(f"[{label}] {stock_id} 無此股票資料（queue剩餘 {left} 支）")
             else:
-                print(f"[{label}] {stock_id} 失敗: {e}")
+                print(f"[{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
         except Exception as e:
-            print(f"[{label}] {stock_id} 失敗: {e}")
+            print(f"[{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
         time.sleep(1.05)
 
 
-def _update_m1_fubon(stocks: list, date_str: str, sdk):
-    """富邦那一半：historical/candles 一次就含今天，1.05秒/支（1次API，
-    `historical_candles()` 官方限制60次/分鐘留緩衝——2026-08-11修正：
-    2026-08-08一度誤改成0.25秒/300次分鐘，是跟 fubon/tick_api.py 的
-    intraday/trades 端點搞混，那是另一個限流更寬鬆的端點家族，
-    historical_candles 實際上跟 Fugle 一樣是60次/分鐘，見
-    data.day_data_loader._FUBON_INTERVAL 說明）。
+def _update_m1_fubon_fast(q: "queue.Queue", date_str: str, sdk, buffer: list, buffer_lock: threading.Lock):
+    """富邦 Phase 1（queue模式）：`ThreadPoolExecutor(_INTRADAY_FAST_WORKERS)`
+    併發搶 queue 裡的股票，呼叫 `_download_m1_fubon_intraday()`
+    （intraday_candles，官方限制300次/分鐘，只拿「今天」）。
 
-    空結果不標記完成：說明同 _update_m1_fugle()。"""
-    for stock_id in stocks:
+    2026-08-13改：呼叫端（update_m1()）只會把「還沒確認有歷史缺口」的
+    股票放進這個 queue——已知有缺口的股票（`gap_stocks`）不需要在這裡
+    多打一次「今天」，反正 Phase 2 的慢路徑 `_update_m1_fubon_slow()`
+    本身就會帶到今天（historical_candles 一次含近30天+今天），省流量，
+    見 update_m1() docstring。
+
+    共用一個函式內 `rate_lock` 控制整體請求間隔在
+    `_INTRADAY_FAST_INTERVAL=0.25秒`（不是每條執行緒各自 sleep 0.25秒
+    ——那樣多條執行緒合計會超過300次/分鐘限制）。改之前是單執行緒序列
+    迴圈，每筆請求的實際網路延遲遠大於0.25秒的節流下限，2026-08-13
+    實測 log 間隔到 5~7秒/支，離300/分鐘的理論吞吐量差很多，改成併發
+    才能真正隱藏單一請求的延遲、逼近理論上限。
+
+    空結果不標記完成：說明同 _update_m1_fugle()。⚠️ 2026-08-13再改：跟
+    _update_m1_fugle() 同一輪的修改，不再逐支存檔，改成疊加進 buffer，
+    見該函式 docstring 的詳細說明（實測逐支存檔本身就是比300次/分鐘更
+    嚴重的瓶頸，跟這裡的併發下載無關）。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    rate_lock = threading.Lock()
+    last_req = [0.0]
+
+    def _worker():
+        while True:
+            try:
+                stock_id = q.get_nowait()
+            except queue.Empty:
+                return
+            left = q.qsize()
+            with rate_lock:
+                wait = _INTRADAY_FAST_INTERVAL - (time.time() - last_req[0])
+                if wait > 0:
+                    time.sleep(wait)
+                last_req[0] = time.time()
+            try:
+                df = _download_m1_fubon_intraday(sdk, stock_id)
+                if not df.empty:
+                    has_today = _has_today_data(df, date_str)
+                    with buffer_lock:
+                        buffer.append((stock_id, df, has_today))
+                    if has_today:
+                        print(f"[富邦-intraday] {stock_id} 下載完成 {len(df)} 筆，等批次存檔（queue剩餘 {left} 支）")
+                    else:
+                        print(f"[富邦-intraday] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓，queue剩餘 {left} 支）")
+                else:
+                    print(f"[富邦-intraday] {stock_id} 無資料（queue剩餘 {left} 支）")
+            except Exception as e:
+                print(f"[富邦-intraday] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
+
+    with ThreadPoolExecutor(max_workers=_INTRADAY_FAST_WORKERS) as pool:
+        futures = [pool.submit(_worker) for _ in range(_INTRADAY_FAST_WORKERS)]
+        for f in futures:
+            f.result()
+
+
+def _update_m1_fubon_slow(q: "queue.Queue", date_str: str, sdk, buffer: list, buffer_lock: threading.Lock):
+    """富邦 Phase 2（queue模式）：單執行緒序列搶 queue 裡的股票，呼叫
+    `_download_m1_fubon()`（historical_candles，官方限制60次/分鐘留
+    緩衝——2026-08-11修正：2026-08-08一度誤改成0.25秒/300次分鐘，是跟
+    fubon/tick_api.py 的 intraday/trades 端點搞混，那是另一個限流更
+    寬鬆的端點家族，historical_candles 實際上跟 Fugle 一樣是60次/分鐘，
+    見 data.day_data_loader._FUBON_INTERVAL 說明），節流1.05秒/支，
+    本身有自動補近30天缺口的能力。
+
+    只有 Phase 2（真的有歷史缺口，見 update_m1()）會用到這支，維持
+    單執行緒不加併發——60次/分鐘本身就慢，併發能省的時間有限（理論
+    下限是股數/60分鐘），不值得為了有限的改善再冒一次誤判 rate limit
+    導致429的風險。
+
+    ⚠️ 2026-08-13再改：不再逐支存檔，改成疊加進 buffer，見
+    _update_m1_fugle() docstring 的詳細說明。"""
+    while True:
+        try:
+            stock_id = q.get_nowait()
+        except queue.Empty:
+            return
+        left = q.qsize()
         try:
             df = _download_m1_fubon(sdk, stock_id)
             if not df.empty:
-                _save_m1(df)
-                print(f"[富邦] {stock_id} 下載完成 {len(df)} 筆")
-                if _has_today_data(df, date_str):
-                    _update_flag(stock_id, date_str)
+                has_today = _has_today_data(df, date_str)
+                with buffer_lock:
+                    buffer.append((stock_id, df, has_today))
+                if has_today:
+                    print(f"[富邦] {stock_id} 下載完成 {len(df)} 筆，等批次存檔（queue剩餘 {left} 支）")
                 else:
-                    print(f"[富邦] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓）")
+                    print(f"[富邦] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓，queue剩餘 {left} 支）")
             else:
-                print(f"[富邦] {stock_id} 無資料")
+                print(f"[富邦] {stock_id} 無資料（queue剩餘 {left} 支）")
         except Exception as e:
-            print(f"[富邦] {stock_id} 失敗: {e}")
+            print(f"[富邦] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
         time.sleep(1.05)
 
 
 def update_m1(stocks: list = None):
-    """1分鐘K線，flag避免同日重複下載。待下載清單依實際節流速率分三份
-    （見 data.day_data_loader._split_by_rate()）：Fugle 兩組帳號（FUGLE、
-    FUGLE_DAYTRADE）+ 富邦 historical_candles，三者官方限制都是60次/分鐘，
-    目前實際上等同均分三等份（2026-08-11修正：曾誤以為富邦這個端點是
-    300次/分鐘而分配更多股票給它，導致 429，已修正回來，見
-    data.day_data_loader._FUBON_INTERVAL 說明）。"""
+    """1分鐘K線，flag避免同日重複下載。
+
+    2026-08-13大改：從「事先切三份固定清單」改成「兩階段＋共用queue」。
+    動機：富邦快路徑（intraday_candles,300次/分鐘）併發化之後比 Fugle
+    （60次/分鐘,固定近30天，見 _download_m1() docstring：分K無法指定
+    from/to）快很多，如果還是照 _split_by_rate() 事先切好固定比例，
+    富邦那份提早做完後只能閒置等 Fugle 兩路慢慢跑完，整體 wall time
+    沒有真正縮短。改成 Fugle 兩組帳號＋富邦一起搶同一個 queue，誰快就
+    自然多吃，不會出現「份內做完但整體還沒完成」的情況。
+
+    **Phase 1**（`wait_stocks` 排除掉已知有缺口的股票）：建一個共用
+    queue，Fugle兩組帳號（各自單執行緒序列 `_update_m1_fugle()`）＋
+    富邦（`_update_m1_fubon_fast()`，ThreadPoolExecutor併發，
+    intraday_candles只拿「今天」）一起搶。Fugle處理過的股票這階段就
+    順便把近30天缺口也補了（沒辦法只拿今天）。
+
+    ⚠️ 2026-08-13再加一版：已經確認有缺口的股票（`gap_stocks`，見下面
+    Phase 2 說明）**不放進 Phase 1 的queue**——這些股票反正等一下
+    Phase 2 的慢路徑（`historical_candles`）本身就會帶到「今天」（見
+    `_download_m1_fubon()` docstring），Phase 1 再多打一次只拿今天的
+    intraday等於白抓，省下這些流量/API額度（尤其富邦快路徑是併發搶，
+    queue裡少放這些注定要被 Phase 2 蓋過的股票，能把併發資源留給真正
+    只缺今天的股票）。
+
+    **Phase 2**（事後檢查缺口，只有真的落後的才進來）：Phase 1 跑完後，
+    重新讀一次 db/m1 目前每支股票的最新存檔日期，跟
+    `data.day_data_loader._expected_prior_trading_day()` 算出的「今天
+    理論上該有的上一個交易日」比較——**嚴格小於**才算真缺口（等於代表
+    只是今天資料還沒公佈，不是缺口，不需要進 Phase 2，下次重跑會自然
+    補上）。這些股票一樣建共用queue，Fugle兩組帳號＋富邦
+    （`_update_m1_fubon_slow()`，單執行緒序列，historical_candles慢
+    路徑）一起搶，補齊。
+
+    ⚠️ 2026-08-13（同一輪）：判斷「有沒有缺口」原本是跟股票池自己的
+    最大日期比較（相對值），這樣若整個排程當天忘記執行，隔天所有股票
+    會「相對彼此」一樣落後、誤判成全部跟上進度。已改成跟
+    `_expected_prior_trading_day()` 算出來的絕對日期比較。
+
+    ⚠️⚠️ 這個比較**必須在 Phase 1 開始前**就做完、把結果記下來，不能等
+    Phase 1 跑完才查——Phase 1 會幫「全部」股票（含真的有缺口的）都補上
+    「今天」這一筆，寫進 db/m1 後，那支股票在檔案裡的最新日期會直接變成
+    「今天」，這時候才查 `_last_stored_dates_m1()` 只會看到「今天」，
+    中間那段沒真正回補的缺口會被完全蓋掉、永遠看不出來（實測過：一支
+    股票原本卡在6天前，Phase 1 補了今天的intraday之後，事後查最新日期
+    就直接變成今天，缺口從此消失、Phase 2 不會再抓它）。所以這裡先用
+    Phase 1 開始前的快照決定 `gap_stocks`，Phase 1 造成的寫入不會影響
+    這個判斷結果。這支函式刻意不處理台股實際的國定假日，判斷錯了頂多
+    多走一次 Phase 2，不會漏資料。"""
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
     if not fugle_api.TOKEN_DAYTRADE:
@@ -277,12 +528,23 @@ def update_m1(stocks: list = None):
     wait_stocks = [s for s in candidates if s not in done]
     print("還有", len(wait_stocks), "個股票未更新（已排除今日已下載 flag）")
 
-    from data.day_data_loader import _split_by_rate
+    # ⚠️ 一定要在 Phase 1 寫入任何資料之前算好 gap_stocks，見上面 docstring
+    # 的說明——Phase 1 補「今天」會讓每支股票的最新日期直接跳成今天，
+    # 事後才查會把中間的缺口蓋掉、永遠看不出來。
+    from data.day_data_loader import _expected_prior_trading_day
 
-    fugle_half1, fugle_half2, fubon_half = _split_by_rate(wait_stocks)
+    last_dates_before = _last_stored_dates_m1()
+    expected_prior = _expected_prior_trading_day(now.date())
+    gap_stocks = [sid for sid in wait_stocks if last_dates_before.get(sid, "") < expected_prior]
+    gap_set = set(gap_stocks)
+    # Phase 2 的慢路徑（historical_candles）本身就會帶到「今天」（見
+    # _download_m1_fubon() docstring），所以已經確認有缺口的股票不需要
+    # 在 Phase 1 再多打一次「今天」——反正等一下 Phase 2 就會把它整段
+    # （含今天）重新抓一次，Phase 1 抓的等於白抓，省下這些流量/API額度。
+    phase1_stocks = [sid for sid in wait_stocks if sid not in gap_set]
     print(
-        f"Fugle {len(fugle_half1)} 支、Fugle(daytrade) {len(fugle_half2)} 支、"
-        f"富邦 {len(fubon_half)} 支，同時下載..."
+        f"預期上一交易日={expected_prior}，{len(gap_stocks)} 支股票目前有歷史缺口"
+        f"（跳過Phase 1直接排進Phase 2補，省流量）"
     )
 
     from fubon import fubon_api as trade_api
@@ -290,17 +552,45 @@ def update_m1(stocks: list = None):
     sdk, _ = trade_api.login()
     trade_api.init_market_data(sdk)
     try:
-        t_fugle1 = threading.Thread(target=_update_m1_fugle, args=(fugle_half1, date_str))
+        # ── Phase 1：排除已知有缺口的股票，Fugle x2 + 富邦(intraday併發) 搶共用queue ──
+        print(f"Phase 1：{len(phase1_stocks)} 支股票，Fugle x2 + 富邦(intraday併發) 從共用queue搶下載...")
+        q1 = queue.Queue()
+        for sid in phase1_stocks:
+            q1.put(sid)
+        buffer1: list = []
+        buffer1_lock = threading.Lock()
+        t_fugle1 = threading.Thread(target=_update_m1_fugle, args=(q1, date_str, buffer1, buffer1_lock))
         t_fugle2 = threading.Thread(
-            target=_update_m1_fugle, args=(fugle_half2, date_str, fugle_api.TOKEN_DAYTRADE, "Fugle-DT")
+            target=_update_m1_fugle,
+            args=(q1, date_str, buffer1, buffer1_lock, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
         )
-        t_fubon = threading.Thread(target=_update_m1_fubon, args=(fubon_half, date_str, sdk))
-        t_fugle1.start()
-        t_fugle2.start()
-        t_fubon.start()
-        t_fugle1.join()
-        t_fugle2.join()
-        t_fubon.join()
+        t_fubon = threading.Thread(target=_update_m1_fubon_fast, args=(q1, date_str, sdk, buffer1, buffer1_lock))
+        for t in (t_fugle1, t_fugle2, t_fubon):
+            t.start()
+        for t in (t_fugle1, t_fugle2, t_fubon):
+            t.join()
+        _flush_m1_buffer(buffer1, date_str)
+        print("Phase 1 完成")
+
+        # ── Phase 2：補 Phase 1 開始前就已經確認有缺口的股票 ──
+        print(f"Phase 2：{len(gap_stocks)} 支股票有歷史缺口，補歷史資料...")
+        if gap_stocks:
+            q2 = queue.Queue()
+            for sid in gap_stocks:
+                q2.put(sid)
+            buffer2: list = []
+            buffer2_lock = threading.Lock()
+            t_fugle1 = threading.Thread(target=_update_m1_fugle, args=(q2, date_str, buffer2, buffer2_lock))
+            t_fugle2 = threading.Thread(
+                target=_update_m1_fugle,
+                args=(q2, date_str, buffer2, buffer2_lock, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+            )
+            t_fubon = threading.Thread(target=_update_m1_fubon_slow, args=(q2, date_str, sdk, buffer2, buffer2_lock))
+            for t in (t_fugle1, t_fugle2, t_fubon):
+                t.start()
+            for t in (t_fugle1, t_fugle2, t_fubon):
+                t.join()
+            _flush_m1_buffer(buffer2, date_str)
     finally:
         trade_api.logout(sdk)
 

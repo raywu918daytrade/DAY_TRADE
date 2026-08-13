@@ -128,9 +128,19 @@ class Candle(BaseModel):
     vwap: Optional[float] = None
 
 
+class VwapPoint(BaseModel):
+    """前端 loadChart()/loadPatternChart() 畫 VWAP 線用的 {time, value} 點。"""
+    time: int | str
+    value: float
+
+
 class CandleResponse(BaseModel):
     stock_id: str
     candles: list[Candle]
+    # 當日 session VWAP 序列（跟 pattern_api detail / 前端 data.vwap 同一形狀）。
+    # 2026-08-13加：策略 M1 圖（含 VWAP 突破點擊）原本只有 candles，前端
+    # loadChart 已會畫 data.vwap，但這支 API 沒回就畫不出來。
+    vwap: list[VwapPoint] = []
 
 
 class LifecycleEvent(BaseModel):
@@ -1064,6 +1074,27 @@ def signal_detail(stock_id: str):
     return detail
 
 
+def _session_vwap_from_candles(candles: list) -> list[dict]:
+    """從當日 OHLCV candles 算 session VWAP 序列，給前端畫線用。
+
+    公式跟 main/live_trader.on_minute() 的 VWAP 突破偵測、
+    pattern/pattern_api.py::get_pattern_detail()、strategy/vwap_ml/features.py
+    同一套：cum(close*volume)/cum(volume)；cum_vol==0 的 bar 略過。
+    candles 的 time 已是 epoch（push_candles / history 都已轉過），直接沿用。
+    """
+    vwap_out: list[dict] = []
+    cum_pv = 0.0
+    cum_vol = 0.0
+    for c in candles:
+        vol = float(c.get("volume") or 0)
+        close = float(c["close"])
+        cum_pv += close * vol
+        cum_vol += vol
+        if cum_vol > 0:
+            vwap_out.append({"time": c["time"], "value": round(cum_pv / cum_vol, 2)})
+    return vwap_out
+
+
 @app.get(
     "/chart/{stock_id}/candles",
     response_model=CandleResponse,
@@ -1073,8 +1104,9 @@ def signal_detail(stock_id: str):
 def chart_candles(stock_id: str):
     with _lock:
         candles = list(_candles.get(stock_id, []))
-    print(f"[GET /chart/{stock_id}/candles] 回傳 {len(candles)} 根 K 線", flush=True)
-    return {"stock_id": stock_id, "candles": candles}
+    vwap = _session_vwap_from_candles(candles)
+    print(f"[GET /chart/{stock_id}/candles] 回傳 {len(candles)} 根 K 線, vwap={len(vwap)}", flush=True)
+    return {"stock_id": stock_id, "candles": candles, "vwap": vwap}
 
 
 @app.get(
@@ -1152,12 +1184,13 @@ def chart_candles_history(
         }
         for _, row in df.iterrows()
     ]
+    vwap = _session_vwap_from_candles(candles)
     print(
         f"[GET /chart/{stock_id}/candles/history] date={date} start_time={start_time} end_time={end_time} "
-        f"回傳 {len(candles)} 根 K 線",
+        f"回傳 {len(candles)} 根 K 線, vwap={len(vwap)}",
         flush=True,
     )
-    return {"stock_id": stock_id, "candles": candles}
+    return {"stock_id": stock_id, "candles": candles, "vwap": vwap}
 
 
 @app.get("/monitoring", tags=["監控"], summary="監控中股票的最新推論結果（依信心度排序）")
