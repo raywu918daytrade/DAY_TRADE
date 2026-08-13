@@ -65,9 +65,10 @@ _flag_lock = threading.Lock()
 
 
 def _m1_file_path(date: pd.Timestamp) -> Path:
-    """月份補零，需與 push_m1_to_hf.py 的 pd.Period.astype(str) 命名一致，
-    否則同一個月會在本機/HF Hub 各自產生一個檔名不同的分檔，觸發 schema 衝突
-    （db/fugle_day/ 已經因此撞過一次，見 2026_7.parquet vs 2026_07.parquet）"""
+    """月份補零，避免同一個月產生檔名不同的分檔、觸發 schema 衝突（db/fugle_day/
+    已經因此撞過一次，見 2026_7.parquet vs 2026_07.parquet）。scripts/push_db_to_hf.py
+    現在是直接鏡像整個 db/ 資料夾上 HF Hub，本機檔名就是 HF 上的檔名，這裡的
+    命名慣例統一與否直接反映到雲端，更要保持一致。"""
     return _ROOT / f"db/m1/{date.year}_{date.month:02d}.parquet"
 
 

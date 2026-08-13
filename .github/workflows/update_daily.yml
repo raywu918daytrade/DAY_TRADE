@@ -1,0 +1,53 @@
+name: Update Daily Data (m1/d1/adjustment_day/tick) and Sync to HF
+
+# 2026-08-13新增：取代舊的 update_m1.yml／update_day.yml。原本兩支各自獨立
+# 重下載一次m1/day K（用不同的股票清單、不同的節流設計），跟這支一起跑會
+# 對富邦/Fugle帳號重複打API、造成不必要的額外負擔，也容易兩邊股票清單
+# 對不上。改成單一workflow直接呼叫 scripts/update_daily.py（本地已驗證過
+# 的完整流程：m1/d1/adjustment_day/tick下載＋全部衍生資料建立），跑完後
+# 用 scripts/push_db_to_hf.py 把整個 db/ 鏡像同步上 HF Hub，一次到位。
+
+on:
+  schedule:
+    # 每天 15:00 台北時間（= 07:00 UTC，不跨日），週一到週五。收盤13:30後
+    # 留約1.5小時緩衝，避免 Fugle/富邦「今天」資料還沒公佈就搶跑（見
+    # scripts/update_daily.py 執行前的檢查邏輯，即使太早跑也會靠 flag
+    # 機制安全重試，不會漏資料，只是浪費一次執行時間）。
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:   # 允許手動觸發
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment: DAY_TRADE
+    timeout-minutes: 180   # m1/d1/adjustment_day/tick全部跑完+建衍生資料，保留寬裕緩衝
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt huggingface_hub
+
+      - name: Run update_daily.py
+        env:
+          FUGLE: ${{ secrets.FUGLE }}
+          FUGLE_DAYTRADE: ${{ secrets.FUGLE_DAYTRADE }}
+          FUBON_ID: ${{ secrets.FUBON_ID }}
+          FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
+          FUBON_CERT_B64: ${{ secrets.FUBON_CERT_B64 }}
+          FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
+        run: python -m scripts.update_daily
+
+      - name: Push db/ to HF Hub
+        if: always()   # 就算 update_daily.py 中途某個步驟失敗，已下載到的部分也要推上去，不要整批遺失
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ vars.HF_REPO_ID }}
+        run: python -m scripts.push_db_to_hf

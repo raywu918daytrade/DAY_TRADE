@@ -545,7 +545,7 @@ def _save_m1(new_df: pd.DataFrame, year: int, month: int):
 def _m1_empty_file_path(year: int, month: int) -> Path:
     """記錄 FinMind 確認過『真的沒有資料』（msg=success 但 data=[]）的
     (股票,交易日) 組合，跟真正的K棒資料分開存在 db/m1_empty/，不要混進
-    db/m1/——其他讀 db/m1 的 pipeline（m1_data_loader.py、push_m1_to_hf.py）
+    db/m1/——其他讀 db/m1 的 pipeline（m1_data_loader.py 等）
     預期的是 OHLCV schema，混進標記用途的資料會壞事。_existing_pairs() 會
     把這裡的組合也當成『已處理過』，2026-07-29 發現：沒有這層記錄的話，
     FinMind 真的沒有資料的組合會被永遠當成『還要補』，每次重跑都對同一批

@@ -1,0 +1,73 @@
+"""
+GH Actions / 手動執行：把本機整個 db/ 資料夾鏡像同步推到 HF Hub dataset repo。
+
+跟舊版 push_m1_to_hf.py／push_day_to_hf.py（已刪除）不同：這支不會自己重新
+下載資料、也不逐月跟 HF Hub 現有資料 merge——db/ 底下每支下載器
+（data/m1_data_loader.py、data/day_data_loader.py、fubon/tick_api.py 等）
+寫入本機時本身就是「累積式」（新的一天資料 merge 進既有月份檔案，不是只留
+近30天），本機 db/ 已經是完整歷史的 authoritative 來源，直接整個資料夾
+鏡像同步上去即可，不用再繞一次「下載→跟HF合併→推回」。
+
+用 huggingface_hub 的 upload_folder()：內部會比對雲端現有內容的 hash，只
+上傳有變動/新增的檔案，一次 commit，適合每天在 update_daily.py 跑完之後
+執行（增量同步，不是每次都整包重傳）。
+
+需要的環境變數：
+    HF_TOKEN   : Hugging Face write token（要有 write 權限）
+    HF_REPO_ID : HF dataset repo，格式 "<user>/<repo>"
+
+用法：
+    python -m scripts.push_db_to_hf
+    python -m scripts.push_db_to_hf --path-in-repo db  # 預設值，通常不用改
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+from huggingface_hub import HfApi
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+_ROOT = Path(__file__).parent.parent
+
+HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+# _atomic_to_parquet()（各下載器共用的原子寫入 helper）寫入中會先產生 .tmp
+# 暫存檔再 rename，正常情況下不該遺留在 db/ 底下，但防呆排除，避免不小心把
+# 寫入中的半成品推上去。
+_IGNORE_PATTERNS = ["*.tmp", "**/*.tmp"]
+
+
+def main(path_in_repo: str = "db"):
+    if not HF_REPO_ID or not HF_TOKEN:
+        raise RuntimeError("請設定 HF_REPO_ID 和 HF_TOKEN 環境變數")
+
+    db_dir = _ROOT / "db"
+    if not db_dir.exists():
+        raise RuntimeError(f"{db_dir} 不存在")
+
+    api = HfApi()
+    # dataset repo 若還不存在，第一次呼叫直接建立（exist_ok=True 避免重跑報錯）。
+    api.create_repo(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN, private=True, exist_ok=True)
+
+    print(f"開始同步 {db_dir} → HF Hub {HF_REPO_ID}/{path_in_repo}/ ...")
+    api.upload_folder(
+        folder_path=str(db_dir),
+        path_in_repo=path_in_repo,
+        repo_id=HF_REPO_ID,
+        repo_type="dataset",
+        token=HF_TOKEN,
+        ignore_patterns=_IGNORE_PATTERNS,
+        commit_message="db/ sync",
+    )
+    print("同步完成")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path-in-repo", default="db")
+    args = parser.parse_args()
+    main(path_in_repo=args.path_in_repo)
