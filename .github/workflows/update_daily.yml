@@ -35,6 +35,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt huggingface_hub
 
+      # 2026-08-13加：GHA runner每次都是全新機器，db/不進版控，這裡checkout
+      # 完是空的。update_daily.py 裡大部分增量/快路徑邏輯（_last_stored_dates()、
+      # build_tick_adjust_factor.py/build_adjustment_factor.py 的全量重建、
+      # build_volume_profile.py/build_poc.py 的「輸出檔案是否已存在」判斷）
+      # 都需要本機已經有完整歷史資料才能正確運作，不然會被誤判成「全新股票」
+      # 或「全部都要重建」。跑 update_daily.py 之前一定要先把 HF 上完整的
+      # db/ 拉下來墊成本機起始狀態。⚠️ 這代表每次執行都要下載一次完整
+      # db/（目前15GB，之後只會更大），是已知、暫時接受的成本，見
+      # /Users/wumingrui/.claude/plans/swirling-wishing-dewdrop.md 的說明。
+      - name: Pull latest db/ from HF Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ vars.HF_REPO_ID }}
+        run: python -m data.download_from_hf
+
       - name: Run update_daily.py
         env:
           FUGLE: ${{ secrets.FUGLE }}
