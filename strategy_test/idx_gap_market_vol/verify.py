@@ -1,12 +1,14 @@
 """
 0050 大缺口日 vs tick_universe 截面波動，以及
-09:05→10:00 效率標籤（quiet / range / trend）能否用 gap×ret5（+ 廣度／類股同步）分開。
+09:05→10:00 效率標籤（quiet / range / trend）能否用 gap×ret5（+ 廣度／類股同步）分開；
+另驗證類股開盤（leave-one-out med gap / ret5）能否判斷同類股內個股方向。
 
 定義：
     0050 gap = (open / prev_close) - 1
     ret5    = (c0905 - o0905) / o0905
     個股窗內：net=(p1000-p905)/p905；rng=(maxH-minL)/p905；eff=|net|/rng
     日標籤：quiet if med_rng<1%；其餘依 med_eff 相對非 quiet 中位數分 range/trend
+    類股：info.group；peers≥5 的 leave-one-out med_gap / med_ret5
 
 用法：
     python -m strategy_test.idx_gap_market_vol.verify \\
@@ -43,6 +45,7 @@ ENTRY_T = dtime(9, 5)
 EXIT_T = dtime(10, 0)
 SECTOR_MIN_N = 5
 TEST_DAYS = 90
+FRICTION = 0.0045  # 0.45%，同 open_drive
 SIGNS = ("up", "down", "flat")
 
 
@@ -183,6 +186,44 @@ def _sector_day_feats(stock_day: pd.DataFrame, idx_ret5: pd.Series) -> pd.DataFr
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _loo_median(s: pd.Series) -> pd.Series:
+    """同組 leave-one-out 中位；peers < SECTOR_MIN_N → NA。"""
+    vals = s.to_numpy(dtype=float)
+    n = len(vals)
+    out = np.full(n, np.nan)
+    if n <= SECTOR_MIN_N:
+        return pd.Series(out, index=s.index)
+    for i in range(n):
+        peers = np.concatenate([vals[:i], vals[i + 1 :]])
+        if np.isfinite(peers).sum() >= SECTOR_MIN_N:
+            out[i] = float(np.nanmedian(peers))
+    return pd.Series(out, index=s.index)
+
+
+def _side_line(r: pd.Series, label: str) -> None:
+    """r = long return；印 long/short mean、win0；|mean|≥摩擦標 opportunity。"""
+    r = r.dropna()
+    n = len(r)
+    if n == 0:
+        print(f"  {label}: n=0", flush=True)
+        return
+    long_mean = float(r.mean())
+    short_mean = float((-r).mean())
+    long_win0 = float((r > 0).mean())
+    short_win0 = float((r < 0).mean())
+    tag = ""
+    if abs(long_mean) >= FRICTION and long_mean >= abs(short_mean):
+        tag = "  → opportunity long"
+    elif abs(short_mean) >= FRICTION and short_mean > abs(long_mean):
+        tag = "  → opportunity short"
+    print(
+        f"  {label}: n={n:,}  "
+        f"long mean={100 * long_mean:+.3f}% win0={100 * long_win0:.1f}%  "
+        f"short mean={100 * short_mean:+.3f}% win0={100 * short_win0:.1f}%{tag}",
+        flush=True,
+    )
 
 
 def _fit_logistic(df: pd.DataFrame, feat_cols: list[str], label: str) -> None:
@@ -478,6 +519,68 @@ def run(start_date: str, end_date: str) -> None:
     _fit_logistic(binary, feats_a, "A 0050 only")
     _fit_logistic(binary, feats_b, "A+B +CS")
     _fit_logistic(binary, feats_c, "A+B+C +sector")
+
+    # ---------- Phase sector：類股開盤 → 個股方向 ----------
+    print("\n" + "=" * 60, flush=True)
+    print("Phase sector — 類股開盤（LOO med）→ 個股方向", flush=True)
+    print("=" * 60, flush=True)
+
+    day_ret = stocks[["stock_id", "day_str", "gap", "open", "close"]].copy()
+    day_ret = day_ret[(day_ret["open"] > 0)].copy()
+    day_ret["day_oc"] = day_ret["close"].astype(float) / day_ret["open"].astype(float) - 1.0
+    day_ret["stock_gap_sign"] = day_ret["gap"].map(_gap_sign)
+
+    sev = stock_px.merge(
+        day_ret[["stock_id", "day_str", "gap", "stock_gap_sign", "day_oc"]],
+        on=["stock_id", "day_str"],
+        how="inner",
+    )
+    sev = sev.dropna(subset=["group", "gap", "ret5", "net"]).copy()
+    sev["r_1000"] = sev["net"]
+    sev["stock_ret5_sign"] = sev["ret5"].map(_ret5_sign)
+
+    print(
+        f"事件列: {len(sev):,}  groups={sev['group'].nunique()}  "
+        f"摩擦 |mean|≥{100 * FRICTION:.2f}%",
+        flush=True,
+    )
+    print("算 leave-one-out 類股 med_gap / med_ret5...", flush=True)
+    sev["sector_gap"] = sev.groupby(["day_str", "group"], sort=False)["gap"].transform(
+        _loo_median
+    )
+    sev["sector_ret5"] = sev.groupby(["day_str", "group"], sort=False)["ret5"].transform(
+        _loo_median
+    )
+    sev = sev.dropna(subset=["sector_gap", "sector_ret5"]).copy()
+    sev["sector_gap_sign"] = sev["sector_gap"].map(_gap_sign)
+    sev["sector_ret5_sign"] = sev["sector_ret5"].map(_ret5_sign)
+    print(f"有類股 LOO 特徵: {len(sev):,}", flush=True)
+
+    print("\n[baseline 無類股濾網 @10:00]", flush=True)
+    _side_line(sev["r_1000"], "all")
+
+    print("\n[sector_gap_sign → 個股 r_1000]", flush=True)
+    for gs in SIGNS:
+        _side_line(sev.loc[sev["sector_gap_sign"] == gs, "r_1000"], f"sec_gap={gs}")
+
+    print("\n[sector_gap_sign → 個股 day_oc (close/open-1)]", flush=True)
+    for gs in SIGNS:
+        _side_line(sev.loc[sev["sector_gap_sign"] == gs, "day_oc"], f"sec_gap={gs}")
+
+    print("\n[sector_gap × sector_ret5 → 個股 r_1000]", flush=True)
+    for gs in SIGNS:
+        for rs in SIGNS:
+            mask = (sev["sector_gap_sign"] == gs) & (sev["sector_ret5_sign"] == rs)
+            _side_line(sev.loc[mask, "r_1000"], f"sec[{gs}/{rs}]")
+
+    print(
+        "\n[sector_gap × stock_gap → 個股 r_1000（看類股是否多餘）]",
+        flush=True,
+    )
+    for gs in SIGNS:
+        for ss in SIGNS:
+            mask = (sev["sector_gap_sign"] == gs) & (sev["stock_gap_sign"] == ss)
+            _side_line(sev.loc[mask, "r_1000"], f"sec={gs} stock={ss}")
 
     print(f"\n耗時 {time.time() - t0:.1f}s", flush=True)
 
