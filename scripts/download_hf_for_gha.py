@@ -55,7 +55,7 @@ update_daily.py 裡大部分增量/快路徑邏輯（`_last_stored_dates()`、
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -65,6 +65,8 @@ from huggingface_hub import snapshot_download
 
 _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env", override=True)
+
+_TW = timezone(timedelta(hours=8))
 
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
@@ -82,9 +84,17 @@ _RECENT_MONTHS_COUNT = 2
 
 def _recent_year_months(n: int) -> list[str]:
     """回傳最近 n 個月的 "YYYY_MM" 字串（含當月），對齊各下載器的月份分檔
-    命名慣例（例如 db/m1/2026_08.parquet）。"""
+    命名慣例（例如 db/m1/2026_08.parquet）。
+
+    ⚠️ 2026-08-13修正：原本用 timezone-naive 的 datetime.now()，GHA runner
+    系統時區是UTC——排程固定在台北15:00觸發（=UTC07:00，當天不跨日，沒事），
+    但手動 workflow_dispatch 觸發時間不固定，如果剛好在UTC接近月份邊界的
+    時間點觸發，算出來的「這個月」會跟台北時間對不上，導致近2個月的判斷
+    抓錯月份檔案。改用 datetime.now(_TW) 明確以台北時區為準，跟
+    data/m1_data_loader.py／data/day_data_loader.py 等其他下載器一致。"""
     months = []
-    y, m = datetime.now().year, datetime.now().month
+    now = datetime.now(_TW)
+    y, m = now.year, now.month
     for i in range(n):
         mm = m - i
         yy = y
