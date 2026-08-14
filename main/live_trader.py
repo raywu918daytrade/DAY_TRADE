@@ -97,6 +97,8 @@ from main.config import (
     CONSENSUS_TOP_N,
     FORCE_CLOSE_HOUR as _FORCE_CLOSE_HOUR,
     FORCE_CLOSE_MIN as _FORCE_CLOSE_MIN,
+    MARKET_CLOSE_HOUR as _MARKET_CLOSE_HOUR,
+    MARKET_CLOSE_MIN as _MARKET_CLOSE_MIN,
     STRATEGY_MODULES,
     TOTAL_CAPITAL,
     TRADE_MODE,
@@ -465,7 +467,11 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             # 頁首固定追蹤清單（WATCHLIST_QUOTES，如 0050）：跟策略候選股無關，
             # 收到 m1 就先查昨收、算漲跌幅，傳到前端之前先算好（不是前端自己拉
             # candles 再算），見 main/config.py 的說明與 api.py 的 push_quote()。
-            if str(sid) in WATCHLIST_QUOTES and candles:
+            # 2026-08-14加：收盤（MARKET_CLOSE_HOUR:MIN，預設13:30）後不再推
+            # ——WebSocket 收盤後還是會繼續收資料（SL/TP reconcile 監控不能
+            # 中斷，見模組頂端說明），但報價已經是收盤價、不會再變，沒必要
+            # 讓前端SSE一直收到「新」的報價更新。
+            if str(sid) in WATCHLIST_QUOTES and candles and (h, m) <= (_MARKET_CLOSE_HOUR, _MARKET_CLOSE_MIN):
                 prev_close = _watchlist_prev_close(str(sid), date_str)
                 push_quote(str(sid), candles[-1]["close"], prev_close, minute_str)
 
