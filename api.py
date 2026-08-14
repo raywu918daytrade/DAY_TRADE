@@ -1057,12 +1057,25 @@ def conflict_today():
         return list(reversed(_conflict_signals))  # 最新在上
 
 
+def _scan_vwap_sr(date_str: str) -> tuple[list, list]:
+    """盤後一次掃全日 m1（pattern/vwap_sr_scan.py），不寫記憶體、不廣播 SSE。"""
+    from pattern.vwap_sr_scan import scan_date
+
+    vwap, sr = scan_date(date_str)
+    return list(reversed(vwap)), list(reversed(sr))
+
+
 @app.get(
     "/vwap_breakout/today",
     tags=["訊號"],
     summary="今日「VWAP突破/跌破」訊號列表",
 )
-def vwap_breakout_today():
+def vwap_breakout_today(date: Optional[str] = None):
+    """date 有值時從 db/m1_live（或 db/m1）一次掃那一天；沒帶則回盤中記憶體。"""
+    if date:
+        vwap, _ = _scan_vwap_sr(date)
+        print(f"[GET /vwap_breakout/today] date={date} 掃出 {len(vwap)} 筆", flush=True)
+        return vwap
     print(f"[GET /vwap_breakout/today] 回傳 {len(_vwap_breakout_signals)} 筆VWAP突破訊號", flush=True)
     with _lock:
         return list(reversed(_vwap_breakout_signals))  # 最新在上
@@ -1073,10 +1086,27 @@ def vwap_breakout_today():
     tags=["訊號"],
     summary="今日「VWAP + 壓力/支撐穿越」訊號列表",
 )
-def sr_vwap_cross_today():
+def sr_vwap_cross_today(date: Optional[str] = None):
+    """date 有值（dashboard「重現」）時掃全日 m1；沒帶則回盤中記憶體。"""
+    if date:
+        _, sr = _scan_vwap_sr(date)
+        print(f"[GET /sr_vwap_cross/today] date={date} 掃出 {len(sr)} 筆", flush=True)
+        return sr
     print(f"[GET /sr_vwap_cross/today] 回傳 {len(_sr_vwap_cross_signals)} 筆", flush=True)
     with _lock:
         return list(reversed(_sr_vwap_cross_signals))
+
+
+@app.get(
+    "/vwap_sr_replay",
+    tags=["訊號"],
+    summary="盤後一次掃某日 m1，同時回 VWAP突破 與 VWAP+壓力支撐",
+)
+def vwap_sr_replay(date: str):
+    """dashboard「重現」用：同一輪掃描回兩欄，避免打兩次 endpoint 重複算包絡。"""
+    vwap, sr = _scan_vwap_sr(date)
+    print(f"[GET /vwap_sr_replay] date={date} VWAP {len(vwap)} 筆 / SR {len(sr)} 筆", flush=True)
+    return {"vwap": vwap, "sr": sr}
 
 
 @app.get(

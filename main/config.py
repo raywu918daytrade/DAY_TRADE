@@ -55,6 +55,15 @@ TRADE_MODE = os.environ.get("TRADE_MODE", "off")  # off | paper | sim | live
 FORCE_CLOSE_HOUR = int(os.environ.get("FORCE_CLOSE_HOUR", "13"))
 FORCE_CLOSE_MIN = int(os.environ.get("FORCE_CLOSE_MIN", "25"))
 
+# 台股一般交易時段收盤時間（2026-08-14加）：main/live_trader.py::on_minute()
+# 用這個把「盤後」跟「盤中」的推播行為分開——WebSocket 收盤後還是會繼續收
+# 資料（見模組頂端說明，SL/TP reconcile 監控不能中斷），但頁首追蹤報價
+# （push_quote()）沒必要跟著一直推，收盤後應該停掉，不要讓前端SSE一直
+# 收到「已經是收盤價」的報價更新。跟 FORCE_CLOSE_HOUR/MIN（13:25，出場用
+# 的提前緩衝時間）不一樣，這個是真正的收盤時間 13:30。
+MARKET_CLOSE_HOUR = int(os.environ.get("MARKET_CLOSE_HOUR", "13"))
+MARKET_CLOSE_MIN = int(os.environ.get("MARKET_CLOSE_MIN", "30"))
+
 _TOTAL_CAPITAL_ENV = float(os.environ.get("TOTAL_CAPITAL", "1000000"))
 
 
