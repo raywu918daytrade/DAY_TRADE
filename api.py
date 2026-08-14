@@ -677,6 +677,10 @@ def push_conflict_signals(minute_str: str, conflicts: list):
         _broadcast({"type": "conflict_signals", "minute": minute_str[11:16], "data": conflicts})
 
 
+def _vwap_event_key(e: dict) -> tuple:
+    return (str(e.get("stock_id", "")), str(e.get("time", "")), str(e.get("direction", "")))
+
+
 def push_vwap_breakout(minute_str: str, breakouts: list):
     """推入「VWAP突破/跌破」訊號（main/live_trader.py 的 on_minute() 每分鐘偵測，
     見該函式內的說明）。
@@ -695,9 +699,18 @@ def push_vwap_breakout(minute_str: str, breakouts: list):
     print(f"[push_vwap_breakout] {minute_str} 產生 {len(breakouts)} 筆VWAP突破訊號", flush=True)
     with _lock:
         _reset_if_new_day()
+        existing = {_vwap_event_key(x) for x in _vwap_breakout_signals}
+        fresh = []
         for b in breakouts:
-            _vwap_breakout_signals.append({**b, "time": minute_str[11:16]})
-        _broadcast({"type": "vwap_breakout", "minute": minute_str[11:16], "data": breakouts})
+            row = {**b, "time": minute_str[11:16]}
+            k = _vwap_event_key(row)
+            if k in existing:
+                continue
+            existing.add(k)
+            _vwap_breakout_signals.append(row)
+            fresh.append(b)
+        if fresh:
+            _broadcast({"type": "vwap_breakout", "minute": minute_str[11:16], "data": fresh})
 
 
 def push_sr_vwap_cross(minute_str: str, hits: list):
@@ -710,9 +723,17 @@ def push_sr_vwap_cross(minute_str: str, hits: list):
     print(f"[push_sr_vwap_cross] {minute_str} 產生 {len(hits)} 筆VWAP+壓力支撐", flush=True)
     with _lock:
         _reset_if_new_day()
+        existing = {str(x.get("stock_id")) for x in _sr_vwap_cross_signals}
+        fresh = []
         for h in hits:
+            sid = str(h.get("stock_id", ""))
+            if sid in existing:
+                continue
+            existing.add(sid)
             _sr_vwap_cross_signals.append({**h, "time": minute_str[11:16]})
-        _broadcast({"type": "sr_vwap_cross", "minute": minute_str[11:16], "data": hits})
+            fresh.append(h)
+        if fresh:
+            _broadcast({"type": "sr_vwap_cross", "minute": minute_str[11:16], "data": fresh})
 
 
 def push_candles(stock_id: str, candles: list):
@@ -1065,6 +1086,42 @@ def _scan_vwap_sr(date_str: str) -> tuple[list, list]:
     return list(reversed(vwap)), list(reversed(sr))
 
 
+_vwap_sr_catchup_hook = None
+
+
+def register_vwap_sr_catchup_hook(fn):
+    """live_trader 登記：catchup 寫入記憶體後同步 vwap_crossed_today / sr_vwap_fired_today。"""
+    global _vwap_sr_catchup_hook
+    _vwap_sr_catchup_hook = fn
+
+
+def _sync_live_vwap_sr_sets(vwap: list, sr: list):
+    """補齊 live_trader 當日 set，避免 10 點開機 catchup 後又把 9 點已發生的再推一次。"""
+    if _vwap_sr_catchup_hook is None:
+        return
+    _vwap_sr_catchup_hook(vwap, sr)
+
+
+def _catchup_today_into_memory() -> tuple[list, list]:
+    """掃今日 m1，覆寫盤中記憶體（補開機前缺口），之後 on_minute 繼續 append。"""
+    today = datetime.now(_TW).strftime("%Y-%m-%d")
+    from pattern.vwap_sr_scan import scan_date
+
+    vwap, sr = scan_date(today)
+    with _lock:
+        _reset_if_new_day()
+        _vwap_breakout_signals.clear()
+        _vwap_breakout_signals.extend(vwap)
+        _sr_vwap_cross_signals.clear()
+        _sr_vwap_cross_signals.extend(sr)
+    _sync_live_vwap_sr_sets(vwap, sr)
+    print(
+        f"[vwap_sr_catchup] {today} 寫入記憶體 VWAP {len(vwap)} 筆 / SR {len(sr)} 筆",
+        flush=True,
+    )
+    return list(reversed(vwap)), list(reversed(sr))
+
+
 @app.get(
     "/vwap_breakout/today",
     tags=["訊號"],
@@ -1095,6 +1152,16 @@ def sr_vwap_cross_today(date: Optional[str] = None):
     print(f"[GET /sr_vwap_cross/today] 回傳 {len(_sr_vwap_cross_signals)} 筆", flush=True)
     with _lock:
         return list(reversed(_sr_vwap_cross_signals))
+
+
+@app.get(
+    "/vwap_sr_catchup",
+    tags=["訊號"],
+    summary="盤中補齊今日開機前的 VWAP／壓力支撐，寫入記憶體後繼續即時累加",
+)
+def vwap_sr_catchup():
+    vwap, sr = _catchup_today_into_memory()
+    return {"vwap": vwap, "sr": sr}
 
 
 @app.get(

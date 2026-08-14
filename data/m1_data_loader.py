@@ -304,12 +304,18 @@ def _last_stored_dates_m1() -> dict:
     return df.groupby("stock_id")["date"].max().to_dict()
 
 
-_INTRADAY_FAST_WORKERS = 10
+_INTRADAY_FAST_WORKERS = 8  # 2026-08-14從10調降：GHA實跑撞到約7.5%(140/1864)的429，降併發數當第一道防線
 _INTRADAY_FAST_INTERVAL = 0.25
 
 
 def _update_m1_fugle(
-    q: "queue.Queue", date_str: str, buffer: list, buffer_lock: threading.Lock, token: str = None, label: str = "Fugle"
+    q: "queue.Queue",
+    date_str: str,
+    buffer: list,
+    buffer_lock: threading.Lock,
+    failed: list,
+    token: str = None,
+    label: str = "Fugle",
 ):
     """Fugle 那一路：從共用queue搶股票下載，直到queue空為止。
 
@@ -338,7 +344,18 @@ def _update_m1_fugle(
     update_m1() 在這個 Phase 全部執行緒 join() 完之後，一次呼叫
     _flush_m1_buffer()。理由見該函式的 docstring：逐支存檔會被全域
     _save_lock 卡住，每次呼叫都要整檔重讀重寫，是比API rate limit更嚴重
-    的瓶頸。"""
+    的瓶頸。
+
+    ⚠️ 2026-08-14加 failed 參數：實際跑GHA時發現 Phase 1（不管Fugle還是
+    富邦快路徑）真的請求失敗（不是404、是暫時性錯誤如rate limit——實測
+    一次GHA執行就有~140支股票因為富邦intraday撞到429失敗）時，原本這批
+    股票當天完全沒有第二次機會，要等隔天gap偵測才會被抓回來補。現在把
+    這種真正的請求失敗記進 failed（線程安全，用同一把 buffer_lock 保護，
+    append本身很輕量不會卡），update_m1() 收集完 Phase 1 全部 failed 後
+    會併入 Phase 2 的 queue，同一天內就用慢路徑補回來，不用等到隔天。
+    404（真的沒有這支股票）跟「無資料」不算這種失敗，不會被加進去——
+    404是確定性的、重試也沒用；「無資料」保留給隔天的flag機制自然重試，
+    避免genuinely沒資料的股票每天都被硬塞進Phase 2浪費一次慢路徑額度。"""
     while True:
         try:
             stock_id = q.get_nowait()
@@ -361,13 +378,19 @@ def _update_m1_fugle(
             if e.response is not None and e.response.status_code == 404:
                 print(f"[{label}] {stock_id} 無此股票資料（queue剩餘 {left} 支）")
             else:
-                print(f"[{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
+                with buffer_lock:
+                    failed.append(stock_id)
+                print(f"[{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支，追加進Phase 2重試）")
         except Exception as e:
-            print(f"[{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
+            with buffer_lock:
+                failed.append(stock_id)
+            print(f"[{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支，追加進Phase 2重試）")
         time.sleep(1.05)
 
 
-def _update_m1_fubon_fast(q: "queue.Queue", date_str: str, sdk, buffer: list, buffer_lock: threading.Lock):
+def _update_m1_fubon_fast(
+    q: "queue.Queue", date_str: str, sdk, buffer: list, buffer_lock: threading.Lock, failed: list
+):
     """富邦 Phase 1（queue模式）：`ThreadPoolExecutor(_INTRADAY_FAST_WORKERS)`
     併發搶 queue 裡的股票，呼叫 `_download_m1_fubon_intraday()`
     （intraday_candles，官方限制300次/分鐘，只拿「今天」）。
@@ -388,7 +411,12 @@ def _update_m1_fubon_fast(q: "queue.Queue", date_str: str, sdk, buffer: list, bu
     空結果不標記完成：說明同 _update_m1_fugle()。⚠️ 2026-08-13再改：跟
     _update_m1_fugle() 同一輪的修改，不再逐支存檔，改成疊加進 buffer，
     見該函式 docstring 的詳細說明（實測逐支存檔本身就是比300次/分鐘更
-    嚴重的瓶頸，跟這裡的併發下載無關）。"""
+    嚴重的瓶頸，跟這裡的併發下載無關）。
+
+    ⚠️ 2026-08-14加 failed 參數：理由/語意同 _update_m1_fugle() 的
+    failed 參數說明——實測GHA一次執行約140支股票在這裡因為富邦intraday
+    撞到429失敗，記進 failed 讓 update_m1() 併入 Phase 2 同一天內用
+    慢路徑補回來，不用等隔天。"""
     from concurrent.futures import ThreadPoolExecutor
 
     rate_lock = threading.Lock()
@@ -419,7 +447,9 @@ def _update_m1_fubon_fast(q: "queue.Queue", date_str: str, sdk, buffer: list, bu
                 else:
                     print(f"[富邦-intraday] {stock_id} 無資料（queue剩餘 {left} 支）")
             except Exception as e:
-                print(f"[富邦-intraday] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
+                with buffer_lock:
+                    failed.append(stock_id)
+                print(f"[富邦-intraday] {stock_id} 失敗: {e}（queue剩餘 {left} 支，追加進Phase 2重試）")
 
     with ThreadPoolExecutor(max_workers=_INTRADAY_FAST_WORKERS) as pool:
         futures = [pool.submit(_worker) for _ in range(_INTRADAY_FAST_WORKERS)]
@@ -514,7 +544,15 @@ def update_m1(stocks: list = None):
     就直接變成今天，缺口從此消失、Phase 2 不會再抓它）。所以這裡先用
     Phase 1 開始前的快照決定 `gap_stocks`，Phase 1 造成的寫入不會影響
     這個判斷結果。這支函式刻意不處理台股實際的國定假日，判斷錯了頂多
-    多走一次 Phase 2，不會漏資料。"""
+    多走一次 Phase 2，不會漏資料。
+
+    ⚠️ 2026-08-14加：Phase 2 除了原本的 `gap_stocks`，還會併入 **Phase 1
+    這次真的請求失敗**（rate limit等暫時性錯誤，不是404、也不是單純空
+    結果）的股票——實測GHA一次執行就有約140支股票在富邦intraday快路徑
+    撞到429失敗，原本這批股票當天完全沒有第二次機會，要等隔天gap偵測
+    才會被抓回來補，現在同一天內就用Phase 2的慢路徑補回來。用
+    `set(gap_stocks) | set(failed1)` 去重，避免同一支股票被塞進queue
+    兩次。"""
     if not fugle_api.TOKEN:
         raise RuntimeError("缺少 FUGLE API Key，請在 .env 設定 FUGLE")
     if not fugle_api.TOKEN_DAYTRADE:
@@ -560,12 +598,15 @@ def update_m1(stocks: list = None):
             q1.put(sid)
         buffer1: list = []
         buffer1_lock = threading.Lock()
-        t_fugle1 = threading.Thread(target=_update_m1_fugle, args=(q1, date_str, buffer1, buffer1_lock))
+        failed1: list = []
+        t_fugle1 = threading.Thread(target=_update_m1_fugle, args=(q1, date_str, buffer1, buffer1_lock, failed1))
         t_fugle2 = threading.Thread(
             target=_update_m1_fugle,
-            args=(q1, date_str, buffer1, buffer1_lock, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+            args=(q1, date_str, buffer1, buffer1_lock, failed1, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
         )
-        t_fubon = threading.Thread(target=_update_m1_fubon_fast, args=(q1, date_str, sdk, buffer1, buffer1_lock))
+        t_fubon = threading.Thread(
+            target=_update_m1_fubon_fast, args=(q1, date_str, sdk, buffer1, buffer1_lock, failed1)
+        )
         for t in (t_fugle1, t_fugle2, t_fubon):
             t.start()
         for t in (t_fugle1, t_fugle2, t_fubon):
@@ -573,18 +614,29 @@ def update_m1(stocks: list = None):
         _flush_m1_buffer(buffer1, date_str)
         print("Phase 1 完成")
 
-        # ── Phase 2：補 Phase 1 開始前就已經確認有缺口的股票 ──
-        print(f"Phase 2：{len(gap_stocks)} 支股票有歷史缺口，補歷史資料...")
-        if gap_stocks:
+        # ── Phase 2：補 Phase 1 開始前就已經確認有缺口的股票，
+        # 加上 Phase 1 這次真的請求失敗（rate limit等暫時性錯誤，不是
+        # 404）的股票——2026-08-14加：實測GHA一次執行約140支股票在富邦
+        # intraday快路徑撞到429失敗，原本要等隔天gap偵測才會被抓回來，
+        # 現在同一天內就用慢路徑補，不用等隔天。用 set 去重，避免同一支
+        # 股票同時在 gap_stocks 跟 failed1 裡導致 queue 重複塞兩次。
+        gap_stocks_final = sorted(set(gap_stocks) | set(failed1))
+        if failed1:
+            print(f"Phase 1 有 {len(failed1)} 支股票請求失敗，併入 Phase 2 同一天內重試")
+        print(f"Phase 2：{len(gap_stocks_final)} 支股票有歷史缺口，補歷史資料...")
+        if gap_stocks_final:
             q2 = queue.Queue()
-            for sid in gap_stocks:
+            for sid in gap_stocks_final:
                 q2.put(sid)
             buffer2: list = []
             buffer2_lock = threading.Lock()
-            t_fugle1 = threading.Thread(target=_update_m1_fugle, args=(q2, date_str, buffer2, buffer2_lock))
+            failed2: list = []
+            t_fugle1 = threading.Thread(
+                target=_update_m1_fugle, args=(q2, date_str, buffer2, buffer2_lock, failed2)
+            )
             t_fugle2 = threading.Thread(
                 target=_update_m1_fugle,
-                args=(q2, date_str, buffer2, buffer2_lock, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+                args=(q2, date_str, buffer2, buffer2_lock, failed2, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
             )
             t_fubon = threading.Thread(target=_update_m1_fubon_slow, args=(q2, date_str, sdk, buffer2, buffer2_lock))
             for t in (t_fugle1, t_fugle2, t_fubon):
@@ -592,6 +644,8 @@ def update_m1(stocks: list = None):
             for t in (t_fugle1, t_fugle2, t_fubon):
                 t.join()
             _flush_m1_buffer(buffer2, date_str)
+            if failed2:
+                print(f"Phase 2 仍有 {len(failed2)} 支股票請求失敗，留給下次重跑（flag機制自然重試）")
     finally:
         trade_api.logout(sdk)
 

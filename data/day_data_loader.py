@@ -99,7 +99,7 @@ _flag_lock = threading.Lock()
 # （見 _update_day_generic()），不再事先按節流速率切固定份數。
 _FUGLE_INTERVAL = 1.05  # 秒/次，60次/分鐘留緩衝
 _FUBON_INTERVAL = 1.05  # 秒/次，60次/分鐘留緩衝（historical_candles，不是intraday/trades）
-_INTRADAY_FAST_WORKERS = 10  # 富邦快路徑（intraday_candles）併發數，比照 marketdata_ws.py::_BACKFILL_WORKERS
+_INTRADAY_FAST_WORKERS = 8  # 富邦快路徑（intraday_candles）併發數，比照 marketdata_ws.py::_BACKFILL_WORKERS；2026-08-14從10調降：GHA實跑撞到約7.5%(140/1864)的429，降併發數當第一道防線
 _INTRADAY_FAST_INTERVAL = 0.25  # 秒/次，300次/分鐘留緩衝，靠共用rate_lock控制整體間隔（不是每執行緒各自sleep）
 
 
@@ -427,6 +427,7 @@ def _update_day_fugle(
     workers: int,
     buffer: list,
     buffer_lock: threading.Lock,
+    failed: list,
     token: str = None,
     label: str = "Fugle",
     adjusted: bool = False,
@@ -467,6 +468,11 @@ def _update_day_fugle(
     每次呼叫都要整檔重讀重寫，是比API rate limit更嚴重的瓶頸。真正的
     存檔/標記flag，交給 _update_day_generic() 在這個 Phase 全部執行緒
     join() 完之後，一次呼叫 _flush_day_buffer()。
+
+    ⚠️ 2026-08-14加 failed 參數：理由/語意同
+    data/m1_data_loader.py::_update_m1_fugle() 的 failed 參數說明——
+    真正的請求失敗（不是404、不是單純空結果）記進 failed，讓呼叫端在
+    Phase 1 併入 Phase 2 同一天內用慢路徑重試，不用等隔天gap偵測。
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -490,9 +496,13 @@ def _update_day_fugle(
                         print(f"  [{label}] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓，queue剩餘 {left} 支）")
             except requests.exceptions.HTTPError as e:
                 if e.response is None or e.response.status_code != 404:
-                    print(f"  [{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
+                    with buffer_lock:
+                        failed.append(stock_id)
+                    print(f"  [{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支，追加進Phase 2重試）")
             except Exception as e:
-                print(f"  [{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
+                with buffer_lock:
+                    failed.append(stock_id)
+                print(f"  [{label}] {stock_id} 失敗: {e}（queue剩餘 {left} 支，追加進Phase 2重試）")
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_worker) for _ in range(workers)]
@@ -500,7 +510,9 @@ def _update_day_fugle(
             f.result()
 
 
-def _update_day_fubon_fast(q: "queue.Queue", date_str: str, sdk, buffer: list, buffer_lock: threading.Lock):
+def _update_day_fubon_fast(
+    q: "queue.Queue", date_str: str, sdk, buffer: list, buffer_lock: threading.Lock, failed: list
+):
     """富邦 Phase 1（queue模式，僅 update_day()/adjusted=False 使用）：
     `ThreadPoolExecutor(max_workers=_INTRADAY_FAST_WORKERS)` 併發搶 queue
     裡的股票，呼叫 `_download_day_fubon_intraday()`（intraday_candles
@@ -520,7 +532,12 @@ def _update_day_fubon_fast(q: "queue.Queue", date_str: str, sdk, buffer: list, b
     空結果不標記完成：說明同 _update_day_fugle()。⚠️ 2026-08-13再改：
     不再逐支存檔，改成疊加進 buffer，見 _flush_day_buffer() docstring
     的詳細說明（實測逐支存檔本身就是比300次/分鐘更嚴重的瓶頸，跟這裡
-    的併發下載無關）。"""
+    的併發下載無關）。
+
+    ⚠️ 2026-08-14加 failed 參數：理由/語意同 _update_day_fugle() 的
+    failed 參數說明——實測GHA一次執行約140支股票在富邦intraday（m1那邊
+    同樣端點）撞到429失敗，記進 failed 讓 _update_day_generic() 併入
+    Phase 2 同一天內用慢路徑補回來，不用等隔天。"""
     from concurrent.futures import ThreadPoolExecutor
 
     rate_lock = threading.Lock()
@@ -549,7 +566,9 @@ def _update_day_fubon_fast(q: "queue.Queue", date_str: str, sdk, buffer: list, b
                     else:
                         print(f"  [富邦-intraday] {stock_id} 尚無今日資料，不標記 flag（稍後重跑會再抓，queue剩餘 {left} 支）")
             except Exception as e:
-                print(f"  [富邦-intraday] {stock_id} 失敗: {e}（queue剩餘 {left} 支）")
+                with buffer_lock:
+                    failed.append(stock_id)
+                print(f"  [富邦-intraday] {stock_id} 失敗: {e}（queue剩餘 {left} 支，追加進Phase 2重試）")
 
     with ThreadPoolExecutor(max_workers=_INTRADAY_FAST_WORKERS) as pool:
         futures = [pool.submit(_worker) for _ in range(_INTRADAY_FAST_WORKERS)]
@@ -703,19 +722,23 @@ def _update_day_generic(
                 q1.put(sid)
             buffer1: list = []
             buffer1_lock = threading.Lock()
+            failed1: list = []
             t_fugle1 = threading.Thread(
                 target=_update_day_fugle,
-                args=(q1, stock_start_dates, date_str, workers, buffer1, buffer1_lock),
+                args=(q1, stock_start_dates, date_str, workers, buffer1, buffer1_lock, failed1),
                 kwargs={"adjusted": adjusted},
             )
             t_fugle2 = threading.Thread(
                 target=_update_day_fugle,
-                args=(q1, stock_start_dates, date_str, workers, buffer1, buffer1_lock, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+                args=(
+                    q1, stock_start_dates, date_str, workers, buffer1, buffer1_lock, failed1,
+                    fugle_api.TOKEN_DAYTRADE, "Fugle-DT",
+                ),
                 kwargs={"adjusted": adjusted},
             )
             t_fubon = threading.Thread(
                 target=_update_day_fubon_fast,
-                args=(q1, date_str, sdk, buffer1, buffer1_lock),
+                args=(q1, date_str, sdk, buffer1, buffer1_lock, failed1),
             )
             for t in (t_fugle1, t_fugle2, t_fubon):
                 t.start()
@@ -724,23 +747,32 @@ def _update_day_generic(
             _flush_day_buffer(buffer1, date_str, base_dir=base_dir, flag_path=flag_path)
             print(f"[{base_dir}] Phase 1 完成")
 
-            # ── Phase 2：補 Phase 1 開始前就已經確認有缺口的股票 ──
-            print(f"[{base_dir}] Phase 2：{len(gap_stocks)} 支股票有歷史缺口，補歷史資料...")
-            if gap_stocks:
+            # ── Phase 2：補 Phase 1 開始前就已經確認有缺口的股票，加上
+            # Phase 1 這次真的請求失敗（rate limit等暫時性錯誤，不是404）
+            # 的股票——2026-08-14加，理由見 data/m1_data_loader.py::
+            # update_m1() 同一輪的說明：實測GHA一次執行約140支股票在富邦
+            # intraday快路徑撞到429失敗，原本要等隔天gap偵測才補得回來，
+            # 現在同一天內就用慢路徑補。set去重避免同一支股票塞進queue兩次。
+            gap_stocks_final = sorted(set(gap_stocks) | set(failed1))
+            if failed1:
+                print(f"[{base_dir}] Phase 1 有 {len(failed1)} 支股票請求失敗，併入 Phase 2 同一天內重試")
+            print(f"[{base_dir}] Phase 2：{len(gap_stocks_final)} 支股票有歷史缺口，補歷史資料...")
+            if gap_stocks_final:
                 q2 = queue.Queue()
-                for sid in gap_stocks:
+                for sid in gap_stocks_final:
                     q2.put(sid)
                 buffer2: list = []
                 buffer2_lock = threading.Lock()
+                failed2: list = []
                 t_fugle1 = threading.Thread(
                     target=_update_day_fugle,
-                    args=(q2, stock_start_dates, date_str, workers, buffer2, buffer2_lock),
+                    args=(q2, stock_start_dates, date_str, workers, buffer2, buffer2_lock, failed2),
                     kwargs={"adjusted": adjusted},
                 )
                 t_fugle2 = threading.Thread(
                     target=_update_day_fugle,
                     args=(
-                        q2, stock_start_dates, date_str, workers, buffer2, buffer2_lock,
+                        q2, stock_start_dates, date_str, workers, buffer2, buffer2_lock, failed2,
                         fugle_api.TOKEN_DAYTRADE, "Fugle-DT",
                     ),
                     kwargs={"adjusted": adjusted},
@@ -755,6 +787,8 @@ def _update_day_generic(
                 for t in (t_fugle1, t_fugle2, t_fubon):
                     t.join()
                 _flush_day_buffer(buffer2, date_str, base_dir=base_dir, flag_path=flag_path)
+                if failed2:
+                    print(f"[{base_dir}] Phase 2 仍有 {len(failed2)} 支股票請求失敗，留給下次重跑（flag機制自然重試）")
         else:
             # 單一階段（update_adjustment_day()，或手動指定 start_date）：
             # 沒有快路徑可用，一樣用共用queue動態分配，但不分 Phase。
@@ -763,14 +797,18 @@ def _update_day_generic(
                 q.put(sid)
             buffer: list = []
             buffer_lock = threading.Lock()
+            failed: list = []
             t_fugle1 = threading.Thread(
                 target=_update_day_fugle,
-                args=(q, stock_start_dates, date_str, workers, buffer, buffer_lock),
+                args=(q, stock_start_dates, date_str, workers, buffer, buffer_lock, failed),
                 kwargs={"adjusted": adjusted},
             )
             t_fugle2 = threading.Thread(
                 target=_update_day_fugle,
-                args=(q, stock_start_dates, date_str, workers, buffer, buffer_lock, fugle_api.TOKEN_DAYTRADE, "Fugle-DT"),
+                args=(
+                    q, stock_start_dates, date_str, workers, buffer, buffer_lock, failed,
+                    fugle_api.TOKEN_DAYTRADE, "Fugle-DT",
+                ),
                 kwargs={"adjusted": adjusted},
             )
             t_fubon = threading.Thread(
@@ -783,6 +821,8 @@ def _update_day_generic(
             for t in (t_fugle1, t_fugle2, t_fubon):
                 t.join()
             _flush_day_buffer(buffer, date_str, base_dir=base_dir, flag_path=flag_path)
+            if failed:
+                print(f"[{base_dir}] {len(failed)} 支股票請求失敗，留給下次重跑（flag機制自然重試，這條路徑沒有Phase 2可以同日重試）")
     finally:
         trade_api.logout(sdk)
 

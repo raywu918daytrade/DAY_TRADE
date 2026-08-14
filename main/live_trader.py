@@ -83,6 +83,7 @@ from api import (
     push_signals,
     push_sr_vwap_cross,
     push_vwap_breakout,
+    register_vwap_sr_catchup_hook,
     set_strategies,
     tw_naive_to_epoch,
     update_positions_price,
@@ -113,6 +114,18 @@ from data.query import load_m1_live
 _TW = timezone(timedelta(hours=8))
 
 state = AppState()
+
+
+def _on_vwap_sr_catchup(vwap: list, sr: list):
+    for e in vwap:
+        state.vwap_crossed_today.add(str(e["stock_id"]))
+    for e in sr:
+        sid = str(e["stock_id"])
+        state.vwap_crossed_today.add(sid)
+        state.sr_vwap_fired_today.add(sid)
+
+
+register_vwap_sr_catchup_hook(_on_vwap_sr_catchup)
 # _startup() 跑完（成功或失敗）就會 set，_daily_refresh() 的立即補載判斷要
 # 等這個，避免兩邊背景執行緒同時搶著呼叫 refresh_tickers()（見 _startup()、
 # _daily_refresh() 的說明）。
