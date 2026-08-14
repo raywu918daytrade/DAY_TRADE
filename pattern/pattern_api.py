@@ -18,6 +18,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
+import numpy as np
 import pandas as pd
 
 from pattern.abcd_bear.detector import AbcdBearDetector
@@ -95,6 +96,75 @@ TICK_UNIVERSE_LIST = [{"stock_id": sid, "name": name} for sid, name in STOCK_NAM
 # 記憶體快取 (In-Memory Cache)
 _SCAN_CACHE: Dict[tuple, Dict[str, Any]] = {}
 _DETAIL_CACHE: Dict[tuple, Dict[str, Any]] = {}
+
+
+def _envelope_sr_lines(df: pd.DataFrame, to_epoch) -> List[Dict[str, Any]]:
+    """日K 包絡壓力／支撐，不要求三角收斂過關。
+
+    股票清單 m1/m3/m5 疊圖用：三角偵測常常分數不夠、pattern.lines 是空的，
+    圖上就完全沒線。這裡用同一套 pivot + envelope（貼外側高點／低點），
+    只取最近 3 個峰／谷，線畫到最新一根日K，幾乎都會有線可疊。
+    """
+    if df is None or df.empty or len(df) < 20:
+        return []
+    det = DETECTORS["triangle"]
+    sub = df.iloc[-120:].reset_index(drop=True)
+    n = len(sub)
+    pivots = det._filter_alternating_pivots(det._extract_raw_pivots(sub))
+    peaks = [p for p in pivots if p.type == "peak"]
+    troughs = [p for p in pivots if p.type == "trough"]
+    if len(peaks) >= 3:
+        peaks = peaks[-3:]
+    if len(troughs) >= 3:
+        troughs = troughs[-3:]
+    if len(peaks) < 2 or len(troughs) < 2:
+        return []
+
+    p1, p_last = peaks[0], peaks[-1]
+    dx_u = p_last.index - p1.index
+    if dx_u <= 0:
+        return []
+    slope_u = (p_last.price - p1.price) / float(dx_u)
+    intercept_u = p1.price - slope_u * p1.index
+    diffs_u = np.array([p.price for p in peaks]) - (slope_u * np.array([p.index for p in peaks]) + intercept_u)
+    max_diff_u = float(np.max(diffs_u))
+    if max_diff_u > 0:
+        intercept_u += max_diff_u
+
+    t1, t_last = troughs[0], troughs[-1]
+    dx_l = t_last.index - t1.index
+    if dx_l <= 0:
+        return []
+    slope_l = (t_last.price - t1.price) / float(dx_l)
+    intercept_l = t1.price - slope_l * t1.index
+    diffs_l = (slope_l * np.array([p.index for p in troughs]) + intercept_l) - np.array([p.price for p in troughs])
+    max_diff_l = float(np.max(diffs_l))
+    if max_diff_l > 0:
+        intercept_l -= max_diff_l
+
+    end_idx = n - 1
+
+    def _line(start_idx: int, slope: float, intercept: float, line_type: str) -> Optional[Dict[str, Any]]:
+        start_date = str(sub["date"].iloc[start_idx])
+        end_date = str(sub["date"].iloc[end_idx])
+        try:
+            t_start = to_epoch(pd.Timestamp(start_date))
+            t_end = to_epoch(pd.Timestamp(end_date))
+        except Exception:
+            return None
+        return {
+            "start_time": t_start,
+            "end_time": t_end,
+            "start_price": round(float(slope * start_idx + intercept), 2),
+            "end_price": round(float(slope * end_idx + intercept), 2),
+            "line_type": line_type,
+        }
+
+    lines = [
+        _line(int(p1.index), slope_u, intercept_u, "resistance"),
+        _line(int(t1.index), slope_l, intercept_l, "support"),
+    ]
+    return [l for l in lines if l is not None]
 
 
 @router.post("/cache/clear", summary="手動清空 Pattern 快取")
@@ -400,7 +470,10 @@ async def submit_scan(
 @router.get("/{stock_id}/detail", summary="單一股票 K 線與型態繪圖細節")
 def get_pattern_detail(
     stock_id: str,
-    pattern_type: str = Query("triangle", description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle, macd_hist_bull, macd_hist_bear"),
+    pattern_type: str = Query(
+        "triangle",
+        description="型態種類: triangle, w_bottom, m_top, abcd_bull, abcd_bear, head_shoulders_bottom, cup_handle, macd_hist_bull, macd_hist_bear；或 none（只回 K 線／VWAP／POC，不跑型態偵測——股票清單欄型態全關時用）",
+    ),
     timeframe: str = Query("day", description="時間週期: 1m, 3m, 5m, day"),
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)"),
     limit: int = Query(120, description="K 線視窗根數，預設 120 根，full_day=true 時忽略"),
@@ -422,15 +495,18 @@ def get_pattern_detail(
     if hasattr(force_live, "default"):
         force_live = force_live.default
 
-    if pattern_type not in DETECTORS:
+    # none：不跑偵測器，只回蜡烛／VWAP／volume profile／POC（股票清單型態全關、
+    # 或盤中圖只要日K水位疊加時的 intraday 底圖）。
+    skip_pattern = pattern_type in (None, "", "none")
+    if not skip_pattern and pattern_type not in DETECTORS:
         raise HTTPException(
             status_code=400,
-            detail=f"尚未支援或無效的型態: {pattern_type}。可用型態: {list(DETECTORS.keys())}",
+            detail=f"尚未支援或無效的型態: {pattern_type}。可用型態: {list(DETECTORS.keys())} 或 none",
         )
 
     # 取得最新 K 線時間戳以構造智慧快取 Key
     latest_ts = get_latest_candle_timestamp(timeframe=timeframe, date=date)
-    cache_key = (stock_id, pattern_type, timeframe, date or "latest", limit, full_day, latest_ts)
+    cache_key = (stock_id, pattern_type if not skip_pattern else "none", timeframe, date or "latest", limit, full_day, latest_ts)
 
     if not force_live and cache_key in _DETAIL_CACHE:
         return _DETAIL_CACHE[cache_key]
@@ -439,8 +515,11 @@ def get_pattern_detail(
     if df_candles.empty:
         raise HTTPException(status_code=404, detail=f"查無 {stock_id} 在 timeframe={timeframe} 的 K 線資料")
 
-    detector = DETECTORS[pattern_type]
-    pattern_res = detector.detect(df_candles, stock_id=stock_id, timeframe=timeframe)
+    detector = None if skip_pattern else DETECTORS[pattern_type]
+    pattern_res = (
+        None if skip_pattern
+        else detector.detect(df_candles, stock_id=stock_id, timeframe=timeframe)
+    )
 
     # 轉換 K 線給前端圖表使用 (依照 CLAUDE.md 使用 tw_naive_to_epoch)
     from api import tw_naive_to_epoch
@@ -498,6 +577,15 @@ def get_pattern_detail(
 
         pattern_output = pattern_dict
 
+    # 日K 包絡壓力／支撐：不綁型態掃描。分K 疊圖要的是「最近日K結構的
+    # 上下軌」，三角沒過關也要有線。
+    sr_lines_output: List[Dict[str, Any]] = []
+    if timeframe == "day":
+        try:
+            sr_lines_output = _envelope_sr_lines(df_candles, tw_naive_to_epoch)
+        except Exception:
+            sr_lines_output = []
+
     # 載入「整個可視K線範圍」的 Volume Profile & POC 籌碼數據（2026-08-01改：
     # 原本只查K線視窗最後一天，跟使用者實際打開的視窗範圍（例如120天）完全
     # 脫鉤，數值看起來不合理、橫條圖也擠成一團貼在單日POC旁邊。現在改成把
@@ -552,11 +640,12 @@ def get_pattern_detail(
         "stock_name": STOCK_NAME_MAP.get(str(stock_id), str(stock_id)),
         "in_tick_universe": str(stock_id) in TICK_UNIVERSE_SET,
         "timeframe": timeframe,
-        "pattern_type": pattern_type,
-        "pattern_name": detector.display_name,
+        "pattern_type": "none" if skip_pattern else pattern_type,
+        "pattern_name": None if skip_pattern else detector.display_name,
         "candles": candles_output,
         "vwap": vwap_output,
         "pattern": pattern_output,
+        "sr_lines": sr_lines_output,
         "volume_profile": volume_profile_output,
         "poc_data": poc_data_output,
     }
