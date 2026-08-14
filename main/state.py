@@ -73,6 +73,14 @@ class AppState:
         self.day_trade_stocks: set | None = None
         self.day: pd.DataFrame = pd.DataFrame()
 
+        # 當日「VWAP + 壓力/支撐」框：昨收包絡水位（盤中不重算）、已穿越 VWAP
+        # 的股票（第 1 層濾網，跟 VWAP 突破同一輪 m1 算出來，不重算 VWAP）、
+        # 以及已經推進新框的股票（當日每股一筆）。
+        self.sr_levels: dict[str, tuple[float, float]] = {}  # stock_id → (res, sup)
+        self.sr_levels_date: str = ""
+        self.vwap_crossed_today: set[str] = set()
+        self.sr_vwap_fired_today: set[str] = set()
+
         # 交易引擎（main/live_trader.py 依 TRADE_MODE 建立一次，之後只讀）。
         # 2026-07-13：交易先暫停，多策略同時跑訊號時怎麼分資金/處理同股票
         # 衝突還沒設計，見 main/config.py 的 STRATEGY_MODULES 說明。

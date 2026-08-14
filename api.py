@@ -324,6 +324,7 @@ _monitoring: dict = {}  # {stock_id: {stock_id, name, proba, price, is_signal, m
 _consensus_signals: list = []  # 今日「多個策略的前N名重疊」記錄，見 push_consensus_signals()
 _conflict_signals: list = []  # 今日「多空衝突（反轉）」記錄，見 push_conflict_signals()
 _vwap_breakout_signals: list = []  # 今日「VWAP突破/跌破」記錄，見 push_vwap_breakout()
+_sr_vwap_cross_signals: list = []  # 今日「VWAP + 壓力/支撐穿越」記錄，見 push_sr_vwap_cross()
 _strategies_registry: dict = {"strategies": [], "consensus_top_n": 0}  # 見 set_strategies()
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
@@ -419,7 +420,7 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals, _sr_vwap_cross_signals
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -436,6 +437,7 @@ def _reset_if_new_day():
         _consensus_signals.clear()
         _conflict_signals.clear()
         _vwap_breakout_signals.clear()
+        _sr_vwap_cross_signals.clear()
         _summary = dict(_SUMMARY_DEFAULT)
 
 
@@ -696,6 +698,21 @@ def push_vwap_breakout(minute_str: str, breakouts: list):
         for b in breakouts:
             _vwap_breakout_signals.append({**b, "time": minute_str[11:16]})
         _broadcast({"type": "vwap_breakout", "minute": minute_str[11:16], "data": breakouts})
+
+
+def push_sr_vwap_cross(minute_str: str, hits: list):
+    """推入「VWAP + 壓力或支撐穿越」訊號。第 1 層是當日已穿越 VWAP（跟
+    push_vwap_breakout 同一輪 m1、同一套 VWAP，不重算）；再查包絡壓力/支撐
+    有沒有也變號。不分順序方向，當日每股只推一筆。
+    hits 每筆：stock_id, name, sr_kind(support/resistance/both), vwap_dir,
+    price, vwap, resistance, support
+    """
+    print(f"[push_sr_vwap_cross] {minute_str} 產生 {len(hits)} 筆VWAP+壓力支撐", flush=True)
+    with _lock:
+        _reset_if_new_day()
+        for h in hits:
+            _sr_vwap_cross_signals.append({**h, "time": minute_str[11:16]})
+        _broadcast({"type": "sr_vwap_cross", "minute": minute_str[11:16], "data": hits})
 
 
 def push_candles(stock_id: str, candles: list):
@@ -1049,6 +1066,17 @@ def vwap_breakout_today():
     print(f"[GET /vwap_breakout/today] 回傳 {len(_vwap_breakout_signals)} 筆VWAP突破訊號", flush=True)
     with _lock:
         return list(reversed(_vwap_breakout_signals))  # 最新在上
+
+
+@app.get(
+    "/sr_vwap_cross/today",
+    tags=["訊號"],
+    summary="今日「VWAP + 壓力/支撐穿越」訊號列表",
+)
+def sr_vwap_cross_today():
+    print(f"[GET /sr_vwap_cross/today] 回傳 {len(_sr_vwap_cross_signals)} 筆", flush=True)
+    with _lock:
+        return list(reversed(_sr_vwap_cross_signals))
 
 
 @app.get(

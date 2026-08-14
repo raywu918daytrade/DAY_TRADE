@@ -68,6 +68,7 @@ def _ts_print(*args, **kwargs):
 _builtins.print = _ts_print
 
 import pandas as pd
+import numpy as np
 import uvicorn
 
 from api import (
@@ -80,6 +81,7 @@ from api import (
     push_monitoring,
     push_quote,
     push_signals,
+    push_sr_vwap_cross,
     push_vwap_breakout,
     set_strategies,
     tw_naive_to_epoch,
@@ -188,6 +190,7 @@ def _startup():
             _log_sys(
                 f"D1 載入完成：{state.day['stock_id'].nunique() if not state.day.empty else 0} 支，最新 {_d1_last}"
             )
+            _refresh_sr_levels(datetime.now(_TW).strftime("%Y-%m-%d"))
         except Exception as e:
             print(f"✗ [D1] 載入失敗: {e}", flush=True)
             _log_sys(f"D1 載入失敗: {e}", "error")
@@ -266,6 +269,7 @@ def _daily_refresh():
                 _premarket.refresh_tickers(state)
                 if state.day_trade_stocks:
                     _premarket.refresh_day(state)
+                    _refresh_sr_levels(now.strftime("%Y-%m-%d"))
                 last_refresh = today
                 n = len(state.day_trade_stocks) if state.day_trade_stocks else 0
                 print(f"  更新完成，當沖標的：{n} 支")
@@ -312,6 +316,48 @@ def _watchlist_prev_close(stock_id: str, date_str: str) -> float | None:
     return val
 
 
+def _refresh_sr_levels(date_str: str):
+    """換日／開機：用 D 之前日K 算包絡壓力／支撐，盤中不重算。"""
+    from data.adjustment_query import load_pattern_day
+    from pattern.envelope import envelope_sr_prices
+
+    stocks = {str(s) for s in (state.day_trade_stocks or state.tickers.keys())}
+    if not stocks:
+        state.sr_levels = {}
+        state.sr_levels_date = date_str
+        return
+    hist_start = (pd.Timestamp(date_str) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+    print(f"[SR水位] 預先計算包絡 {len(stocks)} 檔（日K < {date_str}）…", flush=True)
+    day = load_pattern_day(start_date=hist_start, end_date=date_str)
+    if day.empty:
+        state.sr_levels = {}
+        state.sr_levels_date = date_str
+        print("  [SR水位] 無日K", flush=True)
+        return
+    day["stock_id"] = day["stock_id"].astype(str)
+    cutoff = pd.Timestamp(date_str)
+    levels = {}
+    for sid, g in day.groupby("stock_id", sort=False):
+        sid = str(sid)
+        if sid not in stocks:
+            continue
+        hist = g.loc[g["date"] < cutoff]
+        res, sup = envelope_sr_prices(hist)
+        if res is not None:
+            levels[sid] = (res, sup)
+    state.sr_levels = levels
+    state.sr_levels_date = date_str
+    print(f"  [SR水位] {len(levels)} 檔有壓力/支撐", flush=True)
+
+
+def _ensure_sr_vwap_day(date_str: str):
+    if state.sr_levels_date == date_str:
+        return
+    state.vwap_crossed_today.clear()
+    state.sr_vwap_fired_today.clear()
+    _refresh_sr_levels(date_str)
+
+
 def on_minute(minute_str: str, df: pd.DataFrame):
     """分K收集器每分鐘回呼：每個策略各自推論、推送監控/訊號，並觸發下單。
 
@@ -327,6 +373,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
 
     # 載入今日分K（只載一次，下面 push_candles 和每個策略的 predict_live 共用）
     date_str = minute_str[:10]
+    _ensure_sr_vwap_day(date_str)
     m1_live = load_m1_live(date_str)
     print(
         f"[on_minute] {minute_str[11:16]}  M1:{m1_live['stock_id'].nunique() if not m1_live.empty else 0} 支 {len(m1_live):,} 筆",
@@ -339,6 +386,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     # 偵測到的全部股票，等迴圈跑完一次性推送，跟 push_consensus_signals()/
     # push_conflict_signals() 同一種「這分鐘的結果一次送一批」節奏。
     vwap_breakouts = []
+    sr_vwap_hits = []
 
     if not m1_live.empty:
         for sid, g in m1_live.groupby("stock_id"):
@@ -357,13 +405,10 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                     }
                 )
             push_candles(str(sid), candles)
+            sid = str(sid)
 
-            # VWAP公式沿用 strategy/vwap_ml/features.py::_add_vwap_z() 那一套
-            # （當天從0開始累積收盤價*成交量，不是跨日）——m1_live 本來就
-            # 只有「今天」，g 已經是這支股票今天到目前為止的完整分K，
-            # 每次都整段重算，不用額外存前一分鐘的狀態。只看「這一分鐘」
-            # 跟「上一分鐘」收盤價相對VWAP的位置有沒有變號，那才是「剛好
-            # 跨過那條線」的事件，不是「目前在哪一側」的持續狀態。
+            # VWAP 只算一次：突破欄用變號事件；通過這層濾網的才查壓力/支撐
+            # （不要同一支再重算一遍 VWAP）。
             if len(g) >= 2:
                 closes = g["close"].astype(float).to_numpy()
                 vols = g["volume"].astype(float).to_numpy()
@@ -374,15 +419,48 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                     prev_above = closes[-2] >= vwap[-2]
                     cur_above = closes[-1] >= vwap[-1]
                     if prev_above != cur_above:
+                        vwap_dir = "up" if cur_above else "down"
                         vwap_breakouts.append(
                             {
-                                "stock_id": str(sid),
-                                "name": state.tickers.get(str(sid), str(sid)),
-                                "direction": "up" if cur_above else "down",
+                                "stock_id": sid,
+                                "name": state.tickers.get(sid, sid),
+                                "direction": vwap_dir,
                                 "price": round(float(closes[-1]), 2),
                                 "vwap": round(float(vwap[-1]), 2),
                             }
                         )
+                        state.vwap_crossed_today.add(sid)
+
+                    if (
+                        sid in state.vwap_crossed_today
+                        and sid not in state.sr_vwap_fired_today
+                    ):
+                        sr = state.sr_levels.get(sid)
+                        if sr:
+                            res, sup = sr
+                            res_x = bool(np.any((closes[:-1] >= res) != (closes[1:] >= res)))
+                            sup_x = bool(np.any((closes[:-1] >= sup) != (closes[1:] >= sup)))
+                            if res_x or sup_x:
+                                if res_x and sup_x:
+                                    sr_kind = "both"
+                                elif sup_x:
+                                    sr_kind = "support"
+                                else:
+                                    sr_kind = "resistance"
+                                vwap_dir = "up" if closes[-1] >= vwap[-1] else "down"
+                                sr_vwap_hits.append(
+                                    {
+                                        "stock_id": sid,
+                                        "name": state.tickers.get(sid, sid),
+                                        "sr_kind": sr_kind,
+                                        "vwap_dir": vwap_dir,
+                                        "price": round(float(closes[-1]), 2),
+                                        "vwap": round(float(vwap[-1]), 2),
+                                        "resistance": round(float(res), 2),
+                                        "support": round(float(sup), 2),
+                                    }
+                                )
+                                state.sr_vwap_fired_today.add(sid)
 
             # 頁首固定追蹤清單（WATCHLIST_QUOTES，如 0050）：跟策略候選股無關，
             # 收到 m1 就先查昨收、算漲跌幅，傳到前端之前先算好（不是前端自己拉
@@ -396,6 +474,13 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         print(
             f"  [VWAP突破] {len(vwap_breakouts)} 支跨過VWAP: "
             + " ".join(f"{b['stock_id']}({'突破' if b['direction']=='up' else '跌破'})" for b in vwap_breakouts),
+            flush=True,
+        )
+    if sr_vwap_hits:
+        push_sr_vwap_cross(minute_str, sr_vwap_hits)
+        print(
+            f"  [VWAP+壓力支撐] {len(sr_vwap_hits)} 支: "
+            + " ".join(f"{b['stock_id']}({b['sr_kind']})" for b in sr_vwap_hits),
             flush=True,
         )
 
