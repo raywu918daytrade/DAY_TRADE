@@ -29,10 +29,23 @@ db/adjustment_day vs db/d1，重算 db/adjustment_factor（pattern 專用完整�
 ⚠️ 執行前檢查 finmind 的 backfill_tick 有沒有還在跑同一個月份（兩邊都會寫
 db/tick/{year}_{month}.parquet，同時處理同一個月可能互相覆蓋遺失資料，
 見 finmind/backfill_tick_history.py 的相關說明）。
+
+2026-08-15加：週末（六、日）直接跳過整個pipeline，不執行。原因：m1/d1
+的gap判斷本來就有保護（週末查「今天」一律回傳「尚無今日資料」，不會
+誤標記flag，見 data/day_data_loader.py::_expected_prior_trading_day()），
+但 fubon/tick_api.py::fetch_trades_today() 底層的富邦 intraday.trades
+端點不是用日期查詢、而是回傳「最近一個session」的成交明細——實測發現
+週六執行時，這支端點把上週五的成交資料又完整回傳一次（1878支全部
+「有資料」，不是空的），導致tick階段白白重跑一次上週五早就抓過的資料
+（實測多花約32分鐘、上千次API請求），雖然merge+dedupe邏輯正確、沒有
+造成資料損毀，但完全是浪費。刻意只擋六日，不做完整假日行事曆（跟
+`_expected_prior_trading_day()` 的設計理由一致：國定假日隔天最多只是
+沒享受到快路徑，這裡最多只是沒省到週末的浪費，都是安全的失敗方式）。
 """
 
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -46,7 +59,12 @@ from data.build_tick_adjust_factor import build as build_tick_adjust_factor
 from data.build_adjustment_factor import build as build_adjustment_factor
 from fubon.tick_api import update_tick_today
 
+_TW = timezone(timedelta(hours=8))
+
 if __name__ == "__main__":
+    if datetime.now(_TW).weekday() >= 5:  # 5=Saturday, 6=Sunday
+        print("今天是週末（台北時間），非交易日，跳過整個pipeline")
+        sys.exit(0)
     print("=== 下載 1 分鐘K ===")
     update_m1()
     print("=== 下載日K（原始，db/d1）===")

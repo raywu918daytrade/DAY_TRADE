@@ -18,7 +18,6 @@ import uuid
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
-import numpy as np
 import pandas as pd
 
 from pattern.abcd_bear.detector import AbcdBearDetector
@@ -98,73 +97,50 @@ _SCAN_CACHE: Dict[tuple, Dict[str, Any]] = {}
 _DETAIL_CACHE: Dict[tuple, Dict[str, Any]] = {}
 
 
-def _envelope_sr_lines(df: pd.DataFrame, to_epoch) -> List[Dict[str, Any]]:
-    """日K 包絡壓力／支撐，不要求三角收斂過關。
+def _horizontal_sr_lines(df: pd.DataFrame, to_epoch) -> List[Dict[str, Any]]:
+    """日K 橫向壓力／支撐（雙轉折水平線），不要求型態過關。
 
-    股票清單 m1/m3/m5 疊圖用：三角偵測常常分數不夠、pattern.lines 是空的，
-    圖上就完全沒線。這裡用同一套 pivot + envelope（貼外側高點／低點），
-    只取最近 3 個峰／谷，線畫到最新一根日K，幾乎都會有線可疊。
+    股票清單日K／分K 疊圖用：跟 VWAP+壓力支撐同一套 horizontal_sr_prices。
     """
-    if df is None or df.empty or len(df) < 20:
+    from pattern.horizontal_sr import horizontal_sr_prices
+
+    if df is None or df.empty or len(df) < 25:
         return []
-    det = DETECTORS["triangle"]
     sub = df.iloc[-120:].reset_index(drop=True)
-    n = len(sub)
-    pivots = det._filter_alternating_pivots(det._extract_raw_pivots(sub))
-    peaks = [p for p in pivots if p.type == "peak"]
-    troughs = [p for p in pivots if p.type == "trough"]
-    if len(peaks) >= 3:
-        peaks = peaks[-3:]
-    if len(troughs) >= 3:
-        troughs = troughs[-3:]
-    if len(peaks) < 2 or len(troughs) < 2:
+    res, sup = horizontal_sr_prices(sub)
+    if res is None and sup is None:
         return []
 
-    p1, p_last = peaks[0], peaks[-1]
-    dx_u = p_last.index - p1.index
-    if dx_u <= 0:
+    start_date = str(sub["date"].iloc[0])
+    end_date = str(sub["date"].iloc[-1])
+    try:
+        t_start = to_epoch(pd.Timestamp(start_date))
+        t_end = to_epoch(pd.Timestamp(end_date))
+    except Exception:
         return []
-    slope_u = (p_last.price - p1.price) / float(dx_u)
-    intercept_u = p1.price - slope_u * p1.index
-    diffs_u = np.array([p.price for p in peaks]) - (slope_u * np.array([p.index for p in peaks]) + intercept_u)
-    max_diff_u = float(np.max(diffs_u))
-    if max_diff_u > 0:
-        intercept_u += max_diff_u
 
-    t1, t_last = troughs[0], troughs[-1]
-    dx_l = t_last.index - t1.index
-    if dx_l <= 0:
-        return []
-    slope_l = (t_last.price - t1.price) / float(dx_l)
-    intercept_l = t1.price - slope_l * t1.index
-    diffs_l = (slope_l * np.array([p.index for p in troughs]) + intercept_l) - np.array([p.price for p in troughs])
-    max_diff_l = float(np.max(diffs_l))
-    if max_diff_l > 0:
-        intercept_l -= max_diff_l
-
-    end_idx = n - 1
-
-    def _line(start_idx: int, slope: float, intercept: float, line_type: str) -> Optional[Dict[str, Any]]:
-        start_date = str(sub["date"].iloc[start_idx])
-        end_date = str(sub["date"].iloc[end_idx])
-        try:
-            t_start = to_epoch(pd.Timestamp(start_date))
-            t_end = to_epoch(pd.Timestamp(end_date))
-        except Exception:
-            return None
-        return {
-            "start_time": t_start,
-            "end_time": t_end,
-            "start_price": round(float(slope * start_idx + intercept), 2),
-            "end_price": round(float(slope * end_idx + intercept), 2),
-            "line_type": line_type,
-        }
-
-    lines = [
-        _line(int(p1.index), slope_u, intercept_u, "resistance"),
-        _line(int(t1.index), slope_l, intercept_l, "support"),
-    ]
-    return [l for l in lines if l is not None]
+    lines: List[Dict[str, Any]] = []
+    if res is not None:
+        lines.append(
+            {
+                "start_time": t_start,
+                "end_time": t_end,
+                "start_price": round(float(res), 2),
+                "end_price": round(float(res), 2),
+                "line_type": "resistance",
+            }
+        )
+    if sup is not None:
+        lines.append(
+            {
+                "start_time": t_start,
+                "end_time": t_end,
+                "start_price": round(float(sup), 2),
+                "end_price": round(float(sup), 2),
+                "line_type": "support",
+            }
+        )
+    return lines
 
 
 @router.post("/cache/clear", summary="手動清空 Pattern 快取")
@@ -577,12 +553,11 @@ def get_pattern_detail(
 
         pattern_output = pattern_dict
 
-    # 日K 包絡壓力／支撐：不綁型態掃描。分K 疊圖要的是「最近日K結構的
-    # 上下軌」，三角沒過關也要有線。
+    # 日K 橫向壓力／支撐：不綁型態掃描。分K 疊圖要的是「反覆碰到的水平水位」。
     sr_lines_output: List[Dict[str, Any]] = []
     if timeframe == "day":
         try:
-            sr_lines_output = _envelope_sr_lines(df_candles, tw_naive_to_epoch)
+            sr_lines_output = _horizontal_sr_lines(df_candles, tw_naive_to_epoch)
         except Exception:
             sr_lines_output = []
 

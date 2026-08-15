@@ -332,9 +332,9 @@ def _watchlist_prev_close(stock_id: str, date_str: str) -> float | None:
 
 
 def _refresh_sr_levels(date_str: str):
-    """換日／開機：用 D 之前日K 算包絡壓力／支撐，盤中不重算。"""
+    """換日／開機：用 D 之前日K 算橫向壓力／支撐，盤中不重算。"""
     from data.adjustment_query import load_pattern_day
-    from pattern.envelope import envelope_sr_prices
+    from pattern.horizontal_sr import horizontal_sr_prices
 
     stocks = {str(s) for s in (state.day_trade_stocks or state.tickers.keys())}
     if not stocks:
@@ -342,7 +342,7 @@ def _refresh_sr_levels(date_str: str):
         state.sr_levels_date = date_str
         return
     hist_start = (pd.Timestamp(date_str) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
-    print(f"[SR水位] 預先計算包絡 {len(stocks)} 檔（日K < {date_str}）…", flush=True)
+    print(f"[SR水位] 預先計算橫向壓力/支撐 {len(stocks)} 檔（日K < {date_str}）…", flush=True)
     day = load_pattern_day(start_date=hist_start, end_date=date_str)
     if day.empty:
         state.sr_levels = {}
@@ -357,8 +357,8 @@ def _refresh_sr_levels(date_str: str):
         if sid not in stocks:
             continue
         hist = g.loc[g["date"] < cutoff]
-        res, sup = envelope_sr_prices(hist)
-        if res is not None:
+        res, sup = horizontal_sr_prices(hist)
+        if res is not None or sup is not None:
             levels[sid] = (res, sup)
     state.sr_levels = levels
     state.sr_levels_date = date_str
@@ -453,8 +453,16 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                         sr = state.sr_levels.get(sid)
                         if sr:
                             res, sup = sr
-                            res_x = bool(np.any((closes[:-1] >= res) != (closes[1:] >= res)))
-                            sup_x = bool(np.any((closes[:-1] >= sup) != (closes[1:] >= sup)))
+                            res_x = False
+                            if res is not None:
+                                res_x = bool(
+                                    np.any((closes[:-1] >= res) != (closes[1:] >= res))
+                                )
+                            sup_x = False
+                            if sup is not None:
+                                sup_x = bool(
+                                    np.any((closes[:-1] >= sup) != (closes[1:] >= sup))
+                                )
                             if res_x or sup_x:
                                 if res_x and sup_x:
                                     sr_kind = "both"
@@ -471,8 +479,8 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                                         "vwap_dir": vwap_dir,
                                         "price": round(float(closes[-1]), 2),
                                         "vwap": round(float(vwap[-1]), 2),
-                                        "resistance": round(float(res), 2),
-                                        "support": round(float(sup), 2),
+                                        "resistance": round(float(res), 2) if res is not None else None,
+                                        "support": round(float(sup), 2) if sup is not None else None,
                                     }
                                 )
                                 state.sr_vwap_fired_today.add(sid)

@@ -23,7 +23,7 @@ import pandas as pd
 
 from data.adjustment_query import load_pattern_day, load_pattern_m1
 from finmind.tick_universe import load_tick_universe
-from pattern.envelope import envelope_sr_prices
+from pattern.horizontal_sr import horizontal_sr_prices
 
 FRICTION = 0.0045  # 0.45%，跟其他 strategy_test 一致
 SESSION_START = dtime(9, 0)
@@ -84,18 +84,18 @@ def _build_sr_map(
         g = g.sort_values("date")
         for d in event_dates:
             hist = g.loc[g["date"] < d]
-            res, sup = envelope_sr_prices(hist)
-            if res is None:
+            res, sup = horizontal_sr_prices(hist)
+            if res is None and sup is None:
                 continue
             out[(str(sid), pd.Timestamp(d).strftime("%Y-%m-%d"))] = (res, sup)
         done += 1
         if done % 50 == 0:
-            print(f"  包絡 {done}/{n_stocks} 檔…", flush=True)
+            print(f"  橫向水位 {done}/{n_stocks} 檔…", flush=True)
     return out
 
 
 def _events_for_day(
-    g: pd.DataFrame, res: float, sup: float
+    g: pd.DataFrame, res: float | None, sup: float | None
 ) -> list[dict]:
     g = _session_slice(g).sort_values("date")
     if len(g) < 3:
@@ -106,14 +106,16 @@ def _events_for_day(
     cum_vol = np.cumsum(vols)
     cum_pv = np.cumsum(closes * vols)
     vwap = np.divide(cum_pv, cum_vol, out=np.full_like(cum_pv, np.nan), where=cum_vol > 0)
-    res_arr = np.full_like(closes, res)
-    sup_arr = np.full_like(closes, sup)
 
     # 上：收盤由下往上穿越支撐（突破支撐）且穿越 VWAP
     # 下：收盤由上往下跌破壓力（跌破壓力）且跌破 VWAP
-    i_sup_up = _first_cross_idx(closes, sup_arr, "up")
+    i_sup_up = None
+    if sup is not None:
+        i_sup_up = _first_cross_idx(closes, np.full_like(closes, sup), "up")
     i_vwap_up = _first_cross_idx(closes, vwap, "up")
-    i_res_dn = _first_cross_idx(closes, res_arr, "down")
+    i_res_dn = None
+    if res is not None:
+        i_res_dn = _first_cross_idx(closes, np.full_like(closes, res), "down")
     i_vwap_dn = _first_cross_idx(closes, vwap, "down")
 
     day_close = float(closes[-1])
@@ -206,9 +208,9 @@ def run(start_date: str, end_date: str) -> pd.DataFrame:
     m1 = m1.copy()
     m1["day"] = m1["date"].dt.normalize()
     event_dates = sorted(m1["day"].unique())
-    print(f"交易日 {len(event_dates)} 天，算包絡壓力/支撐…", flush=True)
+    print(f"交易日 {len(event_dates)} 天，算橫向壓力/支撐…", flush=True)
     sr_map = _build_sr_map(day, list(event_dates), stocks)
-    print(f"  有包絡的 stock-day {len(sr_map):,}", flush=True)
+    print(f"  有水位的 stock-day {len(sr_map):,}", flush=True)
 
     recs = []
     n_groups = 0

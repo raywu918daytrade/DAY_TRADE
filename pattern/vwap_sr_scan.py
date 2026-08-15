@@ -11,10 +11,10 @@ import threading
 import numpy as np
 import pandas as pd
 
-from pattern.envelope import envelope_sr_prices
+from pattern.horizontal_sr import horizontal_sr_prices
 
 _scan_cache: dict[str, tuple[list, list]] = {}
-_sr_levels_cache: dict[str, dict[str, tuple[float, float]]] = {}
+_sr_levels_cache: dict[str, dict[str, tuple[float | None, float | None]]] = {}
 _names_cache: dict[str, str] | None = None
 _scan_lock = threading.Lock()
 
@@ -65,8 +65,8 @@ def load_day_m1(date_str: str) -> pd.DataFrame:
 
 def sr_levels_for_date(
     date_str: str, stocks: set[str]
-) -> dict[str, tuple[float, float]]:
-    """D 之前日K 包絡壓力／支撐，與 live_trader._refresh_sr_levels 相同。"""
+) -> dict[str, tuple[float | None, float | None]]:
+    """D 之前日K 橫向壓力／支撐，與 live_trader._refresh_sr_levels 相同。"""
     if date_str in _sr_levels_cache:
         cached = _sr_levels_cache[date_str]
         return {sid: cached[sid] for sid in stocks if sid in cached}
@@ -84,12 +84,12 @@ def sr_levels_for_date(
     day = day.copy()
     day["stock_id"] = day["stock_id"].astype(str)
     cutoff = pd.Timestamp(date_str)
-    levels: dict[str, tuple[float, float]] = {}
+    levels: dict[str, tuple[float | None, float | None]] = {}
     for sid, g in day.groupby("stock_id", sort=False):
         sid = str(sid)
         hist = g.loc[g["date"] < cutoff]
-        res, sup = envelope_sr_prices(hist)
-        if res is not None:
+        res, sup = horizontal_sr_prices(hist)
+        if res is not None or sup is not None:
             levels[sid] = (res, sup)
     _sr_levels_cache[date_str] = levels
     return {sid: levels[sid] for sid in stocks if sid in levels}
@@ -149,9 +149,11 @@ def scan_day_events(
             continue
         res, sup = sr
         res_flip = np.zeros(len(closes), dtype=bool)
-        res_flip[1:] = (closes[1:] >= res) != (closes[:-1] >= res)
+        if res is not None:
+            res_flip[1:] = (closes[1:] >= res) != (closes[:-1] >= res)
         sup_flip = np.zeros(len(closes), dtype=bool)
-        sup_flip[1:] = (closes[1:] >= sup) != (closes[:-1] >= sup)
+        if sup is not None:
+            sup_flip[1:] = (closes[1:] >= sup) != (closes[:-1] >= sup)
         sr_flip = res_flip | sup_flip
         if not sr_flip.any():
             continue
@@ -174,8 +176,8 @@ def scan_day_events(
                 "vwap_dir": "up" if closes[fire] >= vwap[fire] else "down",
                 "price": round(float(closes[fire]), 2),
                 "vwap": round(float(vwap[fire]), 2),
-                "resistance": round(float(res), 2),
-                "support": round(float(sup), 2),
+                "resistance": round(float(res), 2) if res is not None else None,
+                "support": round(float(sup), 2) if sup is not None else None,
                 "time": _hhmm(times[fire]),
             }
         )
