@@ -1,17 +1,21 @@
 """盤後一次掃全日 m1，還原 VWAP突破 / VWAP+壓力支撐（規則同 live_trader.on_minute）。
 
 不模擬時鐘；db/m1_live/{date}.parquet 本來就留檔。盤中仍走 on_minute 增量推
-SSE，這裡只給 GET ?date= 用。
+SSE，這裡只給 GET ?date= 用。重現 universe=daytrade|full 對齊
+GET /api/pattern/stocks/daytrade、/stocks/full 那兩份清單。
 """
 
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from pattern.horizontal_sr import horizontal_sr_prices
+
+_ROOT = Path(__file__).resolve().parent.parent
 
 _scan_cache: dict[tuple[str, str], tuple[list, list]] = {}
 _sr_levels_cache: dict[str, dict[str, tuple[float | None, float | None]]] = {}
@@ -41,7 +45,29 @@ def _name_map() -> dict[str, str]:
 
 
 def normalize_universe(universe: str | None) -> str:
-    return "full" if str(universe or "").strip().lower() == "full" else "tick"
+    """正式值 daytrade / full；舊 tick 當 daytrade 別名。"""
+    v = str(universe or "").strip().lower()
+    return "full" if v == "full" else "daytrade"
+
+
+def _parquet_stock_ids(path: Path) -> set[str]:
+    try:
+        df = pd.read_parquet(path, columns=["stock_id"])
+    except Exception:
+        return set()
+    if df is None or df.empty:
+        return set()
+    return set(df["stock_id"].astype(str))
+
+
+def stock_ids_for_universe(universe: str | None) -> set[str]:
+    """daytrade＝subscribe_list；full＝stock_universe_2000 ∪ daytrade（0050）。"""
+    universe = normalize_universe(universe)
+    daytrade = _parquet_stock_ids(_ROOT / "db/fubon_subscribe/subscribe_list.parquet")
+    if universe == "full":
+        full = _parquet_stock_ids(_ROOT / "db/tickers/stock_universe_2000.parquet")
+        return full | daytrade
+    return daytrade
 
 
 def _from_m1_live(date_str: str) -> pd.DataFrame:
@@ -69,20 +95,32 @@ def _from_pattern_m1(date_str: str) -> pd.DataFrame:
     return m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
-def load_day_m1(date_str: str, universe: str = "tick") -> pd.DataFrame:
-    """tick：優先 db/m1_live（盤中訂閱 ~400 檔）。
-    full：走 db/m1 全市場；沒檔才退回 m1_live（重現才有多出來的列）。"""
+def _filter_m1(m1: pd.DataFrame, universe: str) -> pd.DataFrame:
+    ids = stock_ids_for_universe(universe)
+    if not ids:
+        if m1 is None or m1.empty:
+            return m1 if m1 is not None else pd.DataFrame()
+        return m1.iloc[0:0].copy()
+    if m1 is None or m1.empty:
+        return m1 if m1 is not None else pd.DataFrame()
+    return m1[m1["stock_id"].astype(str).isin(ids)].reset_index(drop=True)
+
+
+def load_day_m1(date_str: str, universe: str = "daytrade") -> pd.DataFrame:
+    """daytrade：優先 db/m1_live，再卡住今天 subscribe_list。
+    full：優先 db/m1，卡住 stock_universe_2000 ∪ 當沖代號。
+    清單空＝不掃；清單有、該日沒 1 分 K＝不列。"""
     universe = normalize_universe(universe)
     if universe == "full":
         m1 = _from_pattern_m1(date_str)
-        if not m1.empty:
-            return m1
-        return _from_m1_live(date_str)
+        if m1.empty:
+            m1 = _from_m1_live(date_str)
+        return _filter_m1(m1, universe)
 
     live = _from_m1_live(date_str)
-    if not live.empty:
-        return live
-    return _from_pattern_m1(date_str)
+    if live.empty:
+        live = _from_pattern_m1(date_str)
+    return _filter_m1(live, universe)
 
 
 def sr_levels_for_date(
@@ -254,7 +292,7 @@ def scan_day_events(
     return vwap_events, sr_events
 
 
-def scan_date(date_str: str, universe: str = "tick") -> tuple[list, list]:
+def scan_date(date_str: str, universe: str = "daytrade") -> tuple[list, list]:
     """掃某一曆日，回傳 (vwap_breakouts, sr_vwap_hits)。過去日期 cache 事件；
     今日每次重算（m1_live 可能還在寫），SR 水位仍 cache。"""
     universe = normalize_universe(universe)

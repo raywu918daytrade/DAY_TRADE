@@ -108,11 +108,11 @@ def divs_map_from_m1(m1: pd.DataFrame) -> dict[str, dict]:
     return out
 
 
-def _compute(date_str: str, universe: str = "tick") -> dict[str, dict]:
+def _compute(date_str: str, universe: str = "daytrade") -> dict[str, dict]:
     return divs_map_from_m1(load_day_m1(date_str, universe=universe))
 
 
-def metrics_for_date(date_str: str, universe: str = "tick") -> dict[str, dict]:
+def metrics_for_date(date_str: str, universe: str = "daytrade") -> dict[str, dict]:
     universe = normalize_universe(universe)
     key = (date_str, universe)
     today = datetime.now(_TW).strftime("%Y-%m-%d")
