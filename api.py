@@ -1202,6 +1202,21 @@ def vwap_activity(date: Optional[str] = None):
 
 
 @app.get(
+    "/vwap_macd_div",
+    tags=["訊號"],
+    summary="VWAP 表 MACD 柱體背離燈：每股當日第一次底／頂背離時間",
+)
+def vwap_macd_div(date: Optional[str] = None):
+    """每股一筆。time 為 HH:MM（右極值確認根）；kind 為 bull／bear／both。"""
+    date_str = date or datetime.now(_TW).strftime("%Y-%m-%d")
+    from pattern.vwap_macd_div import metrics_for_date
+
+    stocks = metrics_for_date(date_str)
+    print(f"[GET /vwap_macd_div] date={date_str} {len(stocks)} 檔", flush=True)
+    return {"date": date_str, "stocks": stocks}
+
+
+@app.get(
     "/strategies",
     tags=["訊號"],
     summary="目前啟用的策略清單（給前端動態渲染幾個模型的面板用）",
