@@ -83,6 +83,7 @@ from api import (
     push_signals,
     push_sr_vwap_cross,
     push_vwap_breakout,
+    push_vwap_macd_div,
     register_vwap_sr_catchup_hook,
     set_strategies,
     tw_naive_to_epoch,
@@ -400,9 +401,11 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     # push_conflict_signals() 同一種「這分鐘的結果一次送一批」節奏。
     vwap_breakouts = []
     sr_vwap_hits = []
+    macd_by_sid: dict = {}
 
     if not m1_live.empty:
         from pattern.vwap_sr_scan import events_for_group
+        from pattern.vwap_macd_div import all_divs_for_group
 
         hhmm = minute_str[11:16]
         for sid, g in m1_live.groupby("stock_id"):
@@ -422,6 +425,10 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                 )
             push_candles(str(sid), candles)
             sid = str(sid)
+
+            macd_evs = all_divs_for_group(g)
+            if macd_evs:
+                macd_by_sid[sid] = {"events": macd_evs}
 
             # VWAP 只算一次：突破欄每次變號一筆；壓力/支撐同一套規則可重複。
             if len(g) >= 2:
@@ -465,6 +472,8 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             + " ".join(f"{b['stock_id']}({b['sr_kind']})" for b in sr_vwap_hits),
             flush=True,
         )
+    if not m1_live.empty:
+        push_vwap_macd_div(minute_str, macd_by_sid)
 
     from api import get_setting
 

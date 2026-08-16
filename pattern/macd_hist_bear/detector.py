@@ -4,12 +4,13 @@ MACD 柱體頂背離 (Bearish Histogram Divergence) 型態檢測器
 硬性條件：
 1. MACD(12,26,9) histogram = DIF − DEA
 2. 柱體局部高點：左右各 L 根嚴格更高
-3. 連續兩處柱體高點 p1 < p2：
-   - price high[p2] > high[p1]（價創新高）
-   - hist[p2] < hist[p1]（柱體降低）
-   - hist[p1] ≥ 0 且 hist[p2] ≥ 0
-4. 兩點間距 ∈ [min_dist, max_dist]
-5. 右頂 p2 距最後一根 ≤ max_age
+3. 價格轉折高點：K 線 high 左右各 L 根更低；可與柱體峰差最多 L 根
+   （不是當下收盤對當下柱）
+4. 連續兩處確認後的紅柱峰 h1 < h2：
+   - 對應價格高點創新高
+   - hist[h2] < hist[h1]（柱體降低）
+   - (h1, h2) 中間至少一根綠柱 → 紅綠紅
+5. 兩柱峰間距 ∈ [min_dist, max_dist]；右峰距最後一根 ≤ max_age
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from pattern.base import BasePatternDetector, PatternResult, PivotPoint, TrendLine
-from pattern.macd_hist_bull.detector import macd_histogram
+from pattern.macd_hist_bull.detector import iter_macd_hist_div_pairs, macd_histogram
 
 
 class MacdHistBearDetector(BasePatternDetector):
@@ -94,36 +95,34 @@ class MacdHistBearDetector(BasePatternDetector):
         dates = sub["date"].astype(str).to_numpy()
         hist = macd_histogram(close, self.macd_fast, self.macd_slow, self.macd_signal)
 
-        peaks = self._hist_peaks(hist)
-        if len(peaks) < 2:
-            return None
-
         latest_idx = n - 1
-        best: Optional[Tuple[float, int, int]] = None
+        best: Optional[Tuple[float, dict]] = None
 
-        for j in range(1, len(peaks)):
-            p1, p2 = peaks[j - 1], peaks[j]
-            dist = p2 - p1
-            if not (self.min_dist <= dist <= self.max_dist):
+        for pair in iter_macd_hist_div_pairs(
+            hist, highs, sub["low"].astype(float).to_numpy(),
+            side="bear",
+            pivot_l=self.pivot_l,
+            min_dist=self.min_dist,
+            max_dist=self.max_dist,
+        ):
+            if latest_idx - pair["h2"] > self.max_age:
                 continue
-            if latest_idx - p2 > self.max_age:
-                continue
-            h1, h2 = float(hist[p1]), float(hist[p2])
-            if h1 < 0 or h2 < 0:
-                continue
-            hi1, hi2 = float(highs[p1]), float(highs[p2])
-            if not (hi2 > hi1 and h2 < h1):
-                continue
-            score = self._score(p1, p2, hi1, hi2, h1, h2, latest_idx)
+            score = self._score(
+                pair["h1"], pair["h2"],
+                pair["price1"], pair["price2"],
+                pair["hist1"], pair["hist2"],
+                latest_idx,
+            )
             if best is None or score > best[0]:
-                best = (score, p1, p2)
+                best = (score, pair)
 
         if best is None:
             return None
 
-        score, p1, p2 = best
-        hi1, hi2 = float(highs[p1]), float(highs[p2])
-        h1, h2 = float(hist[p1]), float(hist[p2])
+        score, pair = best
+        p1, p2 = pair["p1"], pair["p2"]
+        hi1, hi2 = pair["price1"], pair["price2"]
+        h1, h2 = pair["hist1"], pair["hist2"]
 
         pivots = [
             PivotPoint(index=p1, date=str(dates[p1]), price=hi1, type="peak"),
@@ -158,9 +157,9 @@ class MacdHistBearDetector(BasePatternDetector):
             details={
                 "hist1": round(h1, 6),
                 "hist2": round(h2, 6),
-                "dist_bars": int(p2 - p1),
-                "p1_index": int(p1),
-                "p2_index": int(p2),
+                "dist_bars": int(pair["h2"] - pair["h1"]),
+                "p1_index": int(pair["h1"]),
+                "p2_index": int(pair["h2"]),
                 "price1": round(hi1, 4),
                 "price2": round(hi2, 4),
             },

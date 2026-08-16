@@ -325,6 +325,7 @@ _consensus_signals: list = []  # 今日「多個策略的前N名重疊」記錄�
 _conflict_signals: list = []  # 今日「多空衝突（反轉）」記錄，見 push_conflict_signals()
 _vwap_breakout_signals: list = []  # 今日「VWAP突破/跌破」記錄，見 push_vwap_breakout()
 _sr_vwap_cross_signals: list = []  # 今日「VWAP + 壓力/支撐穿越」記錄，見 push_sr_vwap_cross()
+_vwap_macd_live: dict | None = None  # 今日 MACD 背離（on_minute 每分鐘覆寫）
 _strategies_registry: dict = {"strategies": [], "consensus_top_n": 0}  # 見 set_strategies()
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
@@ -420,7 +421,7 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals, _sr_vwap_cross_signals
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals, _sr_vwap_cross_signals, _vwap_macd_live
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -438,6 +439,7 @@ def _reset_if_new_day():
         _conflict_signals.clear()
         _vwap_breakout_signals.clear()
         _sr_vwap_cross_signals.clear()
+        _vwap_macd_live = None
         _summary = dict(_SUMMARY_DEFAULT)
 
 
@@ -744,6 +746,17 @@ def push_sr_vwap_cross(minute_str: str, hits: list):
             fresh.append(h)
         if fresh:
             _broadcast({"type": "sr_vwap_cross", "minute": minute_str[11:16], "data": fresh})
+
+
+def push_vwap_macd_div(minute_str: str, stocks: dict):
+    """盤中每分鐘覆寫今日 MACD 柱體背離（每股 events 有效窗）。前端靠 SSE 重拉。"""
+    global _vwap_macd_live
+    n = sum(len(v.get("events") or []) for v in (stocks or {}).values())
+    print(f"[push_vwap_macd_div] {minute_str} {len(stocks)} 檔 / {n} 筆背離", flush=True)
+    with _lock:
+        _reset_if_new_day()
+        _vwap_macd_live = stocks or {}
+    _broadcast({"type": "vwap_macd_div", "minute": minute_str[11:16]})
 
 
 def push_candles(stock_id: str, candles: list):
@@ -1088,11 +1101,11 @@ def conflict_today():
         return list(reversed(_conflict_signals))  # 最新在上
 
 
-def _scan_vwap_sr(date_str: str) -> tuple[list, list]:
+def _scan_vwap_sr(date_str: str, universe: str = "tick") -> tuple[list, list]:
     """盤後一次掃全日 m1（pattern/vwap_sr_scan.py），不寫記憶體、不廣播 SSE。"""
     from pattern.vwap_sr_scan import scan_date
 
-    vwap, sr = scan_date(date_str)
+    vwap, sr = scan_date(date_str, universe=universe)
     return list(reversed(vwap)), list(reversed(sr))
 
 
@@ -1114,19 +1127,24 @@ def _sync_live_vwap_sr_sets(vwap: list, sr: list):
 
 def _catchup_today_into_memory() -> tuple[list, list]:
     """掃今日 m1，覆寫盤中記憶體（補開機前缺口），之後 on_minute 繼續 append。"""
+    global _vwap_macd_live
     today = datetime.now(_TW).strftime("%Y-%m-%d")
     from pattern.vwap_sr_scan import scan_date
 
     vwap, sr = scan_date(today)
+    from pattern.vwap_macd_div import metrics_for_date as macd_metrics
+
+    macd = macd_metrics(today)
     with _lock:
         _reset_if_new_day()
         _vwap_breakout_signals.clear()
         _vwap_breakout_signals.extend(vwap)
         _sr_vwap_cross_signals.clear()
         _sr_vwap_cross_signals.extend(sr)
+        _vwap_macd_live = macd
     _sync_live_vwap_sr_sets(vwap, sr)
     print(
-        f"[vwap_sr_catchup] {today} 寫入記憶體 VWAP {len(vwap)} 筆 / SR {len(sr)} 筆",
+        f"[vwap_sr_catchup] {today} 寫入記憶體 VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / MACD {len(macd)} 檔",
         flush=True,
     )
     return list(reversed(vwap)), list(reversed(sr))
@@ -1137,11 +1155,14 @@ def _catchup_today_into_memory() -> tuple[list, list]:
     tags=["訊號"],
     summary="今日「VWAP突破/跌破」訊號列表",
 )
-def vwap_breakout_today(date: Optional[str] = None):
-    """date 有值時從 db/m1_live（或 db/m1）一次掃那一天；沒帶則回盤中記憶體。"""
+def vwap_breakout_today(date: Optional[str] = None, universe: str = "tick"):
+    """date 有值時掃那一天（universe=full 走 db/m1 全市場）；沒帶則回盤中記憶體。"""
     if date:
-        vwap, _ = _scan_vwap_sr(date)
-        print(f"[GET /vwap_breakout/today] date={date} 掃出 {len(vwap)} 筆", flush=True)
+        vwap, _ = _scan_vwap_sr(date, universe=universe)
+        print(
+            f"[GET /vwap_breakout/today] date={date} universe={universe} 掃出 {len(vwap)} 筆",
+            flush=True,
+        )
         return vwap
     print(f"[GET /vwap_breakout/today] 回傳 {len(_vwap_breakout_signals)} 筆VWAP突破訊號", flush=True)
     with _lock:
@@ -1153,11 +1174,14 @@ def vwap_breakout_today(date: Optional[str] = None):
     tags=["訊號"],
     summary="今日「VWAP + 壓力/支撐穿越」訊號列表",
 )
-def sr_vwap_cross_today(date: Optional[str] = None):
+def sr_vwap_cross_today(date: Optional[str] = None, universe: str = "tick"):
     """date 有值（dashboard「重現」）時掃全日 m1；沒帶則回盤中記憶體。"""
     if date:
-        _, sr = _scan_vwap_sr(date)
-        print(f"[GET /sr_vwap_cross/today] date={date} 掃出 {len(sr)} 筆", flush=True)
+        _, sr = _scan_vwap_sr(date, universe=universe)
+        print(
+            f"[GET /sr_vwap_cross/today] date={date} universe={universe} 掃出 {len(sr)} 筆",
+            flush=True,
+        )
         return sr
     print(f"[GET /sr_vwap_cross/today] 回傳 {len(_sr_vwap_cross_signals)} 筆", flush=True)
     with _lock:
@@ -1179,10 +1203,14 @@ def vwap_sr_catchup():
     tags=["訊號"],
     summary="盤後一次掃某日 m1，同時回 VWAP突破 與 VWAP+壓力支撐",
 )
-def vwap_sr_replay(date: str):
+def vwap_sr_replay(date: str, universe: str = "tick"):
     """dashboard「重現」用：同一輪掃描回兩欄，避免打兩次 endpoint 重複算包絡。"""
-    vwap, sr = _scan_vwap_sr(date)
-    print(f"[GET /vwap_sr_replay] date={date} VWAP {len(vwap)} 筆 / SR {len(sr)} 筆", flush=True)
+    vwap, sr = _scan_vwap_sr(date, universe=universe)
+    print(
+        f"[GET /vwap_sr_replay] date={date} universe={universe} "
+        f"VWAP {len(vwap)} 筆 / SR {len(sr)} 筆",
+        flush=True,
+    )
     return {"vwap": vwap, "sr": sr}
 
 
@@ -1204,15 +1232,26 @@ def vwap_activity(date: Optional[str] = None):
 @app.get(
     "/vwap_macd_div",
     tags=["訊號"],
-    summary="VWAP 表 MACD 柱體背離燈：每股當日第一次底／頂背離時間",
+    summary="VWAP 表 MACD 柱體背離：每股當日有效窗內的底／頂背離",
 )
-def vwap_macd_div(date: Optional[str] = None):
-    """每股一筆。time 為 HH:MM（右極值確認根）；kind 為 bull／bear／both。"""
+def vwap_macd_div(date: Optional[str] = None, universe: str = "tick"):
+    """每股 {events:[{time, until, kind, legs,...}]}。time～until 為 HH:MM 有效窗。
+    今日盤中優先回 live_trader 每分鐘寫入的記憶體（僅訂閱當沖）。"""
     date_str = date or datetime.now(_TW).strftime("%Y-%m-%d")
+    today = datetime.now(_TW).strftime("%Y-%m-%d")
+    if date_str == today:
+        with _lock:
+            if _vwap_macd_live is not None:
+                stocks = _vwap_macd_live
+                print(f"[GET /vwap_macd_div] live date={date_str} {len(stocks)} 檔", flush=True)
+                return {"date": date_str, "stocks": stocks}
     from pattern.vwap_macd_div import metrics_for_date
 
-    stocks = metrics_for_date(date_str)
-    print(f"[GET /vwap_macd_div] date={date_str} {len(stocks)} 檔", flush=True)
+    stocks = metrics_for_date(date_str, universe=universe)
+    print(
+        f"[GET /vwap_macd_div] date={date_str} universe={universe} {len(stocks)} 檔",
+        flush=True,
+    )
     return {"date": date_str, "stocks": stocks}
 
 

@@ -2,7 +2,9 @@
 Pattern Recognition API Endpoints (FastAPI Router)
 
 端點：
-- GET  /api/pattern/stocks            股票清單（tick=~400當沖候選、full=~1900全市場，含中文名稱）
+- GET  /api/pattern/stocks/full        全市場股票清單（db/tickers/stock_universe_2000.parquet，~1900檔）
+- GET  /api/pattern/stocks/daytrade    當沖候選股清單（db/fubon_subscribe/subscribe_list.parquet，
+                                        今天實際被富邦WebSocket即時收集的股票池，見該端點的說明）
 - GET  /api/pattern/types             取得可用的技術型態選單清單 (含中文名稱)
 - GET  /api/pattern/scan             過濾篩選特定型態與時區的符合股票清單（同步版本，支援快取）
 - GET  /api/pattern/scan/submit      非同步版本：立刻回傳 job_id，掃描完成後透過 SSE
@@ -71,8 +73,8 @@ except Exception:
     STOCK_NAME_MAP = {}
 
 # 全市場股票清單（db/tickers/stock_universe_2000.parquet，~1900檔，含中文
-# 名稱），供前端「股票清單」欄的 universe=full 選項用（見 GET /stocks）。
-# 跟上面 tick_universe 那份是不同來源、不同數量的股票池，分開載入。
+# 名稱），供前端「股票清單」欄的全市場選項用（見 GET /stocks/full）。跟
+# TICK_UNIVERSE_SET 是不同來源、不同數量的股票池，分開載入。
 try:
     _full_uni_df = pd.read_parquet(
         Path(__file__).parent.parent / "db/tickers/stock_universe_2000.parquet",
@@ -86,11 +88,36 @@ try:
 except Exception:
     FULL_UNIVERSE_LIST = []
 
-# 欄位名故意跟 FULL_UNIVERSE_LIST 一致用 stock_id（不是 id）：前端
-# navMonitoring() 鍵盤上下切換清單統一用 item.stock_id 找目前選到的股票
-# （見 dashboard.html 其他清單，例如 _patternList/_conList 都是這個欄位名），
-# 股票清單欄的清單要跟這個慣例一致，不能自己另外取名。
-TICK_UNIVERSE_LIST = [{"stock_id": sid, "name": name} for sid, name in STOCK_NAME_MAP.items()]
+
+def _load_daytrade_list() -> List[Dict[str, str]]:
+    """讀 db/fubon_subscribe/subscribe_list.parquet——這是 main/premarket.py::
+    refresh_tickers() 每天早上6點實際呼叫 fubon/subscribe_list.py::
+    build_and_save_subscribe_list() 存下來的清單，是「今天實際會被富邦
+    WebSocket即時收集」的股票池，db/m1_live 有哪些股票就是看這份決定的。
+
+    2026-08-19改版：股票清單欄的「當沖候選」選項原本讀
+    db/tickers/tick_universe.parquet（finmind/tick_universe.py 算出來的候選
+    母體快照，篩選/建置頻率是使用者手動決定，不是每天）——這會出現「這支
+    股票明明在清單裡選得到，但今天完全沒有m1資料」的困惑（母體有它，但
+    當天實際訂閱清單沒有它，例如當沖資格臨時被取消），改讀這份「當天實際
+    訂閱清單」才會跟 db/m1_live 的真實內容一致。
+
+    欄位名用 stock_id（不是 id）：跟 FULL_UNIVERSE_LIST/dashboard.html
+    navMonitoring() 的既有慣例一致（見那邊的說明）。每次呼叫都重新讀檔
+    （不像 TICK_UNIVERSE_SET/FULL_UNIVERSE_LIST 是模組載入時讀一次快取
+    起來）——這份清單理論上一天只會被 refresh_tickers() 覆寫一次，但
+    每天什麼時候被覆寫、backend process 什麼時候啟動兩者不保證誰先誰後，
+    重新讀檔確保拿到當下最新版本，讀檔成本可以忽略。"""
+    path = Path(__file__).parent.parent / "db/fubon_subscribe/subscribe_list.parquet"
+    try:
+        df = pd.read_parquet(path, columns=["stock_id", "name"])
+    except Exception:
+        return []
+    return [
+        {"stock_id": str(sid), "name": str(name).strip()}
+        for sid, name in zip(df["stock_id"], df["name"])
+        if pd.notna(name) and str(name).strip()
+    ]
 
 # 記憶體快取 (In-Memory Cache)
 _SCAN_CACHE: Dict[tuple, Dict[str, Any]] = {}
@@ -156,13 +183,20 @@ def clear_pattern_cache() -> Dict[str, Any]:
     }
 
 
-@router.get("/stocks", summary="股票清單（供前端股票清單欄選擇用）")
-def get_stock_list(
-    universe: str = Query("tick", description="tick=當沖候選(~400檔)、full=全市場(~1900檔)"),
-) -> Dict[str, Any]:
-    """回傳指定股票池的代號＋中文名稱清單，供前端「股票清單」欄渲染。"""
-    stocks = FULL_UNIVERSE_LIST if universe == "full" else TICK_UNIVERSE_LIST
-    return {"universe": universe, "stocks": stocks}
+@router.get("/stocks/full", summary="全市場股票清單（供前端股票清單欄選擇用）")
+def get_full_stock_list() -> Dict[str, Any]:
+    """回傳全市場(~1900檔)股票代號＋中文名稱清單，來源
+    db/tickers/stock_universe_2000.parquet，供前端「股票清單」欄渲染。"""
+    return {"universe": "full", "stocks": FULL_UNIVERSE_LIST}
+
+
+@router.get("/stocks/daytrade", summary="當沖候選股清單（供前端股票清單欄選擇用）")
+def get_daytrade_stock_list() -> Dict[str, Any]:
+    """回傳今天實際被富邦WebSocket即時收集的當沖候選股清單（db/m1_live
+    實際涵蓋的股票池就是這份決定的），來源 db/fubon_subscribe/
+    subscribe_list.parquet（main/premarket.py::refresh_tickers() 每天06:00
+    更新，見 _load_daytrade_list() 的說明），供前端「股票清單」欄渲染。"""
+    return {"universe": "daytrade", "stocks": _load_daytrade_list()}
 
 
 @router.get("/types", summary="取得可用的技術型態選單清單")
@@ -238,7 +272,7 @@ def scan_patterns(
     if cache_key in _SCAN_CACHE:
         return _SCAN_CACHE[cache_key]
 
-    # 3. 只讀 tick_universe 母體（~400檔）的 K 線，不要整個市場（~2900檔）
+    # 3. 只讀 tick_universe 母體（上限800檔）的 K 線，不要整個市場（~2900檔）
     # 都讀進來才在下面的迴圈丟掉——這支函式本來就只會對 TICK_UNIVERSE_SET
     # 裡的股票跑型態偵測，intraday（3m/5m）資料量大，先用 stock_ids
     # 篩掉不需要的股票，實測全型態掃描才不會因為讀太多用不到的資料逾時/

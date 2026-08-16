@@ -1,20 +1,29 @@
 """
 富邦當沖候選股清單。
 
-2026-08-01改：候選股母體固定成 db/tickers/tick_universe.parquet（399支排名
-+0050強制併入共400支，見 finmind/tick_universe.py），不再即時打富邦API抓
-全市場~2700支、也不再用20日均量動態排序截斷（400支遠低於WebSocket上限
-1000支，不需要截斷）。訓練（data/m1_data_loader.py、data/day_data_loader.py）
-跟推論/交易統一用同一批固定母體，減少訓練雜訊，也大幅減少每天開盤前的API
-用量/等待時間。
+2026-08-01改：候選股母體固定成 db/tickers/tick_universe.parquet（見
+finmind/tick_universe.py），不再即時打富邦API抓全市場~2700支、也不再用20日
+均量動態排序截斷（母體規模遠低於WebSocket上限1000支，不需要截斷）。訓練
+（data/m1_data_loader.py、data/day_data_loader.py）跟推論/交易統一用同一批
+固定母體，減少訓練雜訊，也大幅減少每天開盤前的API用量/等待時間。
+
+2026-08-17改版：母體規模上限從400調成800、選股邏輯也整個換掉（改成
+db/tickers/stock_universe_2000.parquet全市場~1877支個股，篩「均量>1000張且
+ATR(14)%>1%」，通過的再依富邦當沖資格分「能多空」「只能做多」兩級，能多空
+優先、依均量排序取到上限，見 finmind/tick_universe.py 的說明）。實際跑出來
+的數字是「篩選出來多少算多少」，不強制湊滿800——2026-08-17當天跑出來是
+650支（675支通過均量+ATR篩選，其中623支能多空、26支只能做多，量能+ATR這兩
+個門檻本身就會限制住上限，不是排名/當沖資格不夠）。
 
 固定母體流程（見 subscription_batches()）：
-    1. 讀 db/tickers/tick_universe.parquet 固定400支 + db/tickers/tickers.parquet
+    1. 讀 db/tickers/tick_universe.parquet 固定母體 + db/tickers/tickers.parquet
        本地既有清單查名稱（_fixed_universe_names()，都不觸發即時富邦API）
     2. canDayTrade/canBuyDayTrade 逐支確認（_filter_day_tradable()）——這個
-       還是每天做，確認這400支裡有沒有股票今天被停資/注意處置、不能當沖
+       還是每天做，確認這批候選股裡有沒有股票今天被停資/注意處置、不能當沖
+       （tick_universe.py 建置母體時查的當沖資格分級是「建置當下」的快照，
+       這裡才是每天盤前重新驗證「今天還能不能當沖」，兩層檢查目的不同）
    最後切成每組 ≤200 支、最多 5 組（對應富邦 WebSocket rate limit：
-200 檔/連線、5 條連線 → 上限 1000 檔，400支只會用到2組）。
+200 檔/連線、5 條連線 → 上限 1000 檔，母體800支上限會用到4組）。
 
 舊的動態選股邏輯（_fubon_normal_tickers()/ranked_candidates()/
 all_normal_stocks()）保留在檔案裡沒有刪除，只是目前的日常流程不再呼叫，
@@ -122,12 +131,13 @@ def ranked_candidates(names: dict[str, str]) -> list[str]:
 
 
 def _fixed_universe_names() -> dict[str, str]:
-    """固定候選股母體＋名稱查詢（2026-08-01加）：db/tickers/tick_universe.parquet
-    （399支排名+0050強制併入共400支，見 finmind/tick_universe.py，name欄位
-    2026-08-01一併加進去，不用再另外讀 db/tickers/tickers.parquet）決定「有
-    哪些股票」跟名稱——讀本機檔案，不觸發即時富邦API。取代原本
-    _fubon_normal_tickers()（全市場~2700支）+ ranked_candidates()（20日均量
-    動態排序）這兩步，訓練/推論/交易統一用同一批固定母體。"""
+    """固定候選股母體＋名稱查詢（2026-08-01加，2026-08-17改成上限800支的量能
+    +ATR+當沖資格分級篩選，見 finmind/tick_universe.py 的說明）：讀
+    db/tickers/tick_universe.parquet（name欄位2026-08-01一併加進去，不用再
+    另外讀 db/tickers/tickers.parquet）決定「有哪些股票」跟名稱——讀本機
+    檔案，不觸發即時富邦API。取代原本 _fubon_normal_tickers()（全市場
+    ~2700支）+ ranked_candidates()（20日均量動態排序）這兩步，訓練/推論/
+    交易統一用同一批固定母體。"""
     from finmind.tick_universe import _universe_file_path
 
     df = pd.read_parquet(_universe_file_path(), columns=["stock_id", "name"])
@@ -195,12 +205,13 @@ def subscription_batches(names: dict[str, str]) -> list[list[str]]:
     """把候選股切成 ≤MAX_PER_CONNECTION 支一組，最多 MAX_CONNECTIONS 組
     （富邦 WebSocket 連線本身的 rate limit，定義在 fubon/config.py）。
 
-    2026-08-01改：names 現在固定是 _fixed_universe_names() 的400支（不再是
-    ranked_candidates() 動態均量排序後的結果），這裡直接用 dict 的 key 當
-    候選清單。順序：固定母體 → canDayTrade/canBuyDayTrade 逐支確認，
-    _FORCE_INCLUDE 的股票不查、無條件視為可以當沖（_filter_day_tradable）
-    → 分連線。400支遠低於 MAX_CONNECTIONS×MAX_PER_CONNECTION 上限，實務上
-    只會用到2組連線。"""
+    2026-08-01改：names 現在固定是 _fixed_universe_names() 的結果（不再是
+    ranked_candidates() 動態均量排序後的結果，2026-08-17起上限800支，見
+    finmind/tick_universe.py 的說明），這裡直接用 dict 的 key 當候選清單。
+    順序：固定母體 → canDayTrade/canBuyDayTrade 逐支確認，_FORCE_INCLUDE
+    的股票不查、無條件視為可以當沖（_filter_day_tradable）→ 分連線。母體
+    規模遠低於 MAX_CONNECTIONS×MAX_PER_CONNECTION 上限（1000支），實務上
+    不會超過4組連線。"""
     candidates = list(names.keys())
     candidates = _filter_day_tradable(candidates)
     batches = [

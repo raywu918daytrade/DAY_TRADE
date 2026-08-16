@@ -13,7 +13,7 @@ import pandas as pd
 
 from pattern.horizontal_sr import horizontal_sr_prices
 
-_scan_cache: dict[str, tuple[list, list]] = {}
+_scan_cache: dict[tuple[str, str], tuple[list, list]] = {}
 _sr_levels_cache: dict[str, dict[str, tuple[float | None, float | None]]] = {}
 _names_cache: dict[str, str] | None = None
 _scan_lock = threading.Lock()
@@ -40,16 +40,22 @@ def _name_map() -> dict[str, str]:
     return _names_cache
 
 
-def load_day_m1(date_str: str) -> pd.DataFrame:
-    """優先 db/m1_live/{date}；沒檔再 load_pattern_m1 濾那一天。"""
+def normalize_universe(universe: str | None) -> str:
+    return "full" if str(universe or "").strip().lower() == "full" else "tick"
+
+
+def _from_m1_live(date_str: str) -> pd.DataFrame:
     from data.query import load_m1_live
 
     df = load_m1_live(date_str)
-    if not df.empty:
-        df = df.copy()
-        df["stock_id"] = df["stock_id"].astype(str)
-        return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+    if df.empty:
+        return df
+    df = df.copy()
+    df["stock_id"] = df["stock_id"].astype(str)
+    return df.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
+
+def _from_pattern_m1(date_str: str) -> pd.DataFrame:
     from data.adjustment_query import load_pattern_m1
 
     m1 = load_pattern_m1(start_date=date_str, end_date=date_str)
@@ -63,30 +69,51 @@ def load_day_m1(date_str: str) -> pd.DataFrame:
     return m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
 
 
+def load_day_m1(date_str: str, universe: str = "tick") -> pd.DataFrame:
+    """tick：優先 db/m1_live（盤中訂閱 ~400 檔）。
+    full：走 db/m1 全市場；沒檔才退回 m1_live（重現才有多出來的列）。"""
+    universe = normalize_universe(universe)
+    if universe == "full":
+        m1 = _from_pattern_m1(date_str)
+        if not m1.empty:
+            return m1
+        return _from_m1_live(date_str)
+
+    live = _from_m1_live(date_str)
+    if not live.empty:
+        return live
+    return _from_pattern_m1(date_str)
+
+
 def sr_levels_for_date(
     date_str: str, stocks: set[str]
 ) -> dict[str, tuple[float | None, float | None]]:
-    """D 之前日K 橫向壓力／支撐，與 live_trader._refresh_sr_levels 相同。"""
-    if date_str in _sr_levels_cache:
-        cached = _sr_levels_cache[date_str]
+    """D 之前日K 橫向壓力／支撐，與 live_trader._refresh_sr_levels 相同。
+    cache 以日期為鍵；缺的股票再補算（先掃當沖再掃全市場時會用到）。"""
+    stocks = {str(s) for s in stocks}
+    cached = _sr_levels_cache.get(date_str, {})
+    missing = stocks - set(cached)
+    if not missing:
         return {sid: cached[sid] for sid in stocks if sid in cached}
 
     from data.adjustment_query import load_pattern_day
 
     if not stocks:
-        _sr_levels_cache[date_str] = {}
+        _sr_levels_cache[date_str] = cached
         return {}
     hist_start = (pd.Timestamp(date_str) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
     day = load_pattern_day(start_date=hist_start, end_date=date_str)
     if day.empty:
-        _sr_levels_cache[date_str] = {}
-        return {}
+        _sr_levels_cache[date_str] = cached
+        return {sid: cached[sid] for sid in stocks if sid in cached}
     day = day.copy()
     day["stock_id"] = day["stock_id"].astype(str)
     cutoff = pd.Timestamp(date_str)
-    levels: dict[str, tuple[float | None, float | None]] = {}
+    levels = dict(cached)
     for sid, g in day.groupby("stock_id", sort=False):
         sid = str(sid)
+        if sid not in missing:
+            continue
         hist = g.loc[g["date"] < cutoff]
         res, sup = horizontal_sr_prices(hist)
         if res is not None or sup is not None:
@@ -227,18 +254,20 @@ def scan_day_events(
     return vwap_events, sr_events
 
 
-def scan_date(date_str: str) -> tuple[list, list]:
+def scan_date(date_str: str, universe: str = "tick") -> tuple[list, list]:
     """掃某一曆日，回傳 (vwap_breakouts, sr_vwap_hits)。過去日期 cache 事件；
     今日每次重算（m1_live 可能還在寫），SR 水位仍 cache。"""
+    universe = normalize_universe(universe)
+    key = (date_str, universe)
     today = pd.Timestamp.now(tz="Asia/Taipei").strftime("%Y-%m-%d")
     with _scan_lock:
-        if date_str != today and date_str in _scan_cache:
-            return _scan_cache[date_str]
+        if date_str != today and key in _scan_cache:
+            return _scan_cache[key]
 
-        m1 = load_day_m1(date_str)
+        m1 = load_day_m1(date_str, universe=universe)
         stocks = set(m1["stock_id"].astype(str)) if not m1.empty else set()
         levels = sr_levels_for_date(date_str, stocks)
         result = scan_day_events(m1, levels, _name_map())
         if date_str != today:
-            _scan_cache[date_str] = result
+            _scan_cache[key] = result
         return result
