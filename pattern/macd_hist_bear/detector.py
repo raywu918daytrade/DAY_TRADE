@@ -1,16 +1,8 @@
 """
 MACD 柱體頂背離 (Bearish Histogram Divergence) 型態檢測器
 
-硬性條件：
-1. MACD(12,26,9) histogram = DIF − DEA
-2. 柱體局部高點：左右各 L 根嚴格更高
-3. 價格轉折高點：K 線 high 左右各 L 根更低；可與柱體峰差最多 L 根
-   （不是當下收盤對當下柱）
-4. 連續兩處確認後的紅柱峰 h1 < h2：
-   - 對應價格高點創新高
-   - hist[h2] < hist[h1]（柱體降低）
-   - (h1, h2) 中間至少一根綠柱 → 紅綠紅
-5. 兩柱峰間距 ∈ [min_dist, max_dist]；右峰距最後一根 ≤ max_age
+規則同 macd_hist_bull：過去 5 根取 MACD 柱高峰與同窗 K 高，
+價格創新高、柱體降低，且中間至少一根綠柱（紅綠紅）。不必柱與 K 同根。
 """
 
 from __future__ import annotations

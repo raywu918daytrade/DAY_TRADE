@@ -1,10 +1,7 @@
 """VWAP 表 MACD 柱體背離燈：盤中每根 1 分都重算，不是當天第一次就定終身。
 
-規則與型態偵測器相同：柱體要左右各 2 根確認「縮小」才算極值，K 線也要
-走出高低點（可與柱極值差 2 根）。不是當下柱對當下 K。綠紅綠／紅綠紅、
-max_age=5。確認之後到 t2+max_age 才亮燈。
-
-盤後／重現掃全日；盤中 on_minute 掃當下 m1_live。
+過去 5 根先鎖柱體極值，間距＋紅綠紅／綠紅綠＋柱高低過了才取兩窗 K 高低。
+確認在 5 根窗右端。
 """
 
 from __future__ import annotations
@@ -21,12 +18,12 @@ from pattern.vwap_sr_scan import _hhmm, load_day_m1, normalize_universe
 _TW = timezone(timedelta(hours=8))
 
 PIVOT_L = 2
+LOOKBACK = 5
 MIN_DIST = 3
 MAX_DIST = 30
 MIN_CANDLES = 40
 MAX_AGE = 5
-# DIF 用 26 期 EMA、DEA 再 9；開頭這段柱體還在熱身，不當背離。
-WARMUP = 26 + 9
+WARMUP = 0
 
 _cache: dict[tuple[str, str], dict[str, dict]] = {}
 _lock = threading.Lock()
@@ -83,7 +80,13 @@ def all_divs_for_group(g: pd.DataFrame) -> list[dict]:
     hist = macd_histogram(close)
     n = len(hist)
     out: list[dict] = []
-    kw = dict(pivot_l=PIVOT_L, min_dist=MIN_DIST, max_dist=MAX_DIST, warmup=WARMUP)
+    kw = dict(
+        pivot_l=PIVOT_L,
+        lookback=LOOKBACK,
+        min_dist=MIN_DIST,
+        max_dist=MAX_DIST,
+        warmup=WARMUP,
+    )
     for pair in iter_macd_hist_div_pairs(hist, highs, lows, side="bull", **kw):
         leg = _leg("bull", pair, times, n)
         if leg:

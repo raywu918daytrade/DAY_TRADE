@@ -1,17 +1,13 @@
 """
 MACD 柱體底背離 (Bullish Histogram Divergence) 型態檢測器
 
-硬性條件：
+規則（2026-08-17）：看過去 lookback 根（預設 5）即可鎖定
+MACD 柱高低與 K 線高低，不必等右邊再縮小、不必綠紅綠。
+
 1. MACD(12,26,9) histogram = DIF − DEA
-2. 柱體局部低點：左右各 L 根柱體都更高＝極值之後柱體縮小才確認，
-   最新未完成的那根不算
-3. 價格轉折低點：K 線 low 同樣左右各 L 根更高；可與柱體谷差最多 L 根
-   （不是拿「當下收盤」去對「當下柱」）
-4. 連續兩處確認後的綠柱谷 h1 < h2：
-   - 對應價格低點創新低
-   - hist[h2] > hist[h1]（柱體抬高）
-   - (h1, h2) 中間至少一根紅柱 → 綠紅綠
-5. 兩柱谷間距 ∈ [min_dist, max_dist]；右谷距最後一根 ≤ max_age
+2. 柱體谷：hist[j] 是 [j, j+lookback) 唯一最低，且比前一根低；確認在窗右端
+3. 同一窗的 K 低點 = 該 5 根 low 的最低（可跟柱谷不同根）
+4. 先配柱體：間距、綠紅綠、柱抬高；通過才取兩窗 K 低比價（創新低）
 """
 
 from __future__ import annotations
@@ -49,7 +45,8 @@ def hist_has_sign_between(hist: np.ndarray, i1: int, i2: int, positive: bool) ->
 
 
 def local_extrema(values: np.ndarray, kind: str, pivot_l: int = 2) -> List[int]:
-    """左右各 pivot_l 根確認後的局部極值；序列尾端未確認的不算。"""
+    """左右各 pivot_l 根確認後的局部極值；序列尾端未確認的不算。
+    背離主流程已改走 lookback=5 的過去窗，這支留給舊呼叫。"""
     n = len(values)
     L = pivot_l
     out: List[int] = []
@@ -63,15 +60,31 @@ def local_extrema(values: np.ndarray, kind: str, pivot_l: int = 2) -> List[int]:
     return out
 
 
-def nearest_pivot(pivots: List[int], i: int, max_off: int) -> Optional[int]:
-    best: Optional[int] = None
-    best_d = max_off + 1
-    for p in pivots:
-        d = abs(p - i)
-        if d < best_d:
-            best = p
-            best_d = d
-    return best if best is not None and best_d <= max_off else None
+def _lookback_hist_locks(hist: np.ndarray, kind: str, lookback: int) -> List[int]:
+    """過去 lookback 根：左端是窗內唯一極值、且相對前一根轉折。確認在 i=j+lookback-1。"""
+    n = len(hist)
+    L = lookback
+    out: List[int] = []
+    for i in range(L - 1, n):
+        j = i - L + 1
+        if j > 0:
+            if kind == "trough" and not (hist[j] < hist[j - 1]):
+                continue
+            if kind == "peak" and not (hist[j] > hist[j - 1]):
+                continue
+        w = hist[j : i + 1]
+        if kind == "trough":
+            if hist[j] != np.min(w) or np.sum(w == hist[j]) != 1:
+                continue
+            if hist[j] > 0:
+                continue
+        else:
+            if hist[j] != np.max(w) or np.sum(w == hist[j]) != 1:
+                continue
+            if hist[j] < 0:
+                continue
+        out.append(j)
+    return out
 
 
 def iter_macd_hist_div_pairs(
@@ -83,63 +96,77 @@ def iter_macd_hist_div_pairs(
     min_dist: int = 3,
     max_dist: int = 30,
     warmup: int = 0,
+    lookback: int | None = None,
 ):
-    """已確認的柱體極值 × 附近已確認的 K 線高低點。yield dict。
-
-    side=bull：綠柱谷 + K 低點創新低、柱抬高、中間紅柱。
-    side=bear：紅柱峰 + K 高點創新高、柱降低、中間綠柱。
-    當下那根尚未走出「縮小／轉折」時不會進這裡。
+    """過去 lookback 根先鎖柱體極值；配對先通過間距、紅綠紅／綠紅綠、柱高低，
+    才取兩窗 K 高低比價。lookback 預設 2*pivot_l+1（pivot_l=2 → 5 根）。
     """
-    L = pivot_l
+    L = int(lookback) if lookback is not None else (2 * int(pivot_l) + 1)
     n = len(hist)
+    want_pos = side == "bull"
     if side == "bull":
-        h_ext = [i for i in local_extrema(hist, "trough", L) if hist[i] <= 0]
-        p_ext = local_extrema(lows, "trough", L)
-        want_pos = True
+        h_ext = _lookback_hist_locks(hist, "trough", L)
+        px = lows
     else:
-        h_ext = [i for i in local_extrema(hist, "peak", L) if hist[i] >= 0]
-        p_ext = local_extrema(highs, "peak", L)
-        want_pos = False
+        h_ext = _lookback_hist_locks(hist, "peak", L)
+        px = highs
 
-    for j in range(1, len(h_ext)):
-        h1, h2 = h_ext[j - 1], h_ext[j]
-        if h1 < warmup:
+    hs: List[int] = []
+    for h in h_ext:
+        if h < warmup:
             continue
-        if not (min_dist <= h2 - h1 <= max_dist):
+        if h + L - 1 >= n:
             continue
-        if not hist_has_sign_between(hist, h1, h2, positive=want_pos):
+        hs.append(h)
+
+    def _k_at(h: int) -> tuple[int, float]:
+        right = h + L - 1
+        w = px[h : right + 1]
+        off = int(np.argmin(w) if side == "bull" else np.argmax(w))
+        p = h + off
+        return p, float(px[p])
+
+    for b in range(1, len(hs)):
+        h2 = hs[b]
+        v2 = float(hist[h2])
+        best_h1: int | None = None
+        best_v1: float | None = None
+        for a in range(b):
+            h1 = hs[a]
+            if not (min_dist <= h2 - h1 <= max_dist):
+                continue
+            if not hist_has_sign_between(hist, h1, h2, positive=want_pos):
+                continue
+            v1 = float(hist[h1])
+            if side == "bull":
+                if not (v2 > v1):
+                    continue
+                if best_v1 is None or v1 < best_v1:
+                    best_h1, best_v1 = h1, v1
+            else:
+                if not (v2 < v1):
+                    continue
+                if best_v1 is None or v1 > best_v1:
+                    best_h1, best_v1 = h1, v1
+        if best_h1 is None or best_v1 is None:
             continue
-        v1, v2 = float(hist[h1]), float(hist[h2])
+        p1, price1 = _k_at(best_h1)
+        p2, price2 = _k_at(h2)
         if side == "bull":
-            if not (v2 > v1):
+            if not (price2 < price1):
                 continue
-        elif not (v2 < v1):
-            continue
-        p1 = nearest_pivot(p_ext, h1, L)
-        p2 = nearest_pivot(p_ext, h2, L)
-        if p1 is None or p2 is None or p2 <= p1:
-            continue
-        if side == "bull":
-            if not (float(lows[p2]) < float(lows[p1])):
-                continue
-            px1, px2 = float(lows[p1]), float(lows[p2])
-        else:
-            if not (float(highs[p2]) > float(highs[p1])):
-                continue
-            px1, px2 = float(highs[p1]), float(highs[p2])
-        confirmed = max(h2, p2) + L
-        if confirmed >= n:
+        elif not (price2 > price1):
             continue
         yield {
-            "h1": h1,
+            "h1": best_h1,
             "h2": h2,
             "p1": p1,
             "p2": p2,
-            "hist1": v1,
+            "hist1": best_v1,
             "hist2": v2,
-            "price1": px1,
-            "price2": px2,
-            "confirmed": confirmed,
+            "price1": price1,
+            "price2": price2,
+            "confirmed": h2 + L - 1,
         }
 
 
