@@ -74,8 +74,7 @@ class AppState:
         self.day: pd.DataFrame = pd.DataFrame()
 
         # 當日「VWAP + 壓力/支撐」框：昨收包絡水位（盤中不重算）、已穿越 VWAP
-        # 的股票（第 1 層濾網，跟 VWAP 突破同一輪 m1 算出來，不重算 VWAP）、
-        # 以及已經推進新框的股票（當日每股一筆）。
+        # 的股票（跟 VWAP 突破同一輪 m1 算出來）。同一支可多次推進新框。
         self.sr_levels: dict[str, tuple[float, float]] = {}  # stock_id → (res, sup)
         self.sr_levels_date: str = ""
         self.vwap_crossed_today: set[str] = set()

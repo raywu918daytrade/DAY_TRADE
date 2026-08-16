@@ -681,6 +681,15 @@ def _vwap_event_key(e: dict) -> tuple:
     return (str(e.get("stock_id", "")), str(e.get("time", "")), str(e.get("direction", "")))
 
 
+def _sr_vwap_event_key(e: dict) -> tuple:
+    return (
+        str(e.get("stock_id", "")),
+        str(e.get("time", "")),
+        str(e.get("sr_kind", "")),
+        str(e.get("vwap_dir", "")),
+    )
+
+
 def push_vwap_breakout(minute_str: str, breakouts: list):
     """推入「VWAP突破/跌破」訊號（main/live_trader.py 的 on_minute() 每分鐘偵測，
     見該函式內的說明）。
@@ -714,23 +723,24 @@ def push_vwap_breakout(minute_str: str, breakouts: list):
 
 
 def push_sr_vwap_cross(minute_str: str, hits: list):
-    """推入「VWAP + 壓力或支撐穿越」訊號。第 1 層是當日已穿越 VWAP（跟
-    push_vwap_breakout 同一輪 m1、同一套 VWAP，不重算）；再查包絡壓力/支撐
-    有沒有也變號。不分順序方向，當日每股只推一筆。
+    """推入「VWAP + 壓力或支撐穿越」訊號。這一根壓力/支撐變號且當天已有
+    VWAP 變號（含同根），或這一根才第一次跨 VWAP、稍早已穿越壓力/支撐。
+    同一支可多次記錄；去重複鍵是 (stock_id, time, sr_kind, vwap_dir)。
     hits 每筆：stock_id, name, sr_kind(support/resistance/both), vwap_dir,
     price, vwap, resistance, support
     """
     print(f"[push_sr_vwap_cross] {minute_str} 產生 {len(hits)} 筆VWAP+壓力支撐", flush=True)
     with _lock:
         _reset_if_new_day()
-        existing = {str(x.get("stock_id")) for x in _sr_vwap_cross_signals}
+        existing = {_sr_vwap_event_key(x) for x in _sr_vwap_cross_signals}
         fresh = []
         for h in hits:
-            sid = str(h.get("stock_id", ""))
-            if sid in existing:
+            row = {**h, "time": minute_str[11:16]}
+            k = _sr_vwap_event_key(row)
+            if k in existing:
                 continue
-            existing.add(sid)
-            _sr_vwap_cross_signals.append({**h, "time": minute_str[11:16]})
+            existing.add(k)
+            _sr_vwap_cross_signals.append(row)
             fresh.append(h)
         if fresh:
             _broadcast({"type": "sr_vwap_cross", "minute": minute_str[11:16], "data": fresh})
@@ -1090,7 +1100,7 @@ _vwap_sr_catchup_hook = None
 
 
 def register_vwap_sr_catchup_hook(fn):
-    """live_trader 登記：catchup 寫入記憶體後同步 vwap_crossed_today / sr_vwap_fired_today。"""
+    """live_trader 登記：catchup 寫入記憶體後同步 vwap_crossed_today。"""
     global _vwap_sr_catchup_hook
     _vwap_sr_catchup_hook = fn
 
@@ -1174,6 +1184,21 @@ def vwap_sr_replay(date: str):
     vwap, sr = _scan_vwap_sr(date)
     print(f"[GET /vwap_sr_replay] date={date} VWAP {len(vwap)} 筆 / SR {len(sr)} 筆", flush=True)
     return {"vwap": vwap, "sr": sr}
+
+
+@app.get(
+    "/vwap_activity",
+    tags=["訊號"],
+    summary="VWAP 兩欄過濾用：日ATR% / 開盤5分幅% / 09:05量PR",
+)
+def vwap_activity(date: Optional[str] = None):
+    """每股一筆。day_atr、open5_rng 為小數（0.02=2%）；vol5_pr 為 0～1。"""
+    date_str = date or datetime.now(_TW).strftime("%Y-%m-%d")
+    from pattern.vwap_activity import metrics_for_date
+
+    stocks = metrics_for_date(date_str)
+    print(f"[GET /vwap_activity] date={date_str} {len(stocks)} 檔", flush=True)
+    return {"date": date_str, "stocks": stocks}
 
 
 @app.get(

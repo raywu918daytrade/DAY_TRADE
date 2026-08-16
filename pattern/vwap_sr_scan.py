@@ -95,84 +95,104 @@ def sr_levels_for_date(
     return {sid: levels[sid] for sid in stocks if sid in levels}
 
 
-def scan_day_events(
-    m1: pd.DataFrame,
-    sr_levels: dict[str, tuple[float, float]],
-    names: dict[str, str] | None = None,
+def sr_record_indices(vwap_flip: np.ndarray, sr_flip: np.ndarray) -> list[int]:
+    """同一支可以重複：壓力/支撐這一根變號且當天已有 VWAP 變號；
+    或這一根才第一次跨 VWAP、但稍早已穿越過壓力/支撐。"""
+    out: list[int] = []
+    vwap_seen = False
+    sr_seen = False
+    for i in range(1, len(vwap_flip)):
+        v_now = bool(vwap_flip[i])
+        r_now = bool(sr_flip[i])
+        if r_now and (vwap_seen or v_now):
+            out.append(i)
+        elif v_now and (not vwap_seen) and sr_seen:
+            out.append(i)
+        if v_now:
+            vwap_seen = True
+        if r_now:
+            sr_seen = True
+    return out
+
+
+def _sr_kind_at(i: int, res_flip: np.ndarray, sup_flip: np.ndarray) -> str:
+    res_now = bool(res_flip[i]) if i < len(res_flip) else False
+    sup_now = bool(sup_flip[i]) if i < len(sup_flip) else False
+    if res_now and sup_now:
+        return "both"
+    if res_now:
+        return "resistance"
+    if sup_now:
+        return "support"
+    res_h = bool(res_flip[: i + 1].any())
+    sup_h = bool(sup_flip[: i + 1].any())
+    if res_h and sup_h:
+        return "both"
+    if sup_h:
+        return "support"
+    return "resistance"
+
+
+def events_for_group(
+    sid: str,
+    name: str,
+    g: pd.DataFrame,
+    sr: tuple[float | None, float | None] | None,
 ) -> tuple[list, list]:
-    """回傳 (vwap_breakouts, sr_vwap_hits)，欄位與盤中 push payload + time 相同。"""
-    names = names or {}
+    """單檔當日 m1 → (vwap 變號列, 壓力/支撐記錄列)。live 與盤後掃描共用。"""
     vwap_events: list = []
     sr_events: list = []
-    if m1 is None or m1.empty:
+    if g is None or len(g) < 2:
+        return vwap_events, sr_events
+    g = g.sort_values("date")
+    closes = g["close"].astype(float).to_numpy()
+    vols = g["volume"].astype(float).to_numpy()
+    times = g["date"].to_numpy()
+    cum_vol = vols.cumsum()
+    cum_pv = (closes * vols).cumsum()
+    vwap = np.divide(
+        cum_pv,
+        cum_vol,
+        out=np.full_like(cum_pv, np.nan),
+        where=cum_vol > 0,
+    )
+    valid = np.isfinite(vwap)
+    above = closes >= vwap
+    flip = np.zeros(len(closes), dtype=bool)
+    flip[1:] = (above[1:] != above[:-1]) & valid[1:] & valid[:-1]
+    if not flip.any():
         return vwap_events, sr_events
 
-    for sid, g in m1.groupby("stock_id", sort=False):
-        sid = str(sid)
-        g = g.sort_values("date")
-        if len(g) < 2:
-            continue
-        closes = g["close"].astype(float).to_numpy()
-        vols = g["volume"].astype(float).to_numpy()
-        times = g["date"].to_numpy()
-        cum_vol = vols.cumsum()
-        cum_pv = (closes * vols).cumsum()
-        vwap = np.divide(
-            cum_pv,
-            cum_vol,
-            out=np.full_like(cum_pv, np.nan),
-            where=cum_vol > 0,
+    for i in np.flatnonzero(flip):
+        vwap_events.append(
+            {
+                "stock_id": sid,
+                "name": name,
+                "direction": "up" if above[i] else "down",
+                "price": round(float(closes[i]), 2),
+                "vwap": round(float(vwap[i]), 2),
+                "time": _hhmm(times[i]),
+            }
         )
-        valid = np.isfinite(vwap)
-        above = closes >= vwap
-        flip = np.zeros(len(closes), dtype=bool)
-        flip[1:] = (above[1:] != above[:-1]) & valid[1:] & valid[:-1]
-        if not flip.any():
-            continue
 
-        name = names.get(sid, sid)
-        vwap_idxs = np.flatnonzero(flip)
-        for i in vwap_idxs:
-            vwap_events.append(
-                {
-                    "stock_id": sid,
-                    "name": name,
-                    "direction": "up" if above[i] else "down",
-                    "price": round(float(closes[i]), 2),
-                    "vwap": round(float(vwap[i]), 2),
-                    "time": _hhmm(times[i]),
-                }
-            )
-
-        sr = sr_levels.get(sid)
-        if not sr:
-            continue
-        res, sup = sr
-        res_flip = np.zeros(len(closes), dtype=bool)
-        if res is not None:
-            res_flip[1:] = (closes[1:] >= res) != (closes[:-1] >= res)
-        sup_flip = np.zeros(len(closes), dtype=bool)
-        if sup is not None:
-            sup_flip[1:] = (closes[1:] >= sup) != (closes[:-1] >= sup)
-        sr_flip = res_flip | sup_flip
-        if not sr_flip.any():
-            continue
-        first_vwap = int(vwap_idxs[0])
-        first_sr = int(np.flatnonzero(sr_flip)[0])
-        fire = max(first_vwap, first_sr)
-        res_x = bool(res_flip[: fire + 1].any())
-        sup_x = bool(sup_flip[: fire + 1].any())
-        if res_x and sup_x:
-            sr_kind = "both"
-        elif sup_x:
-            sr_kind = "support"
-        else:
-            sr_kind = "resistance"
+    if not sr:
+        return vwap_events, sr_events
+    res, sup = sr
+    res_flip = np.zeros(len(closes), dtype=bool)
+    if res is not None:
+        res_flip[1:] = (closes[1:] >= res) != (closes[:-1] >= res)
+    sup_flip = np.zeros(len(closes), dtype=bool)
+    if sup is not None:
+        sup_flip[1:] = (closes[1:] >= sup) != (closes[:-1] >= sup)
+    sr_flip = res_flip | sup_flip
+    if not sr_flip.any():
+        return vwap_events, sr_events
+    for fire in sr_record_indices(flip, sr_flip):
         sr_events.append(
             {
                 "stock_id": sid,
                 "name": name,
-                "sr_kind": sr_kind,
+                "sr_kind": _sr_kind_at(fire, res_flip, sup_flip),
                 "vwap_dir": "up" if closes[fire] >= vwap[fire] else "down",
                 "price": round(float(closes[fire]), 2),
                 "vwap": round(float(vwap[fire]), 2),
@@ -181,6 +201,28 @@ def scan_day_events(
                 "time": _hhmm(times[fire]),
             }
         )
+    return vwap_events, sr_events
+
+
+def scan_day_events(
+    m1: pd.DataFrame,
+    sr_levels: dict[str, tuple[float, float]],
+    names: dict[str, str] | None = None,
+) -> tuple[list, list]:
+    """回傳 (vwap_breakouts, sr_vwap_hits)，欄位與盤中 push payload + time 相同。
+    VWAP 每次變號一筆；壓力/支撐穿越（且當天已有 VWAP 變號）每次一筆，同一支可重複。
+    """
+    names = names or {}
+    vwap_events: list = []
+    sr_events: list = []
+    if m1 is None or m1.empty:
+        return vwap_events, sr_events
+
+    for sid, g in m1.groupby("stock_id", sort=False):
+        sid = str(sid)
+        ve, se = events_for_group(sid, names.get(sid, sid), g, sr_levels.get(sid))
+        vwap_events.extend(ve)
+        sr_events.extend(se)
 
     return vwap_events, sr_events
 

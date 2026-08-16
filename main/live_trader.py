@@ -120,9 +120,7 @@ def _on_vwap_sr_catchup(vwap: list, sr: list):
     for e in vwap:
         state.vwap_crossed_today.add(str(e["stock_id"]))
     for e in sr:
-        sid = str(e["stock_id"])
-        state.vwap_crossed_today.add(sid)
-        state.sr_vwap_fired_today.add(sid)
+        state.vwap_crossed_today.add(str(e["stock_id"]))
 
 
 register_vwap_sr_catchup_hook(_on_vwap_sr_catchup)
@@ -404,6 +402,9 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     sr_vwap_hits = []
 
     if not m1_live.empty:
+        from pattern.vwap_sr_scan import events_for_group
+
+        hhmm = minute_str[11:16]
         for sid, g in m1_live.groupby("stock_id"):
             candles = []
             for _, row in g.iterrows():
@@ -422,68 +423,22 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             push_candles(str(sid), candles)
             sid = str(sid)
 
-            # VWAP 只算一次：突破欄用變號事件；通過這層濾網的才查壓力/支撐
-            # （不要同一支再重算一遍 VWAP）。
+            # VWAP 只算一次：突破欄每次變號一筆；壓力/支撐同一套規則可重複。
             if len(g) >= 2:
-                closes = g["close"].astype(float).to_numpy()
-                vols = g["volume"].astype(float).to_numpy()
-                cum_vol = vols.cumsum()
-                if cum_vol[-2] > 0 and cum_vol[-1] > 0:
-                    cum_pv = (closes * vols).cumsum()
-                    vwap = cum_pv / cum_vol
-                    prev_above = closes[-2] >= vwap[-2]
-                    cur_above = closes[-1] >= vwap[-1]
-                    if prev_above != cur_above:
-                        vwap_dir = "up" if cur_above else "down"
-                        vwap_breakouts.append(
-                            {
-                                "stock_id": sid,
-                                "name": state.tickers.get(sid, sid),
-                                "direction": vwap_dir,
-                                "price": round(float(closes[-1]), 2),
-                                "vwap": round(float(vwap[-1]), 2),
-                            }
-                        )
-                        state.vwap_crossed_today.add(sid)
-
-                    if (
-                        sid in state.vwap_crossed_today
-                        and sid not in state.sr_vwap_fired_today
-                    ):
-                        sr = state.sr_levels.get(sid)
-                        if sr:
-                            res, sup = sr
-                            res_x = False
-                            if res is not None:
-                                res_x = bool(
-                                    np.any((closes[:-1] >= res) != (closes[1:] >= res))
-                                )
-                            sup_x = False
-                            if sup is not None:
-                                sup_x = bool(
-                                    np.any((closes[:-1] >= sup) != (closes[1:] >= sup))
-                                )
-                            if res_x or sup_x:
-                                if res_x and sup_x:
-                                    sr_kind = "both"
-                                elif sup_x:
-                                    sr_kind = "support"
-                                else:
-                                    sr_kind = "resistance"
-                                vwap_dir = "up" if closes[-1] >= vwap[-1] else "down"
-                                sr_vwap_hits.append(
-                                    {
-                                        "stock_id": sid,
-                                        "name": state.tickers.get(sid, sid),
-                                        "sr_kind": sr_kind,
-                                        "vwap_dir": vwap_dir,
-                                        "price": round(float(closes[-1]), 2),
-                                        "vwap": round(float(vwap[-1]), 2),
-                                        "resistance": round(float(res), 2) if res is not None else None,
-                                        "support": round(float(sup), 2) if sup is not None else None,
-                                    }
-                                )
-                                state.sr_vwap_fired_today.add(sid)
+                ve, se = events_for_group(
+                    sid,
+                    state.tickers.get(sid, sid),
+                    g,
+                    state.sr_levels.get(sid),
+                )
+                for e in ve:
+                    if e.get("time") != hhmm:
+                        continue
+                    vwap_breakouts.append(e)
+                    state.vwap_crossed_today.add(sid)
+                for e in se:
+                    if e.get("time") == hhmm:
+                        sr_vwap_hits.append(e)
 
             # 頁首固定追蹤清單（WATCHLIST_QUOTES，如 0050）：跟策略候選股無關，
             # 收到 m1 就先查昨收、算漲跌幅，傳到前端之前先算好（不是前端自己拉
@@ -506,7 +461,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     if sr_vwap_hits:
         push_sr_vwap_cross(minute_str, sr_vwap_hits)
         print(
-            f"  [VWAP+壓力支撐] {len(sr_vwap_hits)} 支: "
+            f"  [VWAP+壓力支撐] {len(sr_vwap_hits)} 筆: "
             + " ".join(f"{b['stock_id']}({b['sr_kind']})" for b in sr_vwap_hits),
             flush=True,
         )
