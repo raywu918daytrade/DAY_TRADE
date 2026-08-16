@@ -28,6 +28,16 @@ push_db_to_hf.py 改成把整個本機 `db/` 資料夾原樣鏡像到 HF Hub 的
 用法：
     python -m scripts.download_hf_for_local                # 下載整個 db/
     python -m scripts.download_hf_for_local --only m1 d1    # 只下載指定子資料夾
+
+--repo-id：選填，覆蓋 .env 的 HF_REPO_ID，改從指定的其他 HF dataset repo
+下載。用途：一次性從別的repo補資料，不影響 .env 設定的預設repo（不帶這個
+參數時行為完全不變）。
+
+2026-08-16例：db/margin（融資券）、db/ib（法人買賣，FinMind
+TaiwanStockInstitutionalInvestorsBuySell，欄位 stock_id/date/name/buy/sell）
+這兩份資料舊帳號的 repo 上已經有（本地 db/margin 只到 2026-08-03，
+db/ib 本地還不存在），用這個指令一次補齊：
+    python -m scripts.download_hf_for_local --only margin ib --repo-id raywu918python/j1s-data
 """
 
 import argparse
@@ -47,16 +57,17 @@ HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 
 
-def main(only: list[str] | None = None):
-    if not HF_REPO_ID:
-        raise RuntimeError("請在 .env 設定 HF_REPO_ID")
+def main(only: list[str] | None = None, repo_id: str | None = None):
+    repo_id = repo_id or HF_REPO_ID
+    if not repo_id:
+        raise RuntimeError("請在 .env 設定 HF_REPO_ID，或用 --repo-id 指定要下載的 repo")
 
     if only:
         allow_patterns = [f"db/{name}/*" for name in only]
-        print(f"從 HF Hub 下載 db/ 的子集：{only} ...")
+        print(f"從 HF Hub（{repo_id}）下載 db/ 的子集：{only} ...")
     else:
         allow_patterns = ["db/*"]
-        print("從 HF Hub 下載整個 db/（全量，檔案數多時可能較久，甚至撞到HF rate limit——GHA自動化用的是 scripts/download_hf_for_gha.py，不是這支）...")
+        print(f"從 HF Hub（{repo_id}）下載整個 db/（全量，檔案數多時可能較久，甚至撞到HF rate limit——GHA自動化用的是 scripts/download_hf_for_gha.py，不是這支）...")
 
     # snapshot_download 本身就有本地快取比對（依檔案 etag/hash），已經下載過
     # 且雲端沒變動的檔案不會重複下載，適合每次都直接呼叫、不用自己維護
@@ -64,7 +75,7 @@ def main(only: list[str] | None = None):
     # 對應到本機的 db/...（push_db_to_hf.py 用 path_in_repo="db" 上傳，
     # 兩邊路徑結構對稱）。
     snapshot_download(
-        repo_id=HF_REPO_ID,
+        repo_id=repo_id,
         repo_type="dataset",
         token=HF_TOKEN,
         allow_patterns=allow_patterns,
@@ -76,5 +87,6 @@ def main(only: list[str] | None = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", nargs="+", default=None, help="只下載指定的 db/ 子資料夾，例如 --only m1 d1")
+    parser.add_argument("--repo-id", default=None, help="覆蓋 .env 的 HF_REPO_ID，改從指定的其他 HF dataset repo 下載")
     args = parser.parse_args()
-    main(only=args.only)
+    main(only=args.only, repo_id=args.repo_id)
