@@ -1156,9 +1156,8 @@ def _catchup_today_into_memory() -> tuple[list, list]:
     summary="今日「VWAP突破/跌破」訊號列表",
 )
 def vwap_breakout_today(date: Optional[str] = None, universe: str = "daytrade"):
-    """date 有值時掃那一天。universe=daytrade|full（tick＝daytrade 別名）：
-    卡住 GET /api/pattern/stocks 同一份清單；full 走 db/m1，daytrade 走 m1_live。
-    沒帶 date 則回盤中記憶體。"""
+    """date 有值時掃那一天。universe=daytrade|full（tick＝daytrade 別名）。
+    沒帶 date 則回盤中記憶體。過去日期只走 db/m1。"""
     if date:
         vwap, _ = _scan_vwap_sr(date, universe=universe)
         print(
@@ -1208,14 +1207,18 @@ def vwap_sr_catchup():
 )
 def vwap_sr_replay(date: str, universe: str = "daytrade"):
     """dashboard「重現」用：同一輪掃描回兩欄，避免打兩次 endpoint 重複算包絡。
-    universe=daytrade|full（tick＝daytrade）。"""
+    universe=daytrade|full（tick＝daytrade）。m1_bars＝該日讀到的 1 分根數，
+    0 表示來源還沒讀到，前端應繼續等／重試，不要當成「該日無訊號」。"""
+    from pattern.vwap_sr_scan import last_m1_bars
+
     vwap, sr = _scan_vwap_sr(date, universe=universe)
+    bars = last_m1_bars(date, universe)
     print(
         f"[GET /vwap_sr_replay] date={date} universe={universe} "
-        f"VWAP {len(vwap)} 筆 / SR {len(sr)} 筆",
+        f"VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / m1_bars={bars}",
         flush=True,
     )
-    return {"vwap": vwap, "sr": sr}
+    return {"vwap": vwap, "sr": sr, "m1_bars": bars}
 
 
 @app.get(

@@ -1,13 +1,14 @@
 """盤後一次掃全日 m1，還原 VWAP突破 / VWAP+壓力支撐（規則同 live_trader.on_minute）。
 
-不模擬時鐘；db/m1_live/{date}.parquet 本來就留檔。盤中仍走 on_minute 增量推
-SSE，這裡只給 GET ?date= 用。重現 universe=daytrade|full 對齊
-GET /api/pattern/stocks/daytrade、/stocks/full 那兩份清單。
+不模擬時鐘。當天讀 db/m1_live/{date}.parquet；非當天只讀 db/m1，
+不退回 m1_live。盤中仍走 on_minute 增量推 SSE。GET ?date= 的
+universe=daytrade|full 對齊 GET /api/pattern/stocks/daytrade、/stocks/full。
 """
 
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -18,9 +19,15 @@ from pattern.horizontal_sr import horizontal_sr_prices
 _ROOT = Path(__file__).resolve().parent.parent
 
 _scan_cache: dict[tuple[str, str], tuple[list, list]] = {}
+_m1_cache: dict[tuple[str, str], pd.DataFrame] = {}
+_m1_bars: dict[tuple[str, str], int] = {}
 _sr_levels_cache: dict[str, dict[str, tuple[float | None, float | None]]] = {}
 _names_cache: dict[str, str] | None = None
-_scan_lock = threading.Lock()
+# RLock：scan_date 持鎖時還會再進 load_day_m1。MACD 共用這把鎖，同一日 m1 只讀一次。
+_scan_lock = threading.RLock()
+# 掃描放背景執行緒：Django／瀏覽器超時斷線後仍繼續，下一點重現才能接到結果。
+_scan_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vwap-replay")
+_scan_jobs: dict[tuple[str, str], Future] = {}
 
 
 def _hhmm(ts) -> str:
@@ -61,9 +68,11 @@ def _parquet_stock_ids(path: Path) -> set[str]:
 
 
 def stock_ids_for_universe(universe: str | None) -> set[str]:
-    """daytrade＝subscribe_list；full＝stock_universe_2000 ∪ daytrade（0050）。"""
+    """daytrade＝subscribe_list；讀不到才退 tick_universe。full＝2000 ∪ daytrade。"""
     universe = normalize_universe(universe)
     daytrade = _parquet_stock_ids(_ROOT / "db/fubon_subscribe/subscribe_list.parquet")
+    if not daytrade:
+        daytrade = _parquet_stock_ids(_ROOT / "db/tickers/tick_universe.parquet")
     if universe == "full":
         full = _parquet_stock_ids(_ROOT / "db/tickers/stock_universe_2000.parquet")
         return full | daytrade
@@ -82,17 +91,41 @@ def _from_m1_live(date_str: str) -> pd.DataFrame:
 
 
 def _from_pattern_m1(date_str: str) -> pd.DataFrame:
-    from data.adjustment_query import load_pattern_m1
+    """只還原那一天。load_pattern_m1(start=end=當日) 仍會把整個月 parquet
+    讀進記憶體再調整，第一次從 Dropbox 拉月檔很容易超時、前端就當沒資料。"""
+    from data import raw_query
+    from data.adjustment_query import _adjust_ohlc
+    import pyarrow.dataset as ds
 
-    m1 = load_pattern_m1(start_date=date_str, end_date=date_str)
-    if m1.empty:
-        return m1
-    m1 = m1.copy()
-    m1["stock_id"] = m1["stock_id"].astype(str)
     start = pd.Timestamp(date_str)
     end = start + pd.Timedelta(days=1)
-    m1 = m1[(m1["date"] >= start) & (m1["date"] < end)]
-    return m1.sort_values(["stock_id", "date"]).reset_index(drop=True)
+    paths = raw_query._dataset_paths(_ROOT / "db/m1", date_str, date_str)
+    if not paths:
+        return pd.DataFrame()
+    dataset = ds.dataset(paths, format="parquet")
+    df = pd.DataFrame()
+    try:
+        import pyarrow as pa
+
+        df = dataset.to_table(
+            filter=(ds.field("date") >= pa.scalar(start.to_pydatetime()))
+            & (ds.field("date") < pa.scalar(end.to_pydatetime()))
+        ).to_pandas()
+    except Exception:
+        df = pd.DataFrame()
+    if df is None or df.empty:
+        df = dataset.to_table().to_pandas()
+    df = df.copy()
+    df["stock_id"] = df["stock_id"].astype(str)
+    df["date"] = pd.to_datetime(df["date"], format="mixed")
+    if getattr(df["date"].dt, "tz", None) is not None:
+        df["date"] = df["date"].dt.tz_localize(None)
+    df = df[(df["date"] >= start) & (df["date"] < end)]
+    if df.empty:
+        return df
+    df.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
+    df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+    return _adjust_ohlc(df, date_str, date_str)
 
 
 def _filter_m1(m1: pd.DataFrame, universe: str) -> pd.DataFrame:
@@ -107,20 +140,25 @@ def _filter_m1(m1: pd.DataFrame, universe: str) -> pd.DataFrame:
 
 
 def load_day_m1(date_str: str, universe: str = "daytrade") -> pd.DataFrame:
-    """daytrade：優先 db/m1_live，再卡住今天 subscribe_list。
-    full：優先 db/m1，卡住 stock_universe_2000 ∪ 當沖代號。
-    清單空＝不掃；清單有、該日沒 1 分 K＝不列。"""
+    """當天：db/m1_live。非當天：只讀 db/m1（不退回 m1_live，避免第一次掃到
+    盤中暫存、第二次才換成完整歷史）。過去日期 cache 非空的 db/m1。"""
     universe = normalize_universe(universe)
-    if universe == "full":
-        m1 = _from_pattern_m1(date_str)
-        if m1.empty:
+    today = pd.Timestamp.now(tz="Asia/Taipei").strftime("%Y-%m-%d")
+    key = (date_str, universe)
+    with _scan_lock:
+        if date_str != today and key in _m1_cache:
+            return _m1_cache[key]
+        if date_str == today:
             m1 = _from_m1_live(date_str)
-        return _filter_m1(m1, universe)
-
-    live = _from_m1_live(date_str)
-    if live.empty:
-        live = _from_pattern_m1(date_str)
-    return _filter_m1(live, universe)
+            if m1.empty:
+                m1 = _from_pattern_m1(date_str)
+        else:
+            m1 = _from_pattern_m1(date_str)
+        m1 = _filter_m1(m1, universe)
+        _m1_bars[key] = 0 if m1 is None or m1.empty else int(len(m1))
+        if date_str != today and not m1.empty:
+            _m1_cache[key] = m1
+        return m1
 
 
 def sr_levels_for_date(
@@ -292,20 +330,37 @@ def scan_day_events(
     return vwap_events, sr_events
 
 
+def _scan_date_body(date_str: str, universe: str) -> tuple[list, list]:
+    m1 = load_day_m1(date_str, universe=universe)
+    stocks = set(m1["stock_id"].astype(str)) if not m1.empty else set()
+    levels = sr_levels_for_date(date_str, stocks)
+    result = scan_day_events(m1, levels, _name_map())
+    today = pd.Timestamp.now(tz="Asia/Taipei").strftime("%Y-%m-%d")
+    if date_str != today and not m1.empty:
+        with _scan_lock:
+            _scan_cache[(date_str, universe)] = result
+    return result
+
+
+def last_m1_bars(date_str: str, universe: str = "daytrade") -> int:
+    return _m1_bars.get((date_str, normalize_universe(universe)), 0)
+
+
 def scan_date(date_str: str, universe: str = "daytrade") -> tuple[list, list]:
     """掃某一曆日，回傳 (vwap_breakouts, sr_vwap_hits)。過去日期 cache 事件；
-    今日每次重算（m1_live 可能還在寫），SR 水位仍 cache。"""
+    今日每次重算（m1_live 可能還在寫），SR 水位仍 cache。
+    過去日期丟背景執行緒：HTTP 超時斷線後掃描繼續，下一次請求等同一個 job。"""
     universe = normalize_universe(universe)
     key = (date_str, universe)
     today = pd.Timestamp.now(tz="Asia/Taipei").strftime("%Y-%m-%d")
+    if date_str == today:
+        with _scan_lock:
+            return _scan_date_body(date_str, universe)
     with _scan_lock:
-        if date_str != today and key in _scan_cache:
+        if key in _scan_cache:
             return _scan_cache[key]
-
-        m1 = load_day_m1(date_str, universe=universe)
-        stocks = set(m1["stock_id"].astype(str)) if not m1.empty else set()
-        levels = sr_levels_for_date(date_str, stocks)
-        result = scan_day_events(m1, levels, _name_map())
-        if date_str != today:
-            _scan_cache[key] = result
-        return result
+        fut = _scan_jobs.get(key)
+        if fut is None or fut.done():
+            fut = _scan_pool.submit(_scan_date_body, date_str, universe)
+            _scan_jobs[key] = fut
+    return fut.result()

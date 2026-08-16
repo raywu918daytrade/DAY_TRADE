@@ -122,8 +122,8 @@ def metrics_for_date(date_str: str, universe: str = "daytrade") -> dict[str, dic
     with _lock:
         if date_str != today and key in _cache:
             return _cache[key]
-    result = _compute(date_str, universe=universe)
-    if date_str != today:
-        with _lock:
+        result = _compute(date_str, universe=universe)
+        # 空 map 也可能是 m1 還沒讀到，不 cache，讓下一點重現再試。
+        if date_str != today and result:
             _cache[key] = result
-    return result
+        return result
