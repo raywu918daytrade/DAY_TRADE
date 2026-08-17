@@ -59,6 +59,7 @@ all_normal_stocks()）保留在檔案裡沒有刪除，只是目前的日常流�
         batches = load_subscribe_batches()  # 分組後的 stock_id list，給 WebSocket 用
 """
 import os
+import shutil
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -214,10 +215,39 @@ def _assign_connections(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _try_download_from_hf(path: Path) -> None:
+    """一律先試著把 HF Hub 上最新的 tick_universe.parquet 下載蓋過本機
+    再繼續（2026-08-19：候選母體現在由 scripts/update_daily.py 統一每天
+    重建一次、同步到HF，見該檔案說明），不管本機原本有沒有這個檔案都下載，
+    確保用到的是最新版本。下載失敗（沒設定HF_REPO_ID、網路問題、或HF上
+    還沒有這個檔案）不當成錯誤，靜默放棄，讓呼叫端 fallback 到本機既有
+    檔案或整包重建（見 _load_or_rebuild_universe_pool()）。"""
+    repo_id = os.environ.get("HF_REPO_ID", "")
+    if not repo_id:
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+
+        token = os.environ.get("HF_TOKEN") or None
+        downloaded = hf_hub_download(
+            repo_id=repo_id, repo_type="dataset", token=token,
+            filename="db/tickers/tick_universe.parquet",
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".parquet.tmp")
+        shutil.copy(downloaded, tmp)
+        os.replace(tmp, path)
+        print(f"  已從HF Hub下載最新 tick_universe.parquet → {path}", flush=True)
+    except Exception as e:
+        print(f"  HF下載失敗（{e}），改用本機現有檔案或重建", flush=True)
+
+
 def _load_or_rebuild_universe_pool(path: Path) -> pd.DataFrame:
-    """讀 db/tickers/tick_universe.parquet；檔案不存在或是空的，自動呼叫
-    finmind.tick_universe.build_tick_universe() 重建（見
-    build_and_save_subscribe_list() 的說明）。"""
+    """讀 db/tickers/tick_universe.parquet；一律先試著從HF下載最新版本
+    （見 _try_download_from_hf()），下載後（或下載失敗、沿用本機原有檔案）
+    檔案仍不存在或是空的，才自動呼叫 finmind.tick_universe.build_tick_universe()
+    整包重建（見 build_and_save_subscribe_list() 的說明）。"""
+    _try_download_from_hf(path)
     if path.exists():
         pool = pd.read_parquet(path)
         if not pool.empty:
