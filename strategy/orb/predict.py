@@ -174,7 +174,12 @@ def predict_live(
                     "high": float(g["high"].max()),
                     "low": float(g["low"].min()),
                     "close": float(g_s.iloc[-1]["close"]),
-                    "volume": int(g["volume"].sum()),
+                    # m1_live volume 單位是張，day（load_day()，db/d1）是股，
+                    # 差1000倍——同一個bug見 data/day_data_loader.py::
+                    # _download_day_fubon_intraday() 的說明，2026-08-17發現
+                    # 這裡也要乘回來，不然「今天摘要」這一列的volume會比
+                    # 正常日K小1000倍。
+                    "volume": int(g["volume"].sum()) * 1000,
                 }
             )
         if rows:
