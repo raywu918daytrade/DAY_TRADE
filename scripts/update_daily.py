@@ -68,7 +68,8 @@ from data.build_poc import build as build_poc
 from data.build_tick_adjust_factor import build as build_tick_adjust_factor
 from data.build_adjustment_factor import build as build_adjustment_factor
 from fubon.tick_api import update_tick_today
-from finmind.tick_universe import build_tick_universe
+from finmind.tick_universe import build_tick_universe, _universe_file_path
+from finmind.m1_api import _atomic_to_parquet
 
 _TW = timezone(timedelta(hours=8))
 
@@ -84,7 +85,9 @@ if __name__ == "__main__":
     update_adjustment_day()
     print("=== 建立候選股母體（tick_universe）===")
     try:
-        build_tick_universe()
+        _universe = build_tick_universe()
+        _atomic_to_parquet(_universe, _universe_file_path(), index=False, compression="zstd")
+        print(f"✓ tick_universe：已寫入 {len(_universe)} 支 → {_universe_file_path()}")
     except Exception as e:
         print(f"⚠️ tick_universe 重建失敗，跳過（不影響其他步驟）：{e}")
     print("=== 更新今天的tick ===")
