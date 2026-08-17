@@ -10,9 +10,11 @@ on_minute 觸發機制：存檔（_flush_loop，每 FUBON_WS_FLUSH_INTERVAL 秒�
 reconcile 監控不會因為行情安靜而跳過整分鐘（Fugle REST 輪詢器年代就是這樣
 設計的，2026-07-13 移除那支檔案時保留了這個保底邏輯）。
 
-股票清單來自 fubon/subscribe_list.py 存好的
-db/fubon_subscribe/subscribe_list.parquet（開盤前先跑一次
-`python -m fubon.subscribe_list` 產生），這裡只負責讀檔訂閱，不重算排序。
+股票清單來自 fubon/subscribe_list.py 驗證好的
+db/tickers/tick_universe.parquet（daytrade_ok=True 的子集，2026-08-19
+合併進候選母體檔案本身，不再另存 db/fubon_subscribe/subscribe_list.parquet，
+見該檔案的說明——開盤前先跑一次 `python -m fubon.subscribe_list` 產生），
+這裡只負責讀檔訂閱，不重算排序。
 
 補資料（backfill）：WebSocket 只會推「連線之後」的分K，如果不是一開盤就連線
 （例如盤中重啟），連線前那段會整段缺資料。start() 會**先**開好 WebSocket 連線

@@ -8,22 +8,34 @@ finmind/tick_universe.py），不再即時打富邦API抓全市場~2700支、也
 固定母體，減少訓練雜訊，也大幅減少每天開盤前的API用量/等待時間。
 
 2026-08-17改版：母體規模上限從400調成800、選股邏輯也整個換掉（改成
-db/tickers/stock_universe_2000.parquet全市場~1877支個股，篩「均量>1000張且
+db/tickers/stock_universe_2000.parquet全市場股票，篩「均量>1000張且
 ATR(14)%>1%」，通過的再依富邦當沖資格分「能多空」「只能做多」兩級，能多空
 優先、依均量排序取到上限，見 finmind/tick_universe.py 的說明）。實際跑出來
-的數字是「篩選出來多少算多少」，不強制湊滿800——2026-08-17當天跑出來是
-650支（675支通過均量+ATR篩選，其中623支能多空、26支只能做多，量能+ATR這兩
-個門檻本身就會限制住上限，不是排名/當沖資格不夠）。
+的數字是「篩選出來多少算多少」，不強制湊滿800，量能+ATR這兩個門檻本身就會
+限制住上限，不是排名/當沖資格不夠。
 
-固定母體流程（見 subscription_batches()）：
-    1. 讀 db/tickers/tick_universe.parquet 固定母體 + db/tickers/tickers.parquet
-       本地既有清單查名稱（_fixed_universe_names()，都不觸發即時富邦API）
-    2. canDayTrade/canBuyDayTrade 逐支確認（_filter_day_tradable()）——這個
-       還是每天做，確認這批候選股裡有沒有股票今天被停資/注意處置、不能當沖
-       （tick_universe.py 建置母體時查的當沖資格分級是「建置當下」的快照，
-       這裡才是每天盤前重新驗證「今天還能不能當沖」，兩層檢查目的不同）
-   最後切成每組 ≤200 支、最多 5 組（對應富邦 WebSocket rate limit：
-200 檔/連線、5 條連線 → 上限 1000 檔，母體800支上限會用到4組）。
+2026-08-19再改（重要）：拿掉原本另外存一份的 db/fubon_subscribe/
+subscribe_list.parquet，改成**直接讀寫 db/tickers/tick_universe.parquet
+本身**——原本兩個檔案內容高度重疊（同一批股票代號，只差 connection_id/
+驗證日期兩欄），使用者要求合併成一份，不要同樣的東西分兩邊存。做法：
+
+    1. 讀 db/tickers/tick_universe.parquet 現有的候選母體（avg_volume/
+       atr_pct/day_trade_tier/rank/name 這些欄位維持原樣，不受這裡影響——
+       母體要變動只能靠手動重跑 `python -m finmind.tick_universe` 整套
+       重新篩選，這裡完全不碰）
+    2. canBuyDayTrade 逐支確認（_filter_day_tradable()）——這個還是每天做，
+       確認這批候選股裡有沒有股票今天被停資/注意處置、不能當沖（跟
+       tick_universe.py 建置母體時的當沖分級是不同時間點的驗證，目的
+       不同、頻率也不同：母體是手動重建才變、這裡是每天驗證一次）
+    3. 把這次驗證結果寫回同一個檔案的 daytrade_ok（今天能不能當沖）、
+       connection_id（WebSocket分組，只有daytrade_ok=True才有值）、
+       verify_date（驗證日期）三欄——**不刪除任何一列**，今天不能當沖的
+       股票還留在檔案裡（daytrade_ok=False），不會整列消失，明天重新
+       驗證通過的話一樣能自動恢復，不用重跑整套均量/ATR篩選。
+
+分連線：切成每組 ≤200 支、最多 5 組（對應富邦 WebSocket rate limit：
+200 檔/連線、5 條連線 → 上限 1000 檔），依 rank（均量排序）分組，只對
+今天 daytrade_ok=True 的子集分組。
 
 舊的動態選股邏輯（_fubon_normal_tickers()/ranked_candidates()/
 all_normal_stocks()）保留在檔案裡沒有刪除，只是目前的日常流程不再呼叫，
@@ -33,6 +45,8 @@ all_normal_stocks()）保留在檔案裡沒有刪除，只是目前的日常流�
     - fubon/marketdata_ws.py 用分組後的 batches 決定 WebSocket 訂閱誰
     - main/premarket.py::refresh_tickers() 直接呼叫 build_and_save_subscribe_list()
       當作 state.day_trade_stocks / state.tickers 的來源
+    - pattern/pattern_api.py::_load_daytrade_list() 讀 daytrade_ok=True 的列，
+      供前端股票清單欄「當沖候選」選項用
 
 使用方式：
     main/premarket.py::refresh_tickers() 開機、每天 06:00 都會自動呼叫
@@ -41,7 +55,7 @@ all_normal_stocks()）保留在檔案裡沒有刪除，只是目前的日常流�
 
     其他地方要讀已存好的清單（不重算）：
         from fubon.subscribe_list import load_candidates, load_subscribe_batches
-        df = load_candidates()          # 完整 DataFrame（含 name）
+        df = load_candidates()          # 今天 daytrade_ok=True 的完整 DataFrame（含 name）
         batches = load_subscribe_batches()  # 分組後的 stock_id list，給 WebSocket 用
 """
 import os
@@ -59,7 +73,6 @@ _ROOT = Path(__file__).parent.parent
 load_dotenv(_ROOT / ".env", override=True)
 
 _TW = timezone(timedelta(hours=8))
-_SUBSCRIBE_PATH = _ROOT / "db/fubon_subscribe/subscribe_list.parquet"
 
 # fubon_neo SDK 底層沒有設定任何 timeout（翻過套件原始碼確認過），網路/伺服器
 # 卡住的話 REST 呼叫可能無限期不回應，2026-07-25 討論加這層保護。
@@ -114,8 +127,8 @@ def all_normal_stocks() -> list[str]:
     """完整股票母體（isNormal=true、排除債券ETF，不做均量排序/上限）。
     2026-08-01改：日常流程（data/m1_data_loader.py、data/day_data_loader.py、
     fubon/subscribe_list.py 自己）都已經改成固定讀 tick_universe（見
-    _fixed_universe_names()），不再呼叫這支——保留函式本身，之後如果要
-    重新擴大母體/改回動態選股可以直接復用，不用重寫。"""
+    build_and_save_subscribe_list()），不再呼叫這支——保留函式本身，之後
+    如果要重新擴大母體/改回動態選股可以直接復用，不用重寫。"""
     return list(_fubon_normal_tickers().keys())
 
 
@@ -128,20 +141,6 @@ def ranked_candidates(names: dict[str, str]) -> list[str]:
 
     day = load_day()
     return _volume_filter(set(names.keys()), day[["stock_id", "date", "volume"]])
-
-
-def _fixed_universe_names() -> dict[str, str]:
-    """固定候選股母體＋名稱查詢（2026-08-01加，2026-08-17改成上限800支的量能
-    +ATR+當沖資格分級篩選，見 finmind/tick_universe.py 的說明）：讀
-    db/tickers/tick_universe.parquet（name欄位2026-08-01一併加進去，不用再
-    另外讀 db/tickers/tickers.parquet）決定「有哪些股票」跟名稱——讀本機
-    檔案，不觸發即時富邦API。取代原本 _fubon_normal_tickers()（全市場
-    ~2700支）+ ranked_candidates()（20日均量動態排序）這兩步，訓練/推論/
-    交易統一用同一批固定母體。"""
-    from finmind.tick_universe import _universe_file_path
-
-    df = pd.read_parquet(_universe_file_path(), columns=["stock_id", "name"])
-    return dict(zip(df["stock_id"], df["name"].fillna("")))
 
 
 def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
@@ -201,90 +200,160 @@ def _filter_day_tradable(stock_ids: list[str]) -> list[str]:
 _FORCE_INCLUDE = ["0050"]
 
 
-def subscription_batches(names: dict[str, str]) -> list[list[str]]:
-    """把候選股切成 ≤MAX_PER_CONNECTION 支一組，最多 MAX_CONNECTIONS 組
-    （富邦 WebSocket 連線本身的 rate limit，定義在 fubon/config.py）。
+def _assign_connections(df: pd.DataFrame) -> pd.DataFrame:
+    """依 rank（均量排序）切成 ≤MAX_PER_CONNECTION 支一組、最多
+    MAX_CONNECTIONS 組（富邦 WebSocket 連線本身的 rate limit，定義在
+    fubon/config.py），回傳多一欄 connection_id 的 DataFrame。超過
+    MAX_CONNECTIONS×MAX_PER_CONNECTION 上限的股票 connection_id 是
+    pd.NA（daytrade_ok 還是True，只是這次沒被排進WebSocket訂閱分組）——
+    目前母體規模遠低於這個上限（1000支），正常不會發生，保留這段邊界
+    處理避免母體之後成長超過上限時默默出錯。"""
+    df = df.sort_values("rank").reset_index(drop=True)
+    conn = pd.Series(df.index // MAX_PER_CONNECTION, dtype="Int64")
+    df = df.assign(connection_id=conn.where(conn < MAX_CONNECTIONS))
+    return df
 
-    2026-08-01改：names 現在固定是 _fixed_universe_names() 的結果（不再是
-    ranked_candidates() 動態均量排序後的結果，2026-08-17起上限800支，見
-    finmind/tick_universe.py 的說明），這裡直接用 dict 的 key 當候選清單。
-    順序：固定母體 → canDayTrade/canBuyDayTrade 逐支確認，_FORCE_INCLUDE
-    的股票不查、無條件視為可以當沖（_filter_day_tradable）→ 分連線。母體
-    規模遠低於 MAX_CONNECTIONS×MAX_PER_CONNECTION 上限（1000支），實務上
-    不會超過4組連線。"""
-    candidates = list(names.keys())
-    candidates = _filter_day_tradable(candidates)
-    batches = [
-        candidates[i : i + MAX_PER_CONNECTION]
-        for i in range(0, len(candidates), MAX_PER_CONNECTION)
-    ]
-    return batches[:MAX_CONNECTIONS]
+
+def _load_or_rebuild_universe_pool(path: Path) -> pd.DataFrame:
+    """讀 db/tickers/tick_universe.parquet；檔案不存在或是空的，自動呼叫
+    finmind.tick_universe.build_tick_universe() 重建（見
+    build_and_save_subscribe_list() 的說明）。"""
+    if path.exists():
+        pool = pd.read_parquet(path)
+        if not pool.empty:
+            return pool
+        print(f"  {path} 是空的，", end="", flush=True)
+    else:
+        print(f"  找不到 {path}，", end="", flush=True)
+
+    print("自動重新執行 finmind.tick_universe 建立候選母體（會呼叫大量富邦API，需要幾分鐘）...", flush=True)
+    from finmind.m1_api import _atomic_to_parquet
+    from finmind.tick_universe import build_tick_universe
+
+    pool = build_tick_universe()
+    if pool.empty:
+        return pool
+    _atomic_to_parquet(pool, path, index=False, compression="zstd")
+    print(f"候選母體重建完成：{len(pool)} 支 → {path}", flush=True)
+    return pool
 
 
 def build_and_save_subscribe_list(force: bool = False) -> pd.DataFrame:
-    """算好分連線的候選股清單（含名稱），存到 db/fubon_subscribe/。
+    """更新候選股清單「今天能不能當沖」的驗證結果，直接寫回
+    db/tickers/tick_universe.parquet（見本檔案頭的2026-08-19說明，不再
+    另外存一份 db/fubon_subscribe/subscribe_list.parquet）。
     main/premarket.py::refresh_tickers() 開機、每天 06:00 都會呼叫這個，
     不用另外排程。
 
-    force=False（預設，2026-07-25新增）：如果 db/fubon_subscribe/subscribe_list.parquet
-    已經是「今天」存的，直接讀取回傳，不重新跑一次 _filter_day_tradable() 那段
-    3~4分鐘、逐支查富邦API的流程——同一天內 main/live_trader.py 重啟多次（開機時
-    的 _startup()、_daily_refresh() 的立即補載都會呼叫這支函式），沒必要每次都
-    重新查一次同一天的候選資格。force=True 才強制整個重跑（例如手動用
-    `python -m fubon.subscribe_list` 想確認今天最新結果、或懷疑舊資料有問題時）。
-    """
-    if not force and _SUBSCRIBE_PATH.exists():
-        existing = pd.read_parquet(_SUBSCRIBE_PATH)
-        if not existing.empty:
-            today = datetime.now(_TW).strftime("%Y-%m-%d")
-            saved_date = str(existing["date"].iloc[0])
-            if saved_date == today:
-                print(f"候選清單已是今天（{today}）存的，直接沿用，不重新查詢 → {_SUBSCRIBE_PATH}", flush=True)
-                return existing
+    只更新 daytrade_ok/connection_id/verify_date 三欄，候選母體本身
+    （avg_volume/atr_pct/day_trade_tier/rank/name）完全不動——母體要
+    變動只能靠手動重跑 `python -m finmind.tick_universe`。
 
-    names = _fixed_universe_names()
-    if not names:
-        print("  警告：找不到 tick_universe/tickers 本地清單，清單維持空白", flush=True)
-        return pd.DataFrame()
+    force=False（預設，2026-07-25新增）：如果 verify_date 已經是「今天」，
+    直接讀取回傳，不重新跑一次 _filter_day_tradable() 那段3~4分鐘、逐支查
+    富邦API的流程——同一天內 main/live_trader.py 重啟多次（開機時的
+    _startup()、_daily_refresh() 的立即補載都會呼叫這支函式），沒必要每次
+    都重新查一次同一天的候選資格。force=True 才強制整個重跑（例如手動用
+    `python -m fubon.subscribe_list` 想確認今天最新結果、或懷疑舊資料有
+    問題時）。
 
-    batches = subscription_batches(names)
-    date_str = datetime.now(_TW).strftime("%Y-%m-%d")
-    rows = [
-        {"stock_id": sid, "name": names.get(sid, ""), "connection_id": conn_id, "rank": rank, "date": date_str}
-        for conn_id, batch in enumerate(batches)
-        for rank, sid in enumerate(batch)
-    ]
-    df = pd.DataFrame(rows)
-    os.makedirs(_SUBSCRIBE_PATH.parent, exist_ok=True)
-    df.to_parquet(_SUBSCRIBE_PATH, index=False)
+    回傳值：只回傳今天 daytrade_ok=True 的子集（維持跟舊版
+    subscribe_list.parquet 相同的「已經是篩選過的當沖清單」語意，呼叫端
+    ——main/premarket.py::refresh_tickers()——不用另外再篩一次）。
+
+    2026-08-19加：候選母體檔案不存在或是空的（例如意外被刪掉、或
+    Dropbox同步把檔案改名的那類意外——2026-08-19實際發生過一次），
+    自動呼叫 finmind.tick_universe.build_tick_universe() 重新跑一次完整的
+    均量+ATR+當沖分級篩選並存檔，不用人工先手動執行
+    `python -m finmind.tick_universe` 才能讓系統恢復運作——代價是這種情況
+    下開機/背景重試會多花幾分鐘（逐支查富邦API），但比起卡住不動、要等
+    人發現才手動介入好。跟「今天已驗證過就不重算」的快取邏輯不衝突：
+    剛重建出來的母體還沒有 verify_date，一定會往下走真正驗證那段，正常
+    情況（檔案好好的）完全不受影響。"""
+    from finmind.tick_universe import _universe_file_path
+
+    path = _universe_file_path()
+    pool = _load_or_rebuild_universe_pool(path)
+    if pool.empty:
+        print("  警告：候選母體重建後仍是空的，清單維持空白", flush=True)
+        return pool
+
+    today = datetime.now(_TW).strftime("%Y-%m-%d")
+    if not force and "verify_date" in pool.columns and (pool["verify_date"] == today).any():
+        print(f"候選清單已是今天（{today}）驗證過，直接沿用，不重新查詢 → {path}", flush=True)
+        return pool[pool["daytrade_ok"] == True]  # noqa: E712
+
+    candidate_ids = pool["stock_id"].astype(str).tolist()
+    tradable_ids = set(_filter_day_tradable(candidate_ids))
+
+    pool = pool.copy()
+    pool["daytrade_ok"] = pool["stock_id"].astype(str).isin(tradable_ids)
+    pool["verify_date"] = today
+    pool["connection_id"] = pd.array([pd.NA] * len(pool), dtype="Int64")
+
+    ok = _assign_connections(pool[pool["daytrade_ok"]])
+    pool = pool.set_index("stock_id")
+    pool.loc[ok["stock_id"].values, "connection_id"] = ok["connection_id"].values
+    pool = pool.reset_index()
+
+    _atomic_to_parquet_local(pool, path)
+    n_conn = ok["connection_id"].nunique(dropna=True)
     print(
-        f"儲存完成：{len(df)} 支，{len(batches)} 條連線 → {_SUBSCRIBE_PATH}（{date_str}）",
+        f"儲存完成：{pool['daytrade_ok'].sum()} 支可當沖（母體共 {len(pool)} 支），{n_conn} 條連線 → {path}（{today}）",
         flush=True,
     )
-    return df
+    return pool[pool["daytrade_ok"] == True]  # noqa: E712
+
+
+def _atomic_to_parquet_local(df: pd.DataFrame, path: Path) -> None:
+    """先寫暫存檔再 rename，避免寫入過程被中斷導致 parquet 檔損毀（比照
+    finmind/m1_api.py::_atomic_to_parquet() 同樣的做法，這裡獨立一份是
+    因為那支的參數簽名跟這裡想要的不完全一樣，不強行共用）。"""
+    import tempfile
+
+    os.makedirs(path.parent, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as f:
+        tmp_path = f.name
+    try:
+        df.to_parquet(tmp_path, index=False, compression="zstd")
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
 def load_candidates() -> pd.DataFrame:
-    """讀取已存的候選股清單（不重算），欄位：stock_id/name/connection_id/rank/date。
+    """讀取今天 daytrade_ok=True 的候選股清單（不重算），欄位：
+    stock_id/avg_volume/atr_pct/day_trade_tier/rank/forced_include/name/
+    daytrade_ok/connection_id/verify_date。
 
-    找不到檔案或不是今天存的，仍照樣回傳（可能是舊清單），並印警告讓呼叫端自行判斷。
+    找不到檔案、或 verify_date 不是今天，仍照樣回傳篩過的結果（可能是舊
+    清單），並印警告讓呼叫端自行判斷。
     """
-    if not _SUBSCRIBE_PATH.exists():
-        print(f"找不到 {_SUBSCRIBE_PATH}，請先執行 python -m fubon.subscribe_list", flush=True)
+    from finmind.tick_universe import _universe_file_path
+
+    path = _universe_file_path()
+    if not path.exists():
+        print(f"找不到 {path}，請先執行 `python -m finmind.tick_universe`", flush=True)
         return pd.DataFrame()
-    df = pd.read_parquet(_SUBSCRIBE_PATH)
-    if df.empty:
-        return df
+    df = pd.read_parquet(path)
+    if df.empty or "daytrade_ok" not in df.columns:
+        print("警告：候選清單還沒做過當沖資格驗證，請先執行 `python -m fubon.subscribe_list`", flush=True)
+        return pd.DataFrame()
     today = datetime.now(_TW).strftime("%Y-%m-%d")
-    saved_date = str(df["date"].iloc[0])
-    if saved_date != today:
-        print(f"警告：候選股清單是 {saved_date} 存的，非今日（{today}），可能尚未更新", flush=True)
-    return df
+    verify_date = str(df["verify_date"].dropna().iloc[0]) if df["verify_date"].notna().any() else None
+    if verify_date != today:
+        print(f"警告：候選股清單當沖資格是 {verify_date} 驗證的，非今日（{today}），可能尚未更新", flush=True)
+    return df[df["daytrade_ok"] == True]  # noqa: E712
 
 
 def load_subscribe_batches() -> list[list[str]]:
     """開 WebSocket 連線時用：回傳依 connection_id 分組、依 rank 排序的 batches。"""
     df = load_candidates()
+    if df.empty:
+        return []
+    df = df.dropna(subset=["connection_id"])
     if df.empty:
         return []
     return [

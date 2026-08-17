@@ -90,17 +90,24 @@ except Exception:
 
 
 def _load_daytrade_list() -> List[Dict[str, str]]:
-    """讀 db/fubon_subscribe/subscribe_list.parquet——這是 main/premarket.py::
-    refresh_tickers() 每天早上6點實際呼叫 fubon/subscribe_list.py::
-    build_and_save_subscribe_list() 存下來的清單，是「今天實際會被富邦
-    WebSocket即時收集」的股票池，db/m1_live 有哪些股票就是看這份決定的。
+    """讀 db/tickers/tick_universe.parquet 裡 daytrade_ok=True 的列——這是
+    main/premarket.py::refresh_tickers() 每天早上6點實際呼叫
+    fubon/subscribe_list.py::build_and_save_subscribe_list() 驗證過的結果，
+    是「今天實際會被富邦WebSocket即時收集」的股票池，db/m1_live 有哪些
+    股票就是看這份決定的。
 
     2026-08-19改版：股票清單欄的「當沖候選」選項原本讀
-    db/tickers/tick_universe.parquet（finmind/tick_universe.py 算出來的候選
-    母體快照，篩選/建置頻率是使用者手動決定，不是每天）——這會出現「這支
-    股票明明在清單裡選得到，但今天完全沒有m1資料」的困惑（母體有它，但
-    當天實際訂閱清單沒有它，例如當沖資格臨時被取消），改讀這份「當天實際
-    訂閱清單」才會跟 db/m1_live 的真實內容一致。
+    db/tickers/tick_universe.parquet 整份（不分今天能不能當沖）——這會
+    出現「這支股票明明在清單裡選得到，但今天完全沒有m1資料」的困惑
+    （母體有它，但今天當沖資格驗證沒過，例如臨時被列入注意股/處置股），
+    改成只取 daytrade_ok=True 的子集才會跟 db/m1_live 的真實內容一致。
+
+    2026-08-19再改：原本這裡讀的是另外存的 db/fubon_subscribe/
+    subscribe_list.parquet，跟 tick_universe.parquet 內容高度重疊（同一批
+    股票代號，只差 connection_id/驗證日期），使用者要求合併成一份，daytrade_ok/
+    connection_id/verify_date 現在都是 tick_universe.parquet 自己的欄位
+    （見 fubon/subscribe_list.py::build_and_save_subscribe_list() 的說明），
+    不用再讀第二個檔案。
 
     欄位名用 stock_id（不是 id）：跟 FULL_UNIVERSE_LIST/dashboard.html
     navMonitoring() 的既有慣例一致（見那邊的說明）。每次呼叫都重新讀檔
@@ -108,11 +115,14 @@ def _load_daytrade_list() -> List[Dict[str, str]]:
     起來）——這份清單理論上一天只會被 refresh_tickers() 覆寫一次，但
     每天什麼時候被覆寫、backend process 什麼時候啟動兩者不保證誰先誰後，
     重新讀檔確保拿到當下最新版本，讀檔成本可以忽略。"""
-    path = Path(__file__).parent.parent / "db/fubon_subscribe/subscribe_list.parquet"
+    path = Path(__file__).parent.parent / "db/tickers/tick_universe.parquet"
     try:
-        df = pd.read_parquet(path, columns=["stock_id", "name"])
+        df = pd.read_parquet(path, columns=["stock_id", "name", "daytrade_ok"])
     except Exception:
         return []
+    if "daytrade_ok" not in df.columns:
+        return []
+    df = df[df["daytrade_ok"] == True]  # noqa: E712
     return [
         {"stock_id": str(sid), "name": str(name).strip()}
         for sid, name in zip(df["stock_id"], df["name"])

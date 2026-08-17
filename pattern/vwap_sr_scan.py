@@ -57,22 +57,34 @@ def normalize_universe(universe: str | None) -> str:
     return "full" if v == "full" else "daytrade"
 
 
-def _parquet_stock_ids(path: Path) -> set[str]:
+def _parquet_stock_ids(path: Path, only_col: str | None = None) -> set[str]:
+    """only_col 給的話，只留該欄位=True的列（見 stock_ids_for_universe()）。"""
     try:
-        df = pd.read_parquet(path, columns=["stock_id"])
+        cols = ["stock_id"] + ([only_col] if only_col else [])
+        df = pd.read_parquet(path, columns=cols)
     except Exception:
         return set()
     if df is None or df.empty:
         return set()
+    if only_col and only_col in df.columns:
+        df = df[df[only_col] == True]  # noqa: E712
     return set(df["stock_id"].astype(str))
 
 
 def stock_ids_for_universe(universe: str | None) -> set[str]:
-    """daytrade＝subscribe_list；讀不到才退 tick_universe。full＝2000 ∪ daytrade。"""
+    """daytrade＝tick_universe.parquet 裡 daytrade_ok=True 的列；讀不到（或
+    這欄還沒驗證過）才退整份 tick_universe。full＝2000 ∪ daytrade。
+
+    2026-08-19改：原本 daytrade 讀的是另外存的
+    db/fubon_subscribe/subscribe_list.parquet，跟 tick_universe.parquet
+    內容高度重疊，使用者要求合併成一份，daytrade_ok 現在是
+    tick_universe.parquet 自己的欄位（見 fubon/subscribe_list.py::
+    build_and_save_subscribe_list() 的說明），不用再讀第二個檔案。"""
     universe = normalize_universe(universe)
-    daytrade = _parquet_stock_ids(_ROOT / "db/fubon_subscribe/subscribe_list.parquet")
+    tick_path = _ROOT / "db/tickers/tick_universe.parquet"
+    daytrade = _parquet_stock_ids(tick_path, only_col="daytrade_ok")
     if not daytrade:
-        daytrade = _parquet_stock_ids(_ROOT / "db/tickers/tick_universe.parquet")
+        daytrade = _parquet_stock_ids(tick_path)
     if universe == "full":
         full = _parquet_stock_ids(_ROOT / "db/tickers/stock_universe_2000.parquet")
         return full | daytrade

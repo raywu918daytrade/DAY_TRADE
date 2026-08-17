@@ -47,9 +47,13 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 # 2026-08-17發現全量下載會卡在這個資料夾裡的檔案報 size mismatch
 # （HF Hub上該LFS物件本身壞掉），乾脆從源頭排除不上傳。
 #
-# db/fubon_subscribe/subscribe_list.parquet 是本機 Fubon 訂閱清單，只給本機
-# live_trader 用，不是訓練資料，也不用同步。
-_IGNORE_PATTERNS = ["*.tmp", "**/*.tmp", "m1_live/*", "fubon_subscribe/subscribe_list.parquet"]
+# 2026-08-19：db/fubon_subscribe/subscribe_list.parquet 已經合併進
+# db/tickers/tick_universe.parquet（見 fubon/subscribe_list.py 檔頭說明），
+# 不再是獨立檔案，這條 ignore pattern 拿掉——tick_universe.parquet 本身
+# 要同步（avg_volume/atr_pct/day_trade_tier 這些訓練會用到的欄位），裡面
+# 多帶的 daytrade_ok/connection_id/verify_date 幾欄是本機當天驗證結果，
+# 同步過去不會造成問題（下次任一環境的 premarket 流程重新驗證就會覆蓋）。
+_IGNORE_PATTERNS = ["*.tmp", "**/*.tmp", "m1_live/*"]
 
 
 def main(path_in_repo: str = "db", only: list[str] | None = None):

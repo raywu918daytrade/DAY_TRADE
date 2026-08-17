@@ -39,7 +39,9 @@ update_daily.py 裡大部分增量/快路徑邏輯（`_last_stored_dates()`、
 抓取範圍：
     - 全拉（小，合計數十MB量級）：d1、adjustment_day、volume_profile、
       poc_day、breakout_retest_day、breakout_retest_trigger、tickers、
-      fubon_subscribe、margin、info，以及所有 *_flags。
+      margin、info，以及所有 *_flags。2026-08-19：db/fubon_subscribe/
+      已經合併進 db/tickers/tick_universe.parquet（見
+      fubon/subscribe_list.py 檔頭說明），不再是獨立資料夾，這裡拿掉。
     - 只拉最近 _RECENT_MONTHS_COUNT 個月：m1、tick。
     - 完全不拉：adjustment_factor、tick_adjust_factor、m3、m5、m3_std、
       m5_std（理由見上方）。
@@ -75,7 +77,7 @@ _FULL_PULL_FOLDERS = [
     "d1", "adjustment_day",
     "volume_profile", "poc_day",
     "breakout_retest_day", "breakout_retest_trigger",
-    "tickers", "fubon_subscribe", "margin", "info",
+    "tickers", "margin", "info",
     "d1_flags", "adjustment_day_flags", "m1_flags", "tick_flags",
 ]
 _RECENT_MONTHS_FOLDERS = ["m1", "tick"]
