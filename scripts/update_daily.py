@@ -1,13 +1,23 @@
 """
 本機執行用：依序跑完 m1_data_loader.update_m1() → day_data_loader.update_day()
-→ day_data_loader.update_adjustment_day() → fubon.tick_api.update_tick_today() →
-build_volume_profile.build() → build_poc.build() → build_tick_adjust_factor.build() →
-build_adjustment_factor.build() → build_m3_m5_rolling.build() →
-build_m3_m5_std.build()。
+→ day_data_loader.update_adjustment_day() → finmind.tick_universe.build_tick_universe()
+→ fubon.tick_api.update_tick_today() → build_volume_profile.build() → build_poc.build() →
+build_tick_adjust_factor.build() → build_adjustment_factor.build() →
+build_m3_m5_rolling.build() → build_m3_m5_std.build()。
 
-前四支要打 API（Fugle/富邦），後面幾支只讀本機資料做聚合，不吃 API，所以
+前面幾支要打 API（Fugle/富邦），後面幾支只讀本機資料做聚合，不吃 API，所以
 接在下載完之後、用 --incremental 只重建有更新的月份即可。build_poc 依賴
 build_volume_profile 的輸出（db/volume_profile/），所以順序不能對調。
+
+2026-08-19加 build_tick_universe()：候選股母體（db/tickers/tick_universe.
+parquet）原本只靠 fubon/subscribe_list.py 在 live_trader.py 開機/每日06:00
+時自我修復重建，本機/GHA各自獨立觸發、也沒有同步到HF——若某個環境（例如
+沒有本機既有db/的雲端部署）開機時發現檔案不存在，會觸發完整重建（實測
+~6分鐘、打幾百次富邦API查當沖資格），拖慢開機速度。改成併入這支本機/GHA
+共用的每日排程統一重建一次，重建結果正常同步到HF（見 push_db_to_hf.py 的
+_IGNORE_PATTERNS 已拿掉這份檔案的排除規則），其他環境開機時只要下載現成
+檔案，subscribe_list.py 會偵測到 verify_date 不是今天，走既有的「輕量
+重新驗證」路徑（不是完整重建），不用改 subscribe_list.py 任何程式碼。
 
 2026-08-14拿掉 build_breakout_retest_day／build_breakout_retest_trigger：
 這兩支是給 strategy/breakout_retest_ml 用的候選事件表，但這個策略目前
@@ -58,6 +68,7 @@ from data.build_poc import build as build_poc
 from data.build_tick_adjust_factor import build as build_tick_adjust_factor
 from data.build_adjustment_factor import build as build_adjustment_factor
 from fubon.tick_api import update_tick_today
+from finmind.tick_universe import build_tick_universe
 
 _TW = timezone(timedelta(hours=8))
 
@@ -71,6 +82,11 @@ if __name__ == "__main__":
     update_day()
     print("=== 下載日K（完整還原，db/adjustment_day，pattern專用）===")
     update_adjustment_day()
+    print("=== 建立候選股母體（tick_universe）===")
+    try:
+        build_tick_universe()
+    except Exception as e:
+        print(f"⚠️ tick_universe 重建失敗，跳過（不影響其他步驟）：{e}")
     print("=== 更新今天的tick ===")
     tick_ok = True
     try:

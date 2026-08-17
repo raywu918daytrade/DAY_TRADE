@@ -47,10 +47,12 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 # 2026-08-17發現全量下載會卡在這個資料夾裡的檔案報 size mismatch
 # （HF Hub上該LFS物件本身壞掉），乾脆從源頭排除不上傳。
 #
-# db/tickers/tick_universe.parquet：本機一定比 HF Hub 新（本機隨時在重算候選股
-# 母體），GHA 端的 update_daily.py 也完全不讀這份清單（download_hf_for_gha.py
-# 拉 tickers 資料夾純粹是死重量，沒人用），排除不上傳。
-_IGNORE_PATTERNS = ["*.tmp", "**/*.tmp", "m1_live/*", "tickers/tick_universe.parquet"]
+# db/tickers/tick_universe.parquet：2026-08-19起改由 update_daily.py 統一
+# 呼叫 finmind.tick_universe.build_tick_universe() 每天重建一次（見該檔案
+# 說明），本機/GHA共用同一份結果，不再各自獨立重建，正常同步上傳，讓沒有
+# 本機既有db/的環境（例如雲端部署）開機時能直接下載現成檔案，不用觸發
+# fubon/subscribe_list.py 裡最貴的完整重建路徑（~6分鐘、打幾百次富邦API）。
+_IGNORE_PATTERNS = ["*.tmp", "**/*.tmp", "m1_live/*"]
 
 
 def main(path_in_repo: str = "db", only: list[str] | None = None):
