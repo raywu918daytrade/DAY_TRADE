@@ -326,6 +326,7 @@ _conflict_signals: list = []  # 今日「多空衝突（反轉）」記錄，見
 _vwap_breakout_signals: list = []  # 今日「VWAP突破/跌破」記錄，見 push_vwap_breakout()
 _sr_vwap_cross_signals: list = []  # 今日「VWAP + 壓力/支撐穿越」記錄，見 push_sr_vwap_cross()
 _vwap_macd_live: dict | None = None  # 今日 MACD 背離（on_minute 每分鐘覆寫）
+_vwap_chg: dict = {}  # stock_id → 目前漲跌幅%（昨收）
 _strategies_registry: dict = {"strategies": [], "consensus_top_n": 0}  # 見 set_strategies()
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
 
@@ -421,7 +422,7 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals, _sr_vwap_cross_signals, _vwap_macd_live
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals, _sr_vwap_cross_signals, _vwap_macd_live, _vwap_chg
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -440,6 +441,7 @@ def _reset_if_new_day():
         _vwap_breakout_signals.clear()
         _sr_vwap_cross_signals.clear()
         _vwap_macd_live = None
+        _vwap_chg.clear()
         _summary = dict(_SUMMARY_DEFAULT)
 
 
@@ -757,6 +759,26 @@ def push_vwap_macd_div(minute_str: str, stocks: dict):
         _reset_if_new_day()
         _vwap_macd_live = stocks or {}
     _broadcast({"type": "vwap_macd_div", "minute": minute_str[11:16]})
+
+
+@app.get(
+    "/vwap_chg",
+    tags=["訊號"],
+    summary="目前每檔股票的漲跌幅%（昨收基準），供前端VWAP突破欄「漲幅」欄位初始載入用",
+)
+def vwap_chg_today():
+    with _lock:
+        return dict(_vwap_chg)
+
+
+def push_vwap_chg(minute_str: str, stocks: dict):
+    """盤中每股目前漲跌幅%（相對昨收）。VWAP 清單顯示用。"""
+    global _vwap_chg
+    print(f"[push_vwap_chg] {minute_str} {len(stocks)} 檔", flush=True)
+    with _lock:
+        _reset_if_new_day()
+        _vwap_chg = stocks or {}
+    _broadcast({"type": "vwap_chg", "stocks": dict(_vwap_chg)})
 
 
 def push_candles(stock_id: str, candles: list):

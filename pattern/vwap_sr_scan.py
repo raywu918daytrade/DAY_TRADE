@@ -346,6 +346,46 @@ def last_m1_bars(date_str: str, universe: str = "daytrade") -> int:
     return _m1_bars.get((date_str, normalize_universe(universe)), 0)
 
 
+def last_chg_map(date_str: str, universe: str = "daytrade") -> dict[str, float]:
+    """每股最新 1 分收相對昨收漲跌幅（%）。重現／catchup 用。"""
+    m1 = load_day_m1(date_str, universe=universe)
+    if m1 is None or m1.empty:
+        return {}
+    m1 = m1.copy()
+    m1["stock_id"] = m1["stock_id"].astype(str)
+    m1["date"] = pd.to_datetime(m1["date"], format="mixed")
+    last = m1.sort_values("date").groupby("stock_id", sort=False)["close"].last()
+
+    from data.adjustment_query import load_pattern_day
+
+    hist_start = (pd.Timestamp(date_str) - pd.Timedelta(days=20)).strftime("%Y-%m-%d")
+    day = load_pattern_day(start_date=hist_start, end_date=date_str)
+    prev: dict[str, float] = {}
+    if day is not None and not day.empty:
+        day = day.copy()
+        day["stock_id"] = day["stock_id"].astype(str)
+        day["date"] = pd.to_datetime(day["date"], format="mixed")
+        before = day[day["date"] < pd.Timestamp(date_str)]
+        if not before.empty:
+            prev = (
+                before.sort_values("date")
+                .groupby("stock_id", sort=False)["close"]
+                .last()
+                .astype(float)
+                .to_dict()
+            )
+
+    out: dict[str, float] = {}
+    for sid, close in last.items():
+        pc = prev.get(sid)
+        if pc is None or not np.isfinite(pc) or pc <= 0:
+            continue
+        if not np.isfinite(close):
+            continue
+        out[str(sid)] = round((float(close) / float(pc) - 1.0) * 100, 2)
+    return out
+
+
 def scan_date(date_str: str, universe: str = "daytrade") -> tuple[list, list]:
     """掃某一曆日，回傳 (vwap_breakouts, sr_vwap_hits)。過去日期 cache 事件；
     今日每次重算（m1_live 可能還在寫），SR 水位仍 cache。

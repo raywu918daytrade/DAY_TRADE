@@ -83,6 +83,7 @@ from api import (
     push_signals,
     push_sr_vwap_cross,
     push_vwap_breakout,
+    push_vwap_chg,
     push_vwap_macd_div,
     register_vwap_sr_catchup_hook,
     set_strategies,
@@ -338,6 +339,7 @@ def _refresh_sr_levels(date_str: str):
     stocks = {str(s) for s in (state.day_trade_stocks or state.tickers.keys())}
     if not stocks:
         state.sr_levels = {}
+        state.sr_prev_close = {}
         state.sr_levels_date = date_str
         return
     hist_start = (pd.Timestamp(date_str) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
@@ -345,21 +347,26 @@ def _refresh_sr_levels(date_str: str):
     day = load_pattern_day(start_date=hist_start, end_date=date_str)
     if day.empty:
         state.sr_levels = {}
+        state.sr_prev_close = {}
         state.sr_levels_date = date_str
         print("  [SR水位] 無日K", flush=True)
         return
     day["stock_id"] = day["stock_id"].astype(str)
     cutoff = pd.Timestamp(date_str)
     levels = {}
+    prev_closes = {}
     for sid, g in day.groupby("stock_id", sort=False):
         sid = str(sid)
         if sid not in stocks:
             continue
-        hist = g.loc[g["date"] < cutoff]
+        hist = g.loc[g["date"] < cutoff].sort_values("date")
+        if not hist.empty:
+            prev_closes[sid] = float(hist["close"].iloc[-1])
         res, sup = horizontal_sr_prices(hist)
         if res is not None or sup is not None:
             levels[sid] = (res, sup)
     state.sr_levels = levels
+    state.sr_prev_close = prev_closes
     state.sr_levels_date = date_str
     print(f"  [SR水位] {len(levels)} 檔有壓力/支撐", flush=True)
 
@@ -402,12 +409,14 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     vwap_breakouts = []
     sr_vwap_hits = []
     macd_by_sid: dict = {}
+    chg_map: dict = {}
 
     if not m1_live.empty:
         from pattern.vwap_sr_scan import events_for_group
         from pattern.vwap_macd_div import all_divs_for_group
 
         hhmm = minute_str[11:16]
+        pc_map = state.sr_prev_close or {}
         for sid, g in m1_live.groupby("stock_id"):
             candles = []
             for _, row in g.iterrows():
@@ -425,6 +434,11 @@ def on_minute(minute_str: str, df: pd.DataFrame):
                 )
             push_candles(str(sid), candles)
             sid = str(sid)
+            if candles:
+                pc = pc_map.get(sid)
+                last = candles[-1]["close"]
+                if pc and pc > 0:
+                    chg_map[sid] = round((last / pc - 1.0) * 100, 2)
 
             macd_evs = all_divs_for_group(g)
             if macd_evs:
@@ -474,6 +488,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         )
     if not m1_live.empty:
         push_vwap_macd_div(minute_str, macd_by_sid)
+        push_vwap_chg(minute_str, chg_map)
 
     from api import get_setting
 

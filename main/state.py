@@ -77,6 +77,7 @@ class AppState:
         # 的股票（跟 VWAP 突破同一輪 m1 算出來）。同一支可多次推進新框。
         self.sr_levels: dict[str, tuple[float, float]] = {}  # stock_id → (res, sup)
         self.sr_levels_date: str = ""
+        self.sr_prev_close: dict[str, float] = {}  # stock_id → D 前一日收，給 VWAP 清單漲跌幅
         self.vwap_crossed_today: set[str] = set()
         self.sr_vwap_fired_today: set[str] = set()
 
