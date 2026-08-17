@@ -6,7 +6,7 @@ db/tick_live/{日期}.parquet，schema 跟 db/tick（見 finmind/tick_api.py）
 ticks_by_stock 參數）。
 
 跟 FubonM1Collector 刻意分開的原因：
-1. 只做「收→buffer→定期存檔」，不補歷史缺口（_backfill_intraday）、不驅動
+1. 只做「收→buffer→定期存檔」，不補歷史缺口（_backfill_m1_live）、不驅動
    on_minute() 的每分鐘觸發時機——目前只需要「能收 tick」，不需要這些。
 2. 策略還在開發中，tick 解析可能有 bug；獨立成一支檔案，出問題不會拖累
    已經上線在跑其他策略的 candles collector。

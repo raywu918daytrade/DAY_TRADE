@@ -87,7 +87,7 @@ class AppState:
         self.executor = None
 
         # 盤中重啟時，db/m1_live/ 可能有缺口（連線建立前那段沒有即時資料），
-        # fubon/marketdata_ws.py::FubonM1Collector._backfill_intraday() 會用
+        # fubon/marketdata_ws.py::FubonM1Collector._backfill_m1_live() 會用
         # REST 補這個缺口，補完才 set() 這個 flag（2026-07-25討論）。
         # main/live_trader.py::on_minute() 用這個決定要不要先跳過推論——沒補完
         # 前，m1_live 資料不完整，貿然推論算出來的機率不可靠，寧可先不推論

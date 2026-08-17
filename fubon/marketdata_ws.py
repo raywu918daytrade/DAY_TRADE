@@ -115,7 +115,7 @@ class FubonM1Collector:
     def __init__(self, on_minute=None, backfill_done=None, on_token_ready=None):
         self._on_minute = on_minute
         # threading.Event（見 main/state.py::AppState.backfill_done 的說明），
-        # _backfill_intraday() 補完才 set()，讓呼叫端（on_minute）知道資料
+        # _backfill_m1_live() 補完才 set()，讓呼叫端（on_minute）知道資料
         # 缺口補齊了沒有。留空（手動測試/單獨跑這個檔案時）就不做這個追蹤。
         self._backfill_done = backfill_done
         # 選填 callback(token)，在拿到 realtime_token() 之後立刻呼叫（見 start()）。
@@ -188,7 +188,7 @@ class FubonM1Collector:
         date_str = datetime.now(_TW).strftime("%Y-%m-%d")
         all_symbols = [sid for batch in batches for sid in batch]
         self._total_subscribed = len(all_symbols)
-        threading.Thread(target=self._backfill_intraday, args=(all_symbols, date_str), daemon=True).start()
+        threading.Thread(target=self._backfill_m1_live, args=(all_symbols, date_str), daemon=True).start()
 
         threading.Thread(target=self._flush_loop, daemon=True).start()
         self._minute_tick_loop()  # 主執行緒 block 在這裡，直到 stop() 被呼叫
@@ -222,7 +222,7 @@ class FubonM1Collector:
 
     # ── 背景補歷史缺口（寫進共用 buffer，不直接存檔）─────────────────────
 
-    def _backfill_intraday(self, symbols: list[str], date_str: str):
+    def _backfill_m1_live(self, symbols: list[str], date_str: str):
         """用 REST 補「WebSocket 連線前」缺的分K，寫進跟即時資料共用的
         self._buffer（由 _flush_loop 統一存檔），不直接呼叫存檔函式——避免
         這個背景執行緒跟 _flush_loop 同時讀寫同一個檔案造成 race condition。

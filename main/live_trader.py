@@ -539,7 +539,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     # 物件，這裡的判斷才會生效）。快取只在這個 on_minute() 呼叫內有效，下一
     # 分鐘重新算，不用煩惱資料過期。
     _infer_cache: dict[tuple[int, int], list[dict]] = {}
-    # 盤中重啟時 db/m1_live/ 可能有缺口，collector 的 _backfill_intraday()
+    # 盤中重啟時 db/m1_live/ 可能有缺口，collector 的 _backfill_m1_live()
     # 補完前先跳過整段推論（2026-07-25討論）——資料不完整時貿然推論，算出來
     # 的機率不可靠。K線/報價（上面已經推送）不受影響照常更新；既有持倉的
     # SL/TP 監控（下面 reconcile()）也不受影響，只有「這一分鐘要不要產生

@@ -3,7 +3,7 @@
 在收），立刻用現有資料跑一次 predict_live()，填 SSE monitoring，不用等下一個
 分鐘 tick。只在開機呼叫一次，不是排程。
 
-跟 fubon/marketdata_ws.py::_backfill_intraday() 是不同層級的東西：那支是用
+跟 fubon/marketdata_ws.py::_backfill_m1_live() 是不同層級的東西：那支是用
 REST 補「WebSocket 連線前」缺的原始分K（寫進 db/m1_live/），這裡是用「已經
 在 db/m1_live/ 的資料」跑一次推論（填前端監控畫面），兩者互不重疊。
 """
