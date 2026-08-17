@@ -42,7 +42,14 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 # _atomic_to_parquet()（各下載器共用的原子寫入 helper）寫入中會先產生 .tmp
 # 暫存檔再 rename，正常情況下不該遺留在 db/ 底下，但防呆排除，避免不小心把
 # 寫入中的半成品推上去。
-_IGNORE_PATTERNS = ["*.tmp", "**/*.tmp"]
+#
+# db/m1_live 是盤中即時分K，本機自己有就好、不需要也不該同步到 HF Hub：
+# 2026-08-17發現全量下載會卡在這個資料夾裡的檔案報 size mismatch
+# （HF Hub上該LFS物件本身壞掉），乾脆從源頭排除不上傳。
+#
+# db/fubon_subscribe/subscribe_list.parquet 是本機 Fubon 訂閱清單，只給本機
+# live_trader 用，不是訓練資料，也不用同步。
+_IGNORE_PATTERNS = ["*.tmp", "**/*.tmp", "m1_live/*", "fubon_subscribe/subscribe_list.parquet"]
 
 
 def main(path_in_repo: str = "db", only: list[str] | None = None):

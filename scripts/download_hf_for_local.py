@@ -29,6 +29,16 @@ push_db_to_hf.py 改成把整個本機 `db/` 資料夾原樣鏡像到 HF Hub 的
     python -m scripts.download_hf_for_local                # 下載整個 db/
     python -m scripts.download_hf_for_local --only m1 d1    # 只下載指定子資料夾
 
+2026-08-17遇過：全量下載卡在最後一兩個檔案，報
+`RuntimeError: File size mismatch: expected X bytes but downloaded Y bytes`
+（xet 傳輸協定）或對應的 `OSError: Consistency check failed`（一般 HTTP），
+且同一個檔案重試多次報的 expected/實際 bytes 數字都一樣——不是網路不穩,
+換一次性關掉 xet 改走一般 HTTP 下載通常能繞過：
+    HF_HUB_DISABLE_XET=1 python -m scripts.download_hf_for_local
+如果還是同一個檔案報同樣的 mismatch，改用 `--only` 分批下載繞過那個資料夾，
+問題出在 HF Hub 上那個特定 LFS 物件本身（不是本機端），要用
+scripts/push_db_to_hf.py 重新推一次正確版本才會根治。
+
 --repo-id：選填，覆蓋 .env 的 HF_REPO_ID，改從指定的其他 HF dataset repo
 下載。用途：一次性從別的repo補資料，不影響 .env 設定的預設repo（不帶這個
 參數時行為完全不變）。
