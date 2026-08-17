@@ -93,6 +93,19 @@ def update_tickers() -> pd.DataFrame:
     從富邦 intraday.tickers() 取得當日可交易股票清單（TWSE + TPEx），濾掉
     industry 非數字的垃圾代碼和債券型ETF，存到 db/tickers/tickers.parquet。
     建議每日開盤前呼叫一次。
+
+    2026-08-19改：is_normal=False（不是預設的True）——實測過富邦這個參數
+    是「True=只回傳正常股、False=正常+異常股全部都回傳（True的超集，不是
+    互斥的另一組）」，不是「篩選成只剩異常股」。改成False是為了讓這份清單
+    （進而 finmind/stock_universe_2000.py 篩出來的母體、m1/d1歷史資料收集
+    範圍）涵蓋最大範圍，不要因為某支股票在抓這份清單當下剛好是注意股/
+    處置股，就永久被排除在歷史資料收集之外（2026-08-19發現：3481這類正常
+    交易、成交量前幾名的股票，因為 tickers.parquet 沒有定期更新+isNormal
+    篩選，完全沒被收進候選母體）。「今天能不能實際當沖」這個判斷交給
+    fubon/subscribe_list.py::_filter_day_tradable()（canBuyDayTrade/
+    canDayTrade，比isNormal更直接反映當沖資格）跟
+    finmind/tick_universe.py::_check_day_trade_tiers() 那兩層去做，不需要
+    在這裡就先篩掉。
     """
     from fubon import fubon_api as trade_api
 
@@ -102,7 +115,7 @@ def update_tickers() -> pd.DataFrame:
         trade_api.init_market_data(sdk)
         rows = []
         for exchange in ("TWSE", "TPEx"):
-            for item in trade_api.intraday_tickers(sdk, exchange, type_="EQUITY"):
+            for item in trade_api.intraday_tickers(sdk, exchange, type_="EQUITY", is_normal=False):
                 sid = item["symbol"]
                 name = item.get("name", "")
                 industry = item.get("industry", "")

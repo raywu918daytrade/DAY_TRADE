@@ -459,22 +459,13 @@ def get_latest_candle_timestamp(timeframe: str = "day", date: Optional[str] = No
 def get_stocks_10d_avg_vol_lots(date: Optional[str] = None) -> Dict[str, float]:
     """從 db/adjustment_day/ 計算全市場各股票近 10 個交易日的平均成交量 (單位: 張 = 1000 股)。
 
+    2026-08-19改：實作搬到 data/adjustment_query.py::avg_volume_lots()（跟
+    finmind/tick_universe.py 候選股篩選共用同一套邏輯，天數當參數，見該函式
+    的說明）——這支函式留著只是不想動 pattern_api.py 既有的呼叫點名稱。
+
     Returns:
         Dict[stock_id, float] (例如 {"2330": 28450.5})
     """
-    ref_date = date if (date and isinstance(date, str)) else "today"
-    cutoff = (pd.Timestamp(ref_date) - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
-    df = load_pattern_day(start_date=cutoff)
-    if df.empty:
-        return {}
-    if date and isinstance(date, str):
-        df = df[df["date"] <= f"{date} 23:59:59"]
+    from data.adjustment_query import avg_volume_lots
 
-    avg_vols = {}
-    for sid, group in df.groupby("stock_id"):
-        recent10 = group.drop_duplicates(subset=["date"], keep="last").sort_values("date").tail(10)
-        if not recent10.empty:
-            avg_shares = float(recent10["volume"].mean())
-            avg_vols[str(sid)] = round(avg_shares / 1000.0, 1)
-
-    return avg_vols
+    return avg_volume_lots(window=10, date=date)

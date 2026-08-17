@@ -82,16 +82,11 @@ def _load_recent_day_k(lookback_days: int = _FETCH_CALENDAR_DAYS) -> pd.DataFram
     return df[df["date"] >= start]
 
 
-def _compute_metrics(day_df: pd.DataFrame) -> pd.DataFrame:
-    """回傳每支股票的 avg_volume_lots（最近 _AVG_VOL_WINDOW 個交易日均量，張）、
-    atr_pct（最新一筆 ATR(14) 佔收盤價百分比）。index 是 stock_id，缺 ATR
-    （例如新上市不到14個交易日）的股票直接濾掉（dropna），不是均量/ATR不合
-    門檻——這兩件事分開處理，第2步再做門檻比較。
-
-    ATR 用抓進來的「全部」歷史算 rolling（比 _AVG_VOL_WINDOW 更早的資料只是
-    給 ATR14 暖機用，不會被當成均量的一部分）；均量則只取每支股票最後
-    _AVG_VOL_WINDOW 筆（day_df 已經依 stock_id/date 排序，tail(N) 就是「最近
-    N個交易日」，不是日曆天）。"""
+def _compute_atr_pct(day_df: pd.DataFrame) -> pd.Series:
+    """回傳每支股票最新一筆 ATR(14) 佔收盤價百分比（index 是 stock_id）。缺
+    ATR（例如新上市不到14個交易日）的股票直接濾掉（dropna），不是門檻判斷，
+    門檻比較留給呼叫端。ATR 用抓進來的「全部」歷史算 rolling（比
+    _AVG_VOL_WINDOW 更早的資料只是給 ATR14 暖機用）。"""
     day_df = day_df.sort_values(["stock_id", "date"])
     g = day_df.groupby("stock_id")
     prev_close = g["close"].shift(1)
@@ -108,10 +103,24 @@ def _compute_metrics(day_df: pd.DataFrame) -> pd.DataFrame:
         lambda s: s.rolling(_ATR_WINDOW, min_periods=_ATR_WINDOW).mean()
     )
     day_df["_atr_pct"] = day_df["_atr14"] / day_df["close"] * 100
+    return day_df.dropna(subset=["_atr_pct"]).groupby("stock_id")["_atr_pct"].last()
 
-    recent = day_df.groupby("stock_id", group_keys=False).tail(_AVG_VOL_WINDOW)
-    avg_vol_lots = recent.groupby("stock_id")["volume"].mean() / 1000.0  # 股數轉張數
-    latest_atr_pct = day_df.dropna(subset=["_atr_pct"]).groupby("stock_id")["_atr_pct"].last()
+
+def _compute_metrics(day_df: pd.DataFrame) -> pd.DataFrame:
+    """回傳每支股票的 avg_volume_lots（最近 _AVG_VOL_WINDOW 個交易日均量，張）、
+    atr_pct（最新一筆 ATR(14) 佔收盤價百分比）。index 是 stock_id。
+
+    均量改呼叫 data.adjustment_query.avg_volume_lots()（2026-08-19合併，見
+    該函式的說明）——原本這裡自己用 day_df 現算，沒有走
+    _adjust_volume_only() 的拆股volume校正，跟 pattern/data_loader.py 那份
+    10日均量邏輯不一致，同一支股票兩邊算出來的均量可能對不上（使用者
+    2026-08-19實測發現 5488 用這裡算超過1000張門檻、用另一份10日邏輯只有
+    731張）。ATR 不受這個問題影響（用的是 high/low/close，不是volume），
+    繼續用這支自己抓的 day_df 現算，不用額外呼叫。"""
+    from data.adjustment_query import avg_volume_lots as _avg_volume_lots_shared
+
+    latest_atr_pct = _compute_atr_pct(day_df)
+    avg_vol_lots = pd.Series(_avg_volume_lots_shared(window=_AVG_VOL_WINDOW), dtype="float64")
 
     return pd.DataFrame({"avg_volume_lots": avg_vol_lots, "atr_pct": latest_atr_pct}).dropna()
 

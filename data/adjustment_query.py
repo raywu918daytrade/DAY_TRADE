@@ -108,6 +108,39 @@ def load_pattern_day_by_stock(stock_id: str, date: str = None) -> pd.DataFrame:
     return df.sort_values("date").reset_index(drop=True)
 
 
+def avg_volume_lots(window: int = 10, date: str | None = None) -> dict[str, float]:
+    """算全市場各股票近 window 個交易日的平均成交量（張 = 1000股）。
+
+    2026-08-19合併：原本 pattern/data_loader.py::get_stocks_10d_avg_vol_lots()
+    （固定10日，型態掃描的均量過濾用）跟 finmind/tick_universe.py（候選股
+    篩選，固定20日）各自寫了一份幾乎一樣的邏輯——後者原本直接讀
+    db/adjustment_day 現算，沒有走 load_pattern_day() 的 _adjust_volume_only()
+    volume拆股校正（0050這類經歷過拆股的股票，沒校正的話均量會算錯，見
+    _adjust_volume_only() 的說明），是實際的正確性差異，不只是重複程式碼
+    的問題。使用者要求「不要同一個功能在那麼多地方」，合併成一份、天數當
+    參數，兩邊各自傳自己要的 window，統一走這裡唯一一份volume校正邏輯。
+
+    Returns:
+        Dict[stock_id, float]（例如 {"2330": 28450.5}）
+    """
+    ref_date = date if (date and isinstance(date, str)) else "today"
+    cutoff = (pd.Timestamp(ref_date) - pd.Timedelta(days=max(60, window * 3 + 20))).strftime("%Y-%m-%d")
+    df = load_pattern_day(start_date=cutoff)
+    if df.empty:
+        return {}
+    if date and isinstance(date, str):
+        df = df[df["date"] <= f"{date} 23:59:59"]
+
+    avg_vols = {}
+    for sid, group in df.groupby("stock_id"):
+        recent = group.drop_duplicates(subset=["date"], keep="last").sort_values("date").tail(window)
+        if not recent.empty:
+            avg_shares = float(recent["volume"].mean())
+            avg_vols[str(sid)] = round(avg_shares / 1000.0, 1)
+
+    return avg_vols
+
+
 def _load_adjustment_factor(
     stock_id: str | None,
     date: str | None,

@@ -18,6 +18,7 @@ GH Actions / 手動執行：把本機整個 db/ 資料夾鏡像同步推到 HF H
 
 用法：
     python -m scripts.push_db_to_hf
+    python -m scripts.push_db_to_hf --only tickers 更新 hf 清單
     python -m scripts.push_db_to_hf --only m1        # 只推指定的 db/ 子資料夾（可多個）
     python -m scripts.push_db_to_hf --path-in-repo db  # 預設值，通常不用改
 """

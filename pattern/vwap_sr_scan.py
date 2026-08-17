@@ -249,6 +249,8 @@ def events_for_group(
         return vwap_events, sr_events
     g = g.sort_values("date")
     closes = g["close"].astype(float).to_numpy()
+    highs = g["high"].astype(float).to_numpy()
+    lows = g["low"].astype(float).to_numpy()
     vols = g["volume"].astype(float).to_numpy()
     times = g["date"].to_numpy()
     cum_vol = vols.cumsum()
@@ -281,12 +283,22 @@ def events_for_group(
     if not sr:
         return vwap_events, sr_events
     res, sup = sr
+    # 2026-08-17改：原本用「收盤價 vs 前一根收盤價」判斷有沒有穿越壓力/支撐，
+    # 抓不到「這根K棒的高低價曾經觸及/突破，但收盤又拉回」的情況——例如
+    # 6770 2026-08-17開盤09:00 high=79.9 直接站上壓力79.2，但那根收盤78.7已經
+    # 拉回，全天每根收盤價都沒超過79.2，res_flip 永遠是 False，SR燈不會亮，
+    # 但盤中明明已經測過這個壓力（使用者回報）。改用「這根高/低價有沒有
+    # 觸及水位」當狀態，觸及狀態前後改變才算一次「flip」（跟原本收盤價的
+    # flip 邏輯同一種寫法，只是判斷觸及與否的欄位從 close 換成 high/low），
+    # 壓力用 high、支撐用 low，不再要求收盤價真的站上/跌破。
     res_flip = np.zeros(len(closes), dtype=bool)
     if res is not None:
-        res_flip[1:] = (closes[1:] >= res) != (closes[:-1] >= res)
+        res_touch = highs >= res
+        res_flip[1:] = res_touch[1:] != res_touch[:-1]
     sup_flip = np.zeros(len(closes), dtype=bool)
     if sup is not None:
-        sup_flip[1:] = (closes[1:] >= sup) != (closes[:-1] >= sup)
+        sup_touch = lows <= sup
+        sup_flip[1:] = sup_touch[1:] != sup_touch[:-1]
     sr_flip = res_flip | sup_flip
     if not sr_flip.any():
         return vwap_events, sr_events
