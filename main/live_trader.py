@@ -214,14 +214,17 @@ def _startup():
         state.day = pd.DataFrame()
         print("[D1] 非盤中，跳過日K載入（_daily_refresh 06:00 更新）", flush=True)
 
-    print("盤前預算快取...", flush=True)
-    try:
-        _premarket.refresh_prewarm(state)
-        print(
-            f"✓ 盤前快取完成：{ {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()} }", flush=True
-        )
-    except Exception as e:
-        print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
+    if state.strategies:
+        print("盤前預算快取...", flush=True)
+        try:
+            _premarket.refresh_prewarm(state)
+            print(
+                f"✓ 盤前快取完成：{ {s.name: list(s.prewarm_cache.keys()) for s in state.strategies.values()} }", flush=True
+            )
+        except Exception as e:
+            print(f"✗ 盤前快取失敗，改用 predict_live() 內建 fallback: {e}", flush=True)
+    else:
+        print("[盤前快取] 沒有載入任何策略，跳過（省記憶體，orb等策略要載入全歷史分K算快取）", flush=True)
 
     # 啟動補載：若今日已有 m1_live，立刻跑推論填 _monitoring（不用等下一分鐘）
     run_startup_backfill(state)
@@ -292,7 +295,7 @@ def _daily_refresh():
             except Exception as e:
                 print(f"  更新失敗: {e}")
 
-        need_prewarm = last_prewarm != today and (now.hour, now.minute) >= (8, 45)
+        need_prewarm = state.strategies and last_prewarm != today and (now.hour, now.minute) >= (8, 45)
         if need_prewarm:
             print(f"[{now.strftime('%H:%M')}] 盤前策略快取重算...")
             try:
