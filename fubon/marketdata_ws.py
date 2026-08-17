@@ -188,7 +188,20 @@ class FubonM1Collector:
         date_str = datetime.now(_TW).strftime("%Y-%m-%d")
         all_symbols = [sid for batch in batches for sid in batch]
         self._total_subscribed = len(all_symbols)
-        threading.Thread(target=self._backfill_m1_live, args=(all_symbols, date_str), daemon=True).start()
+        # 2026-08-19：開盤（9:00）前連線，這個當下市場還沒開始交易，
+        # intraday_candles() 理論上抓不到任何資料（實測驗證過），backfill
+        # 沒有意義還會噴一次併發REST請求的記憶體尖峰（見
+        # bugs_and_todos.md），跳過。門檻抓 8:45（比9:00早15分鐘）當保守
+        # 緩衝——這裡檢查的是「WS訂閱完成、真的要開始backfill」這個當下的
+        # 時間，不是process啟動時間，所以前面模型載入/清單驗證等花的時間
+        # 不會讓這個判斷失準。
+        now_tw = datetime.now(_TW)
+        if (now_tw.hour, now_tw.minute) < (8, 45):
+            print(f"[backfill] 現在還沒到8:45（{now_tw.strftime('%H:%M')}），市場尚未開盤，跳過backfill", flush=True)
+            if self._backfill_done:
+                self._backfill_done.set()
+        else:
+            threading.Thread(target=self._backfill_m1_live, args=(all_symbols, date_str), daemon=True).start()
 
         threading.Thread(target=self._flush_loop, daemon=True).start()
         self._minute_tick_loop()  # 主執行緒 block 在這裡，直到 stop() 被呼叫
