@@ -332,11 +332,24 @@ def _watchlist_prev_close(stock_id: str, date_str: str) -> float | None:
 
 
 def _refresh_sr_levels(date_str: str):
-    """換日／開機：用 D 之前日K 算橫向壓力／支撐，盤中不重算。"""
+    """換日／開機：用 D 之前日K 算橫向壓力／支撐，盤中不重算。
+
+    2026-08-17改：股票池從 `state.day_trade_stocks`（均量過濾後、給策略
+    當沖候選用的較窄名單）改成 `state.tickers.keys()`（`refresh_tickers()`
+    直接寫入、跟富邦WebSocket實際訂閱清單一致的完整名單，見
+    main/premarket.py::refresh_tickers() 的說明）。這裡算的 `sr_prev_close`
+    同時是前端 VWAP突破欄「漲跌幅」的資料來源（見 on_minute() 的
+    pc_map），漲跌幅只需要「今天價」跟「昨收」，不需要先通過當沖候選的
+    均量門檻——VWAP突破事件本身（pattern/vwap_sr_scan.py）掃的就是這個
+    較寬的名單，用較窄的 day_trade_stocks 算漲跌幅，會讓表格裡本來就顯示
+    得出來的股票反而沒有漲跌幅可看（2026-08-17使用者回報：5488 有VWAP
+    突破事件、SR/MACD都正常，唯獨沒有漲跌幅）。state.tickers 本身就是
+    WebSocket訂閱清單的來源，一定涵蓋得到任何能產生事件的股票，不會有
+    m1_live沒資料算不出漲跌幅的情況。"""
     from data.adjustment_query import load_pattern_day
     from pattern.horizontal_sr import horizontal_sr_prices
 
-    stocks = {str(s) for s in (state.day_trade_stocks or state.tickers.keys())}
+    stocks = {str(s) for s in state.tickers.keys()}
     if not stocks:
         state.sr_levels = {}
         state.sr_prev_close = {}
