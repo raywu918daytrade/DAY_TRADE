@@ -488,7 +488,7 @@ def get_pattern_detail(
     date: Optional[str] = Query(None, description="基準日期 (YYYY-MM-DD)"),
     limit: int = Query(120, description="K 線視窗根數，預設 120 根，full_day=true 時忽略"),
     full_day: bool = Query(False, description="True 時忽略 limit，改成回傳 date（沒帶則今天）當天完整一天的K線（開盤到現在/收盤），只對 1m/3m/5m 有意義"),
-    force_live: bool = Query(False, description="True 時略過快取，強制重新讀取一次（股票清單欄「即時」按鈕/自動刷新用）。cache_key 是用取樣單一股票2330最新一根K線時間戳當版本號，理論上盤中應該會自動跟著變、不用強制略過，這個參數是給使用者手動要求「現在立刻重抓」時的保險，不用等下一次自然變化"),
+    force_live: bool = Query(False, description="True 時略過快取，強制重新讀取一次（股票清單欄「即時」按鈕/自動刷新用）。cache_key 版本號 day 看 db/adjustment_day mtime、intraday 看2330最新一根K線時間戳，理論上都會自動跟著變、不用強制略過，這個參數是給使用者手動要求「現在立刻重抓」時的保險，不用等下一次自然變化"),
 ) -> Dict[str, Any]:
     """回傳 K 線數據（時間已轉為前端所需的 UTC timestamp）以及型態關鍵轉折點與趨勢線線段資訊（支援快取）。"""
     # 處理直接在 Python 內部調用函式時可能傳入 Query 物件的情況

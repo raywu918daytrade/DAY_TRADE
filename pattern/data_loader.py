@@ -83,10 +83,38 @@ def get_stock_candles(
             limit = 120
     if timeframe == "day":
         df = load_pattern_day_by_stock(stock_id, date=None)
-        if df.empty:
-            return df
         if date:
             df = df[df["date"] <= f"{date} 23:59:59"]
+        else:
+            # 2026-08-17加：db/adjustment_day 是隔夜批次（見
+            # backfill_day_history.log，每天早上才補前一交易日），今天盤中
+            # 這支股票的日K本來就還沒有——沒帶 date（＝要「最新」）時，補一根
+            # 「今天進行中」的合成日K，OHLCV 從今天的1分K（db/m1_live，含
+            # 開盤到現在）現算：open=第一筆、high/low=極值、close=最新一筆、
+            # volume=加總。收盤後隔天批次補上正式那筆，這根合成的就不會再
+            # 被用到（df 裡已經有當天正式資料，下面比對到日期重複就不會疊加）。
+            today_str = pd.Timestamp.now(tz="Asia/Taipei").strftime("%Y-%m-%d")
+            has_today = not df.empty and str(df["date"].max().strftime("%Y-%m-%d")) == today_str
+            if not has_today:
+                df_1m_today = get_stock_candles(stock_id, timeframe="1m", date=None, limit=100000, full_day=True)
+                if not df_1m_today.empty:
+                    today_row = pd.DataFrame([{
+                        "stock_id": stock_id,
+                        "date": pd.Timestamp(today_str),
+                        "open": float(df_1m_today["open"].iloc[0]),
+                        "high": float(df_1m_today["high"].max()),
+                        "low": float(df_1m_today["low"].min()),
+                        "close": float(df_1m_today["close"].iloc[-1]),
+                        # db/adjustment_day 的 volume 單位是股，1分K（db/m1／
+                        # db/m1_live）是張——實測 3230 2026-08-14 整天 1分K
+                        # 加總 1589（張），對照當天官方日K volume 1,601,769
+                        # （股），差了 1000 倍，這裡要乘回來，不然合成的這根
+                        # 「今天」volume 會比其他歷史日K小1000倍。
+                        "volume": int(df_1m_today["volume"].sum()) * 1000,
+                    }])
+                    df = pd.concat([df, today_row], ignore_index=True)
+        if df.empty:
+            return df
         if limit and len(df) > limit:
             df = df.iloc[-limit:].reset_index(drop=True)
         return df
@@ -384,7 +412,41 @@ def get_all_stocks_candles(
 
 
 def get_latest_candle_timestamp(timeframe: str = "day", date: Optional[str] = None) -> str:
-    """取得特定 timeframe 及 date 設定下最新一根 K 線的時間戳記，作為 Cache Key 版本識別。"""
+    """取得特定 timeframe 及 date 設定下最新一根 K 線的時間戳記，作為 Cache Key 版本識別。
+
+    day：改用 db/adjustment_day/ 底下所有月檔的最新 mtime，疊加 2330 今天最新
+    一根1分K的時間戳（2026-08-17改）。原本跟 intraday 共用「採樣 2330 最新
+    一根K線時間戳」的邏輯，只能偵測「多了新的一天」，偵測不到「舊資料被
+    回補/修正」——例如 data.day_data_loader.update_adjustment_day() 整批重建
+    歷史時，2330 當天最新一根K線的日期前後不變，快取版本號不會跳，其他股票
+    被回補/改掉的舊資料就會一直卡在重建前的舊快取，直到 process 重啟或手動
+    /cache/clear（2026-08-17 實測 3230 卡到這個問題）。改成看檔案 mtime，
+    任何一支月檔被重寫（不管是新增一天還是回補舊資料）都會讓版本號跳動，
+    整批快取失效重算；成本也比原本查 2330 K線（開 parquet row group）更低，
+    只是 stat 檔案。
+    另外疊加 2330 今天最新1分K時間戳：get_stock_candles() 的 day 分支
+    （見該函式說明）沒帶 date 時會現算一根「今天進行中」的合成日K，OHLCV
+    隨盤中每分鐘變化——只看 adjustment_day mtime（隔夜批次才會動）偵測不到
+    這個變化，today 這根會整天卡在第一次被查到的樣子不再更新，所以要跟
+    intraday 共用「有沒有新一分鐘」這個訊號。收盤後 2330 不再有新1分鐘，
+    版本自然穩定，直到下一個交易日。
+    intraday（1m/3m/5m）維持原本邏輯不動：db/m1 等檔案數量龐大，逐檔 stat
+    反而較貴，而且沒有歷史回補這個問題，用「有沒有新一分鐘」這一個訊號就夠。
+    """
+    if timeframe == "day":
+        day_dir = _ROOT / "db/adjustment_day"
+        try:
+            mtime = max(f.stat().st_mtime for f in day_dir.glob("*.parquet"))
+        except (FileNotFoundError, ValueError):
+            mtime = "no-file"
+        intraday_tick = ""
+        try:
+            sample = get_stock_candles("2330", timeframe="1m", date=None, limit=1)
+            if not sample.empty:
+                intraday_tick = str(sample["date"].iloc[-1])
+        except Exception:
+            pass
+        return f"{mtime}|{intraday_tick}"
     try:
         sample = get_stock_candles("2330", timeframe=timeframe, date=date, limit=1)
         if not sample.empty:
