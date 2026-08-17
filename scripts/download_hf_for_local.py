@@ -66,6 +66,10 @@ load_dotenv(_ROOT / ".env", override=True)
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 
+# db/tickers/tick_universe.parquet：本機一定比 HF Hub 新（本機隨時在重算候選股
+# 母體），下載會拿舊的蓋掉本機新的，故排除；push_db_to_hf.py 也對應排除不上傳。
+_IGNORE_PATTERNS = ["db/tickers/tick_universe.parquet"]
+
 
 def main(only: list[str] | None = None, repo_id: str | None = None):
     repo_id = repo_id or HF_REPO_ID
@@ -89,6 +93,7 @@ def main(only: list[str] | None = None, repo_id: str | None = None):
         repo_type="dataset",
         token=HF_TOKEN,
         allow_patterns=allow_patterns,
+        ignore_patterns=_IGNORE_PATTERNS,
         local_dir=str(_ROOT),
     )
     print("完成")
