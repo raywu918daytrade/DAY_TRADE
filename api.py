@@ -1163,9 +1163,9 @@ def _sync_live_vwap_sr_sets(vwap: list, sr: list):
 
 def _catchup_today_into_memory() -> tuple[list, list]:
     """掃今日 m1，覆寫盤中記憶體（補開機前缺口），之後 on_minute 繼續 append。"""
-    global _vwap_macd_live, _vwap_obv_live
+    global _vwap_macd_live, _vwap_obv_live, _vwap_chg
     today = datetime.now(_TW).strftime("%Y-%m-%d")
-    from pattern.vwap_sr_scan import scan_date
+    from pattern.vwap_sr_scan import last_chg_map, scan_date
 
     vwap, sr = scan_date(today)
     from pattern.vwap_macd_div import metrics_for_date as macd_metrics
@@ -1173,6 +1173,10 @@ def _catchup_today_into_memory() -> tuple[list, list]:
 
     macd = macd_metrics(today)
     obv = obv_metrics(today)
+    # 2026-08-18修：漏補漲跌幅，重啟後 _vwap_chg 是空的，要等下一次 on_minute()
+    # 自然跑（每分鐘一次）才會重新填，這段空窗期前端VWAP框「漲幅」欄會是空的
+    # （使用者回報：重啟後VWAP框漲跌幅不見了）。跟 macd/obv 同一套補法。
+    chg = last_chg_map(today)
     with _lock:
         _reset_if_new_day()
         _vwap_breakout_signals.clear()
@@ -1181,9 +1185,10 @@ def _catchup_today_into_memory() -> tuple[list, list]:
         _sr_vwap_cross_signals.extend(sr)
         _vwap_macd_live = macd
         _vwap_obv_live = obv
+        _vwap_chg = chg
     _sync_live_vwap_sr_sets(vwap, sr)
     print(
-        f"[vwap_sr_catchup] {today} 寫入記憶體 VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / MACD {len(macd)} 檔 / OBV {len(obv)} 檔",
+        f"[vwap_sr_catchup] {today} 寫入記憶體 VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / MACD {len(macd)} 檔 / OBV {len(obv)} 檔 / chg {len(chg)} 檔",
         flush=True,
     )
     return list(reversed(vwap)), list(reversed(sr))
