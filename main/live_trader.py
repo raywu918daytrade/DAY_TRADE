@@ -85,6 +85,7 @@ from api import (
     push_vwap_breakout,
     push_vwap_chg,
     push_vwap_macd_div,
+    push_vwap_obv_div,
     register_vwap_sr_catchup_hook,
     set_strategies,
     tw_naive_to_epoch,
@@ -425,11 +426,13 @@ def on_minute(minute_str: str, df: pd.DataFrame):
     vwap_breakouts = []
     sr_vwap_hits = []
     macd_by_sid: dict = {}
+    obv_by_sid: dict = {}
     chg_map: dict = {}
 
     if not m1_live.empty:
         from pattern.vwap_sr_scan import events_for_group
         from pattern.vwap_macd_div import all_divs_for_group
+        from pattern.vwap_obv_div import all_divs_for_group as all_obv_divs_for_group
 
         hhmm = minute_str[11:16]
         pc_map = state.sr_prev_close or {}
@@ -459,6 +462,10 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             macd_evs = all_divs_for_group(g)
             if macd_evs:
                 macd_by_sid[sid] = {"events": macd_evs}
+
+            obv_evs = all_obv_divs_for_group(g)
+            if obv_evs:
+                obv_by_sid[sid] = {"events": obv_evs}
 
             # VWAP 只算一次：突破欄每次變號一筆；壓力/支撐同一套規則可重複。
             if len(g) >= 2:
@@ -504,6 +511,7 @@ def on_minute(minute_str: str, df: pd.DataFrame):
         )
     if not m1_live.empty:
         push_vwap_macd_div(minute_str, macd_by_sid)
+        push_vwap_obv_div(minute_str, obv_by_sid)
         push_vwap_chg(minute_str, chg_map)
 
     from api import get_setting

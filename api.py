@@ -326,6 +326,7 @@ _conflict_signals: list = []  # 今日「多空衝突（反轉）」記錄，見
 _vwap_breakout_signals: list = []  # 今日「VWAP突破/跌破」記錄，見 push_vwap_breakout()
 _sr_vwap_cross_signals: list = []  # 今日「VWAP + 壓力/支撐穿越」記錄，見 push_sr_vwap_cross()
 _vwap_macd_live: dict | None = None  # 今日 MACD 背離（on_minute 每分鐘覆寫）
+_vwap_obv_live: dict | None = None  # 今日 OBV 背離（on_minute 每分鐘覆寫，見 pattern/vwap_obv_div.py）
 _vwap_chg: dict = {}  # stock_id → 目前漲跌幅%（昨收）
 _strategies_registry: dict = {"strategies": [], "consensus_top_n": 0}  # 見 set_strategies()
 _force_close_queue: set = set()  # 前端觸發的立即平倉股票清單
@@ -422,7 +423,7 @@ def set_strategies(strategies: list[dict], consensus_top_n: int = 0):
 
 
 def _reset_if_new_day():
-    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals, _sr_vwap_cross_signals, _vwap_macd_live, _vwap_chg
+    global _today_date, _summary, _signals, _trades, _completed_trades, _candles, _quotes, _signal_detail, _positions, _monitoring, _consensus_signals, _conflict_signals, _vwap_breakout_signals, _sr_vwap_cross_signals, _vwap_macd_live, _vwap_obv_live, _vwap_chg
     today = datetime.now(_TW).date()
     if _today_date != today:
         _today_date = today
@@ -441,6 +442,7 @@ def _reset_if_new_day():
         _vwap_breakout_signals.clear()
         _sr_vwap_cross_signals.clear()
         _vwap_macd_live = None
+        _vwap_obv_live = None
         _vwap_chg.clear()
         _summary = dict(_SUMMARY_DEFAULT)
 
@@ -759,6 +761,18 @@ def push_vwap_macd_div(minute_str: str, stocks: dict):
         _reset_if_new_day()
         _vwap_macd_live = stocks or {}
     _broadcast({"type": "vwap_macd_div", "minute": minute_str[11:16]})
+
+
+def push_vwap_obv_div(minute_str: str, stocks: dict):
+    """盤中每分鐘覆寫今日 OBV 背離（每股 events 有效窗）。前端靠 SSE 重拉。
+    跟 push_vwap_macd_div() 是同一種節奏，資料來源見 pattern/vwap_obv_div.py。"""
+    global _vwap_obv_live
+    n = sum(len(v.get("events") or []) for v in (stocks or {}).values())
+    print(f"[push_vwap_obv_div] {minute_str} {len(stocks)} 檔 / {n} 筆背離", flush=True)
+    with _lock:
+        _reset_if_new_day()
+        _vwap_obv_live = stocks or {}
+    _broadcast({"type": "vwap_obv_div", "minute": minute_str[11:16]})
 
 
 @app.get(
@@ -1149,14 +1163,16 @@ def _sync_live_vwap_sr_sets(vwap: list, sr: list):
 
 def _catchup_today_into_memory() -> tuple[list, list]:
     """掃今日 m1，覆寫盤中記憶體（補開機前缺口），之後 on_minute 繼續 append。"""
-    global _vwap_macd_live
+    global _vwap_macd_live, _vwap_obv_live
     today = datetime.now(_TW).strftime("%Y-%m-%d")
     from pattern.vwap_sr_scan import scan_date
 
     vwap, sr = scan_date(today)
     from pattern.vwap_macd_div import metrics_for_date as macd_metrics
+    from pattern.vwap_obv_div import metrics_for_date as obv_metrics
 
     macd = macd_metrics(today)
+    obv = obv_metrics(today)
     with _lock:
         _reset_if_new_day()
         _vwap_breakout_signals.clear()
@@ -1164,9 +1180,10 @@ def _catchup_today_into_memory() -> tuple[list, list]:
         _sr_vwap_cross_signals.clear()
         _sr_vwap_cross_signals.extend(sr)
         _vwap_macd_live = macd
+        _vwap_obv_live = obv
     _sync_live_vwap_sr_sets(vwap, sr)
     print(
-        f"[vwap_sr_catchup] {today} 寫入記憶體 VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / MACD {len(macd)} 檔",
+        f"[vwap_sr_catchup] {today} 寫入記憶體 VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / MACD {len(macd)} 檔 / OBV {len(obv)} 檔",
         flush=True,
     )
     return list(reversed(vwap)), list(reversed(sr))
@@ -1280,6 +1297,34 @@ def vwap_macd_div(date: Optional[str] = None, universe: str = "daytrade"):
     stocks = metrics_for_date(date_str, universe=universe)
     print(
         f"[GET /vwap_macd_div] date={date_str} universe={universe} {len(stocks)} 檔",
+        flush=True,
+    )
+    return {"date": date_str, "stocks": stocks}
+
+
+@app.get(
+    "/vwap_obv_div",
+    tags=["訊號"],
+    summary="VWAP 表 OBV 背離：每股當日有效窗內的底／頂背離",
+)
+def vwap_obv_div(date: Optional[str] = None, universe: str = "daytrade"):
+    """每股 {events:[{time, until, kind, legs,...}]}。time～until 為 HH:MM 有效窗。
+    今日盤中優先回 live_trader 每分鐘寫入的記憶體（僅訂閱當沖）。過去日期
+    universe=daytrade|full 與 VWAP 重現同一份清單。跟 /vwap_macd_div 是同一種
+    節奏，資料來源見 pattern/vwap_obv_div.py。"""
+    date_str = date or datetime.now(_TW).strftime("%Y-%m-%d")
+    today = datetime.now(_TW).strftime("%Y-%m-%d")
+    if date_str == today:
+        with _lock:
+            if _vwap_obv_live is not None:
+                stocks = _vwap_obv_live
+                print(f"[GET /vwap_obv_div] live date={date_str} {len(stocks)} 檔", flush=True)
+                return {"date": date_str, "stocks": stocks}
+    from pattern.vwap_obv_div import metrics_for_date as obv_metrics_for_date
+
+    stocks = obv_metrics_for_date(date_str, universe=universe)
+    print(
+        f"[GET /vwap_obv_div] date={date_str} universe={universe} {len(stocks)} 檔",
         flush=True,
     )
     return {"date": date_str, "stocks": stocks}
