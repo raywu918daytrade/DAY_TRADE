@@ -1247,17 +1247,25 @@ def vwap_sr_catchup():
 def vwap_sr_replay(date: str, universe: str = "daytrade"):
     """dashboard「重現」用：同一輪掃描回兩欄，避免打兩次 endpoint 重複算包絡。
     universe=daytrade|full（tick＝daytrade）。m1_bars＝該日讀到的 1 分根數，
-    0 表示來源還沒讀到，前端應繼續等／重試，不要當成「該日無訊號」。"""
-    from pattern.vwap_sr_scan import last_m1_bars
+    0 表示來源還沒讀到，前端應繼續等／重試，不要當成「該日無訊號」。
+
+    2026-08-18加 chg：VWAP突破表「漲幅」欄原本只有 _vwap_chg（今天盤中即時
+    快照），使用者重現過去日期（例如8/14）時前端沿用切換前殘留的今天數值，
+    誤把今天的漲幅當成那天的（使用者回報：選8/14 6907，漲幅卻是8/18的）。
+    修法不是把這欄清空，是真的算對——pattern/vwap_sr_scan.py::last_chg_map()
+    本來就寫好了（該日最後一根m1收盤 vs 前一交易日收盤），只是沒接到任何
+    endpoint，這裡接上去，讓重現模式也有正確的當日漲幅。"""
+    from pattern.vwap_sr_scan import last_chg_map, last_m1_bars
 
     vwap, sr = _scan_vwap_sr(date, universe=universe)
     bars = last_m1_bars(date, universe)
+    chg = last_chg_map(date, universe=universe)
     print(
         f"[GET /vwap_sr_replay] date={date} universe={universe} "
-        f"VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / m1_bars={bars}",
+        f"VWAP {len(vwap)} 筆 / SR {len(sr)} 筆 / m1_bars={bars} / chg {len(chg)} 檔",
         flush=True,
     )
-    return {"vwap": vwap, "sr": sr, "m1_bars": bars}
+    return {"vwap": vwap, "sr": sr, "m1_bars": bars, "chg": chg}
 
 
 @app.get(
