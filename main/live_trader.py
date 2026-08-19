@@ -171,7 +171,13 @@ def _startup():
     提早開始收資料、on_minute() 提早呼叫 predict_live() 也不會出錯，只是
     model 還沒背景載完的那幾次呼叫會各自重新讀一次模型檔，效能小損失換
     前端能立刻連上。
+
+    2026-08-19加：最開頭先呼叫 check_and_refresh_from_hf()——用0050的
+    d1 flag判斷本機db/是否跟上今天的排程進度，過期就從HF全量下載，確保
+    後面 refresh_tickers()/refresh_day() 這些依賴新鮮資料的步驟不會用到
+    過期資料（見 main/premarket.py 的說明）。
     """
+    _premarket.check_and_refresh_from_hf()
     print("載入模型...")
     sys.stdout.flush()
     try:

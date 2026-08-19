@@ -11,6 +11,40 @@ from fubon.subscribe_list import build_and_save_subscribe_list
 from strategy.prewarm import build_prewarm_cache
 
 
+def check_and_refresh_from_hf() -> None:
+    """開機檢查：用 0050 的 db/d1_flags/day_flag.parquet 有沒有「今天」的
+    flag，判斷本機 db/ 是否跟上最新排程進度。0050 是候選池強制納入的股票
+    （見 finmind/tick_universe.py 的 _FORCE_INCLUDE），update_daily.py
+    每天都會處理它，用它當代理指標比逐一檢查每支股票便宜。沒有今天的flag
+    （不管是本機真的落後、還是HF自己當天都還沒有——後者是上游排程的問題，
+    這裡不負責分辨，下載了也可能沒用，但不影響後續開機流程）就從 HF Hub
+    全量下載補齊。
+
+    2026-08-19討論：跟本檔案其他函式「不吞例外，留給呼叫端處理」的慣例
+    刻意不同——這裡下載失敗只印log、不往外拋，讓 live_trader 照樣用現有
+    本機資料繼續開機，不因為HF暫時連不上（例如已知的xet傳輸問題，見
+    scripts/download_hf_for_local.py 檔頭說明）就卡死整個開機流程。"""
+    from datetime import datetime, timezone, timedelta
+
+    from data.day_data_loader import _get_done_stocks
+
+    tw = timezone(timedelta(hours=8))
+    today = datetime.now(tw).strftime("%Y-%m-%d")
+    done = _get_done_stocks(today)
+    if "0050" in done:
+        print(f"[HF同步檢查] 0050 今天（{today}）的 d1 flag 已存在，本機資料新鮮，跳過下載", flush=True)
+        return
+
+    print(f"[HF同步檢查] 0050 今天（{today}）沒有 d1 flag，本機資料可能落後，從 HF Hub 全量下載...", flush=True)
+    try:
+        from scripts.download_hf_for_local import main as download_from_hf
+
+        download_from_hf()
+        print("[HF同步檢查] 下載完成", flush=True)
+    except Exception as e:
+        print(f"[HF同步檢查] 下載失敗，改用現有本機資料繼續開機: {e}", flush=True)
+
+
 def refresh_tickers(state) -> None:
     """更新當沖候選清單，寫入 state.tickers / state.day_trade_stocks。
 
