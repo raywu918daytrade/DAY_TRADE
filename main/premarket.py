@@ -12,13 +12,23 @@ from strategy.prewarm import build_prewarm_cache
 
 
 def check_and_refresh_from_hf() -> None:
-    """開機檢查：用 0050 的 db/d1_flags/day_flag.parquet 有沒有「今天」的
-    flag，判斷本機 db/ 是否跟上最新排程進度。0050 是候選池強制納入的股票
-    （見 finmind/tick_universe.py 的 _FORCE_INCLUDE），update_daily.py
-    每天都會處理它，用它當代理指標比逐一檢查每支股票便宜。沒有今天的flag
-    （不管是本機真的落後、還是HF自己當天都還沒有——後者是上游排程的問題，
-    這裡不負責分辨，下載了也可能沒用，但不影響後續開機流程）就從 HF Hub
-    全量下載補齊。
+    """開機檢查：用 0050 的 db/d1_flags/day_flag.parquet 有沒有「上一個
+    預期交易日」的flag，判斷本機 db/ 是否跟上最新排程進度。0050 是候選池
+    強制納入的股票（見 finmind/tick_universe.py 的 _FORCE_INCLUDE），
+    update_daily.py 每天都會處理它，用它當代理指標比逐一檢查每支股票便宜。
+
+    2026-08-19修正：一開始誤用「今天」比對——d1是收盤後才會有的整天K線，
+    早上開機（開盤前/盤中）當下，今天的d1本來就不可能存在，用「今天」當
+    基準會導致每天早上開機都被誤判成「過期」，天天觸發不必要的全量下載。
+    改用 data.day_data_loader._expected_prior_trading_day()（週一回推到
+    上週五，其他天回推1天，跟這個專案「快路徑判斷是否落後」既有的邏輯
+    一致，刻意不處理國定假日——假日隔天可能誤判觸發一次多餘下載，是可
+    接受的安全失敗方式，見該函式的說明），比對「上一個預期交易日」才是
+    這個當下真正該已經有的最新資料。
+
+    沒有這個flag（不管是本機真的落後、還是HF自己都還沒有——後者是上游
+    排程的問題，這裡不負責分辨，下載了也可能沒用，但不影響後續開機流程）
+    就從 HF Hub 全量下載補齊。
 
     2026-08-19討論：跟本檔案其他函式「不吞例外，留給呼叫端處理」的慣例
     刻意不同——這裡下載失敗只印log、不往外拋，讓 live_trader 照樣用現有
@@ -26,16 +36,16 @@ def check_and_refresh_from_hf() -> None:
     scripts/download_hf_for_local.py 檔頭說明）就卡死整個開機流程。"""
     from datetime import datetime, timezone, timedelta
 
-    from data.day_data_loader import _get_done_stocks
+    from data.day_data_loader import _expected_prior_trading_day, _get_done_stocks
 
     tw = timezone(timedelta(hours=8))
-    today = datetime.now(tw).strftime("%Y-%m-%d")
-    done = _get_done_stocks(today)
+    expected_date = _expected_prior_trading_day(datetime.now(tw))
+    done = _get_done_stocks(expected_date)
     if "0050" in done:
-        print(f"[HF同步檢查] 0050 今天（{today}）的 d1 flag 已存在，本機資料新鮮，跳過下載", flush=True)
+        print(f"[HF同步檢查] 0050 上一個預期交易日（{expected_date}）的 d1 flag 已存在，本機資料新鮮，跳過下載", flush=True)
         return
 
-    print(f"[HF同步檢查] 0050 今天（{today}）沒有 d1 flag，本機資料可能落後，從 HF Hub 全量下載...", flush=True)
+    print(f"[HF同步檢查] 0050 上一個預期交易日（{expected_date}）沒有 d1 flag，本機資料可能落後，從 HF Hub 全量下載...", flush=True)
     try:
         from scripts.download_hf_for_local import main as download_from_hf
 
