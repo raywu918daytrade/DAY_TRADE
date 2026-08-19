@@ -467,13 +467,16 @@ def on_minute(minute_str: str, df: pd.DataFrame):
             if obv_evs:
                 obv_by_sid[sid] = {"events": obv_evs}
 
-            # VWAP 只算一次：突破欄每次變號一筆；壓力/支撐同一套規則可重複。
+            # VWAP 只算一次：突破欄每次變號一筆；壓力/支撐同一套規則可重複，
+            # 含開盤跳空直接穿越（2026-08-19加，見 events_for_group() 的
+            # 說明），要傳 pc_map 裡的昨收才能判斷。
             if len(g) >= 2:
                 ve, se = events_for_group(
                     sid,
                     state.tickers.get(sid, sid),
                     g,
                     state.sr_levels.get(sid),
+                    pc_map.get(sid),
                 )
                 for e in ve:
                     if e.get("time") != hhmm:

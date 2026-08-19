@@ -253,6 +253,7 @@ def events_for_group(
     name: str,
     g: pd.DataFrame,
     sr: tuple[float | None, float | None] | None,
+    prev_close: float | None = None,
 ) -> tuple[list, list]:
     """單檔當日 m1 → (vwap 變號列, 壓力/支撐記錄列)。live 與盤後掃描共用。"""
     vwap_events: list = []
@@ -303,18 +304,35 @@ def events_for_group(
     # 觸及水位」當狀態，觸及狀態前後改變才算一次「flip」（跟原本收盤價的
     # flip 邏輯同一種寫法，只是判斷觸及與否的欄位從 close 換成 high/low），
     # 壓力用 high、支撐用 low，不再要求收盤價真的站上/跌破。
+    # 2026-08-19再改：res_flip/sup_flip 的 [0] 一直是 False（陣列預設值，沒有
+    # 「盤前」可比較），抓不到「開盤直接跳空穿過水位、盤中完全沒有翻轉」的
+    # 情況——例如3167開盤728直接跳空跌破支撐768.76，全天每根K最低價都在
+    # 支撐之下，狀態從頭到尾沒變過，永遠不會有flip（使用者回報）。有
+    # prev_close時，把「昨收 vs 水位」當成第0根之前的虛擬狀態，第0根本身
+    # 的觸碰狀態若跟這個虛擬狀態不同，一樣算一次flip。
     res_flip = np.zeros(len(closes), dtype=bool)
     if res is not None:
         res_touch = highs >= res
         res_flip[1:] = res_touch[1:] != res_touch[:-1]
+        if prev_close is not None and prev_close > 0:
+            res_flip[0] = (prev_close >= res) != res_touch[0]
     sup_flip = np.zeros(len(closes), dtype=bool)
     if sup is not None:
         sup_touch = lows <= sup
         sup_flip[1:] = sup_touch[1:] != sup_touch[:-1]
+        if prev_close is not None and prev_close > 0:
+            sup_flip[0] = (prev_close <= sup) != sup_touch[0]
     sr_flip = res_flip | sup_flip
     if not sr_flip.any():
         return vwap_events, sr_events
-    for fire in sr_record_indices(flip, sr_flip):
+    # sr_record_indices() 的迴圈從 i=1 開始（跟VWAP配對用），結構上永遠不會
+    # 把index 0算進去；跳空穿越不用等VWAP配對（VWAP本身在第0根也還沒有
+    # 「前一狀態」可比較，這個配對條件在index 0天生就滿足不了），開盤跳空
+    # 本身已經夠顯著，偵測到就直接算一筆。
+    fired = sr_record_indices(flip, sr_flip)
+    if sr_flip[0]:
+        fired = [0] + fired
+    for fire in fired:
         sr_events.append(
             {
                 "stock_id": sid,
@@ -335,11 +353,14 @@ def scan_day_events(
     m1: pd.DataFrame,
     sr_levels: dict[str, tuple[float, float]],
     names: dict[str, str] | None = None,
+    prev_close_map: dict[str, float] | None = None,
 ) -> tuple[list, list]:
     """回傳 (vwap_breakouts, sr_vwap_hits)，欄位與盤中 push payload + time 相同。
-    VWAP 每次變號一筆；壓力/支撐穿越（且當天已有 VWAP 變號）每次一筆，同一支可重複。
+    VWAP 每次變號一筆；壓力/支撐穿越（且當天已有 VWAP 變號，或開盤跳空直接
+    穿越，見 events_for_group()）每次一筆，同一支可重複。
     """
     names = names or {}
+    prev_close_map = prev_close_map or {}
     vwap_events: list = []
     sr_events: list = []
     if m1 is None or m1.empty:
@@ -347,7 +368,9 @@ def scan_day_events(
 
     for sid, g in m1.groupby("stock_id", sort=False):
         sid = str(sid)
-        ve, se = events_for_group(sid, names.get(sid, sid), g, sr_levels.get(sid))
+        ve, se = events_for_group(
+            sid, names.get(sid, sid), g, sr_levels.get(sid), prev_close_map.get(sid)
+        )
         vwap_events.extend(ve)
         sr_events.extend(se)
 
@@ -358,7 +381,8 @@ def _scan_date_body(date_str: str, universe: str) -> tuple[list, list]:
     m1 = load_day_m1(date_str, universe=universe)
     stocks = set(m1["stock_id"].astype(str)) if not m1.empty else set()
     levels = sr_levels_for_date(date_str, stocks)
-    result = scan_day_events(m1, levels, _name_map())
+    prev_close_map = prev_close_for_date(date_str)
+    result = scan_day_events(m1, levels, _name_map(), prev_close_map)
     today = pd.Timestamp.now(tz="Asia/Taipei").strftime("%Y-%m-%d")
     if date_str != today and not m1.empty:
         with _scan_lock:
@@ -368,6 +392,31 @@ def _scan_date_body(date_str: str, universe: str) -> tuple[list, list]:
 
 def last_m1_bars(date_str: str, universe: str = "daytrade") -> int:
     return _m1_bars.get((date_str, normalize_universe(universe)), 0)
+
+
+def prev_close_for_date(date_str: str) -> dict[str, float]:
+    """每股在 date_str 之前最後一筆日K收盤（前一交易日收盤）。從
+    last_chg_map() 抽出來獨立成一支函式，讓 events_for_group() 的跳空穿越
+    偵測（見該函式2026-08-19的說明）也能重用同一套，不用重複寫一次。"""
+    from data.adjustment_query import load_pattern_day
+
+    hist_start = (pd.Timestamp(date_str) - pd.Timedelta(days=20)).strftime("%Y-%m-%d")
+    day = load_pattern_day(start_date=hist_start, end_date=date_str)
+    if day is None or day.empty:
+        return {}
+    day = day.copy()
+    day["stock_id"] = day["stock_id"].astype(str)
+    day["date"] = pd.to_datetime(day["date"], format="mixed")
+    before = day[day["date"] < pd.Timestamp(date_str)]
+    if before.empty:
+        return {}
+    return (
+        before.sort_values("date")
+        .groupby("stock_id", sort=False)["close"]
+        .last()
+        .astype(float)
+        .to_dict()
+    )
 
 
 def last_chg_map(date_str: str, universe: str = "daytrade") -> dict[str, float]:
@@ -380,24 +429,7 @@ def last_chg_map(date_str: str, universe: str = "daytrade") -> dict[str, float]:
     m1["date"] = pd.to_datetime(m1["date"], format="mixed")
     last = m1.sort_values("date").groupby("stock_id", sort=False)["close"].last()
 
-    from data.adjustment_query import load_pattern_day
-
-    hist_start = (pd.Timestamp(date_str) - pd.Timedelta(days=20)).strftime("%Y-%m-%d")
-    day = load_pattern_day(start_date=hist_start, end_date=date_str)
-    prev: dict[str, float] = {}
-    if day is not None and not day.empty:
-        day = day.copy()
-        day["stock_id"] = day["stock_id"].astype(str)
-        day["date"] = pd.to_datetime(day["date"], format="mixed")
-        before = day[day["date"] < pd.Timestamp(date_str)]
-        if not before.empty:
-            prev = (
-                before.sort_values("date")
-                .groupby("stock_id", sort=False)["close"]
-                .last()
-                .astype(float)
-                .to_dict()
-            )
+    prev = prev_close_for_date(date_str)
 
     out: dict[str, float] = {}
     for sid, close in last.items():
