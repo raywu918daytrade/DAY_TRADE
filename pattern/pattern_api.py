@@ -134,20 +134,28 @@ _SCAN_CACHE: Dict[tuple, Dict[str, Any]] = {}
 _DETAIL_CACHE: Dict[tuple, Dict[str, Any]] = {}
 
 
-def _horizontal_sr_lines(df: pd.DataFrame, to_epoch) -> List[Dict[str, Any]]:
+def _horizontal_sr_lines(df: pd.DataFrame, to_epoch, stock_id: str) -> List[Dict[str, Any]]:
     """日K 橫向壓力／支撐（雙轉折水平線），不要求型態過關。
 
     股票清單日K／分K 疊圖用：跟 VWAP+壓力支撐同一套 horizontal_sr_prices。
-    """
-    from pattern.horizontal_sr import horizontal_sr_prices
+
+    2026-08-20改：原本自己拿 df（get_stock_candles 抓回來的、含今天還在跑
+    的合成K棒）切最後120筆算，跟 main/live_trader.py::_refresh_sr_levels()/
+    pattern/vwap_sr_scan.py::sr_levels_for_date()（180日曆天、明確排除今天）
+    用不同窗口——導致D1圖跟VWAP突破欄m1疊圖的「日壓力/日支撐」對不起來
+    （使用者實測3443：D1顯示5956.51，m1疊圖顯示5337.50，差了快12%，見
+    對話紀錄）。改成直接呼叫 sr_levels_for_date()，兩邊共用同一個計算＋
+    同一份cache，不會再各自維護一套邏輯、以後也不會再漂移。"""
+    from pattern.vwap_sr_scan import sr_levels_for_date
 
     if df is None or df.empty or len(df) < 25:
         return []
-    sub = df.iloc[-120:].reset_index(drop=True)
-    res, sup = horizontal_sr_prices(sub)
+    date_str = str(df["date"].iloc[-1])[:10]
+    res, sup = sr_levels_for_date(date_str, {str(stock_id)}).get(str(stock_id), (None, None))
     if res is None and sup is None:
         return []
 
+    sub = df.iloc[-120:].reset_index(drop=True)
     start_date = str(sub["date"].iloc[0])
     end_date = str(sub["date"].iloc[-1])
     try:
@@ -601,7 +609,7 @@ def get_pattern_detail(
     sr_lines_output: List[Dict[str, Any]] = []
     if timeframe == "day":
         try:
-            sr_lines_output = _horizontal_sr_lines(df_candles, tw_naive_to_epoch)
+            sr_lines_output = _horizontal_sr_lines(df_candles, tw_naive_to_epoch, stock_id)
         except Exception:
             sr_lines_output = []
 
