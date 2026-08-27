@@ -8,6 +8,7 @@ marketdata_ws.py 等上層程式只呼叫這裡的函式，不直接 import fubo
 import base64
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,19 +29,46 @@ def _resolve_cert_path() -> str:
         return f.name
 
 
-def login() -> tuple[FubonSDK, list]:
+def login(retry_delays: tuple[float, ...] = (60, 300, 600)) -> tuple[FubonSDK, list]:
     """身分證字號＋API Key（.env 的 FUBON_API_KEY）＋憑證登入。第一次連線測試
-    （身分證字號＋密碼＋憑證）已經在 2026-07 完成、帳號權限開通，之後一律用這個。"""
-    sdk = FubonSDK()
-    result = sdk.apikey_login(
-        os.environ["FUBON_ID"],
-        os.environ["FUBON_API_KEY"],
-        _resolve_cert_path(),
-        os.environ.get("FUBON_CERT_PASS") or None,
-    )
-    if not result.is_success:
-        raise RuntimeError(f"富邦 API Key 登入失敗: {result.message}")
-    return sdk, result.data
+    （身分證字號＋密碼＋憑證）已經在 2026-07 完成、帳號權限開通，之後一律用這個。
+
+    2026-08-28加重試：2026-08-27 GHA排程整個失敗，原因是 FubonSDK() 建構
+    子連線時噴 ValueError（Unable to connect to wss://neoapi.fbs.com.tw/...），
+    這個例外沒接住，直接把整支 update_daily.py 炸掉（後面 m1/d1/
+    adjustment_day/tick_universe全部沒機會跑，見對話紀錄的診斷）。查過去
+    21次排程只有這一次失敗，屬於偶發的暫時性連線問題（不是帳密/憑證這種
+    重試也沒用的錯誤），所以在這裡包一層重試，換掉單點失敗就讓一整天全部
+    作廢的行為。FubonSDK() 建構子跟 apikey_login() 都可能是連線失敗的
+    來源，一起包進 try。retry_delays 用遞增間隔（預設1/5/10分鐘）而不是
+    固定間隔——如果失敗原因是跟本機live_trader搶同一組帳密的session
+    （見對話紀錄的假設），本機那邊通常不會秒退，給更長的等待時間比較有
+    機會等到session釋放。"""
+    last_err: Exception | None = None
+    attempts = len(retry_delays) + 1
+    for i in range(attempts):
+        try:
+            sdk = FubonSDK()
+            result = sdk.apikey_login(
+                os.environ["FUBON_ID"],
+                os.environ["FUBON_API_KEY"],
+                _resolve_cert_path(),
+                os.environ.get("FUBON_CERT_PASS") or None,
+            )
+            if not result.is_success:
+                raise RuntimeError(f"富邦 API Key 登入失敗: {result.message}")
+            return sdk, result.data
+        except Exception as e:
+            last_err = e
+            if i < len(retry_delays):
+                delay = retry_delays[i]
+                print(
+                    f"[fubon_api] 登入失敗（第{i + 1}/{attempts}次）：{e}，"
+                    f"{delay}秒後重試...",
+                    flush=True,
+                )
+                time.sleep(delay)
+    raise last_err
 
 
 def logout(sdk: FubonSDK):
