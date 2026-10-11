@@ -16,6 +16,11 @@ on:
   # 可控。原本排程是每天台北15:00（=07:00 UTC，不跨日）週一到週五，外部
   # cronjob設定時間點可以比照這個邏輯。
   workflow_dispatch:   # 允許手動/外部觸發
+    inputs:
+      force:
+        description: '週末也照跑（手動回補用）'
+        type: boolean
+        default: false
 
 jobs:
   update:
@@ -69,6 +74,7 @@ jobs:
           FUBON_API_KEY: ${{ secrets.FUBON_API_KEY }}
           FUBON_CERT_B64: ${{ secrets.FUBON_CERT_B64 }}
           FUBON_CERT_PASS: ${{ secrets.FUBON_CERT_PASS }}
+          FORCE_RUN: ${{ inputs.force && '1' || '' }}
         run: python -m scripts.update_daily
 
       - name: Push db/ to HF Hub
