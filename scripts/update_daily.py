@@ -74,7 +74,8 @@ from finmind.m1_api import _atomic_to_parquet
 _TW = timezone(timedelta(hours=8))
 
 if __name__ == "__main__":
-    if datetime.now(_TW).weekday() >= 5:  # 5=Saturday, 6=Sunday
+    # FORCE_RUN：手動回補用（workflow_dispatch 的 force 輸入），週末也照跑
+    if datetime.now(_TW).weekday() >= 5 and not os.environ.get("FORCE_RUN"):  # 5=Saturday, 6=Sunday
         print("今天是週末（台北時間），非交易日，跳過整個pipeline")
         sys.exit(0)
     print("=== 下載 1 分鐘K ===")

@@ -277,6 +277,9 @@ def _save_day(new_df: pd.DataFrame, base_dir: str = _D1_DIR):
                             print(f"警告：{file_path} 讀取失敗3次（可能是 Dropbox 同步中），略過 merge")
                         else:
                             time.sleep(1)
+            # 2026-10-11：外部寫入者曾把 date 寫成「YYYY-MM-DD 00:00:00」，存檔前一律切回純日期，
+            # 否則去重複對不上、_last_stored_dates() 也會拿到帶時分秒的字串。
+            group["date"] = group["date"].astype(str).str[:10]
             group.drop_duplicates(subset=["stock_id", "date"], keep="last", inplace=True)
             group.sort_values(["date", "stock_id"], inplace=True)
             _atomic_to_parquet(group, file_path, index=False, compression="zstd")
@@ -372,6 +375,9 @@ def _last_stored_dates(base_dir: str = _D1_DIR) -> dict[str, str]:
     if dataset.count_rows() == 0:
         return {}
     df = dataset.to_table(columns=["stock_id", "date"]).to_pandas()
+    # 2026-10-11：只取前10碼。10/2 起 db/d1 混進「YYYY-MM-DD 00:00:00」，呼叫端用
+    # strptime(..., "%Y-%m-%d") 解析起始日會整批失敗（每天約2,236支沒抓到）。
+    df["date"] = df["date"].astype(str).str[:10]
     return df.groupby("stock_id")["date"].max().to_dict()
 
 
